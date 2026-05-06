@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  # === 1. 物理挂载 MySQL 引擎 ===
+  mysql:
+    image: mysql:8.0
+    container_name: im_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: 123456
+      MYSQL_DATABASE: im_gateway_db
+    ports:
+      - "3307:3306"
+    # 这里是物理防线：把容器里的数据挂载到宿主机，防止容器销毁后聊天记录灰飞烟灭
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  # === 2. 物理挂载 Redis 塔台 ===
+  redis:
+    image: redis:7.0-alpine
+    container_name: im_redis
+    ports:
+      - "6379:6379"
+
+  # === 3. 部署你的 Go IM 网关 ===
+  im_app:
+    build: . 
+    container_name: im_gateway_app
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mysql
+      - redis
+      - rabbitmq
+    # 极其冷酷的网络注入：容器之间通过“服务名(mysql/redis)”互相通信，彻底抛弃 localhost
+    environment:
+      - DB_DSN=root:123456@tcp(mysql:3306)/im_gateway_db?charset=utf8mb4&parseTime=True&loc=Local
+      - REDIS_ADDR=redis:6379
+      - MQ_URL=qmqp://guest:guest@rabbitmq:5672/
+  # === 4. 强行挂载 RabbitMQ 消息队列 ===
+  rabbitmq:
+    image: rabbitmq:3-management-alpine # 带 management 后缀意味着自带 Web 监控大屏
+    container_name: im_rabbitmq
+    ports:
+      - "5672:5672"   # Go 代码内部通信用的物理通道
+      - "15672:15672" # 浏览器访问 Web 面板的端口
+
+volumes:
+  mysql_data:

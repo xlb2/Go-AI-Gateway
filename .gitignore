@@ -1,0 +1,26 @@
+# 编译产物 (极其致命，绝对不能推)
+im_gateway
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# 环境变量与机密护照 (防止 API Key 泄露)
+.env
+*.local
+
+# IDE 缓存
+.vscode/
+.idea/
+*.swp
+
+# Go 依赖与工作区
+vendor/
+go.work
+go.work.sum
+
+# 操作系统生成的垃圾文件
+.DS_Store
+Thumbs.db
