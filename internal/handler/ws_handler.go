@@ -70,6 +70,24 @@ func (c *Client) SendMessage(msg []byte) error {
 // 带透视眼的安保队长2.0
 func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
+
+		// uidStr := c.Query("uid")
+		// userIDInt, _ := strconv.Atoi(uidStr)
+		// if userIDInt == 0 {
+		// 	// 如果连 uid 都没带，随机发一个巨大的临时身份证，绝对防止 Map 键值碰撞！
+		// 	userIDInt = rand.Intn(900000) + 100000
+		// }
+		// userID := uint(userIDInt) // 拿到唯一的身份证明！
+
+		// // ==============================================================
+
+		// // 只有身份核实无误，才允许执行光缆的升级
+		// conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+		// if err != nil {
+		// 	fmt.Println("光缆架设失败:", err)
+		// 	return
+		// }
+
 		//===核心第一步，从url的尾巴上抠出通行证====
 		tokenString := c.Query("token")
 		if tokenString == "" {
@@ -225,7 +243,7 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 					// 异步存新消息（务必使用 Background，防止跟着当前对话一起被 cancel 取消掉）
 					go ai_service.SaveMessage(context.Background(), userID, usrMsg)
 
-					agentRunner, err := ai_service.BulidEinoAgent(ctx, "your-apikey:ark-.....", "your-modelEndpoint:ep-m-.....")
+					agentRunner, err := ai_service.BulidEinoAgent(ctx, "...", "...")
 					if err != nil {
 						failMsg := fmt.Sprintf("❌ Eino 引擎点火失败! 物理死因: %v", err)
 						fmt.Println(failMsg)

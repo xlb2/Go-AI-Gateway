@@ -55,3 +55,32 @@ func ClearPendingAction(ctx context.Context, userID uint) {
 	key := fmt.Sprintf("agent:pending:%d", userID)
 	Rdb.Del(ctx, key)
 }
+
+// CheckRateLimit 物理执行：Lua 单线程绝对霸占限流// CheckRateLimit 物理执行：Lua 单线程绝对霸占限流
+func CheckRateLimit(ctx context.Context, rdb *redis.Client, userID uint) bool {
+	// 逻辑：把用户的访问次数加 1。如果是第一次，设置 10 秒过期。如果次数大于 5，返回 0（拦截），否则返回 1（放行）。
+	script := `
+			local current  = redis.call('INCR',KEYS[1])
+			if tonumber(current) == 1 then 	
+					redis.call('EXPIRE',KEYS[1],ARGV[1])
+			end
+			if tonumber(current) > tonumber(ARGV[2]) then
+					return 0
+			else 	
+					return 1
+			end 
+	`
+	key := fmt.Sprintf("ratelimit:user:%d", userID)
+
+	result, err := rdb.Eval(ctx, script, []string{key}, 10, 5).Result()
+
+	if err != nil {
+		fmt.Printf("Redis 执行 Lua 报错：%v\n", err)
+		return true
+	}
+	res, ok := result.(int64)
+	if !ok {
+		return true
+	}
+	return res == 1
+}
