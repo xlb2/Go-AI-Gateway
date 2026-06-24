@@ -27,6 +27,7 @@ services:
     container_name: im_gateway_app
     ports:
       - "8080:8080"
+      - "6060:6060"
     depends_on:
       - mysql
       - redis
@@ -35,7 +36,7 @@ services:
     environment:
       - DB_DSN=root:123456@tcp(mysql:3306)/im_gateway_db?charset=utf8mb4&parseTime=True&loc=Local
       - REDIS_ADDR=redis:6379
-      - MQ_URL=qmqp://guest:guest@rabbitmq:5672/
+      - MQ_URL=amqp://guest:guest@rabbitmq:5672/
   # === 4. 强行挂载 RabbitMQ 消息队列 ===
   rabbitmq:
     image: rabbitmq:3-management-alpine # 带 management 后缀意味着自带 Web 监控大屏

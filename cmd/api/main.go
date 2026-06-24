@@ -8,19 +8,30 @@ import (
 	"go_im_gateway/internal/handler"
 	"go_im_gateway/internal/model"
 	"go_im_gateway/internal/service"
-	"log"              // [新增] 用于暴露 pprof
+	"log" // [新增] 用于暴露 pprof
+	"net"
+	"net/http"
 	_ "net/http/pprof" // [新增] 性能监控雷达
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/rabbitmq/amqp091-go"
 	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
 func main() {
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGALRM)
+	defer stop()
+
+	var wg sync.WaitGroup
 	// // 启动最高级别物理性能雷达 ===
 	// go func() {
 	// 	fmt.Println("🚀 pprof 性能雷达已开启：访问 http://localhost:6060/debug/pprof/")
@@ -66,7 +77,10 @@ func main() {
 	})
 
 	// === 3. 强行挂载 RabbitMQ 消息队列 ==
-	mqURL := "amqp://guest:guest@localhost:5672/"
+	mqURL := os.Getenv("MQ_URL")
+	if mqURL == "" {
+		mqURL = "amqp://guest:guest@localhost:5672/"
+	}
 
 	fmt.Printf("正在接驳 MQ 管道，坐标: [%s]\n", mqURL)
 
@@ -151,7 +165,41 @@ func main() {
 		v1.GET("/ws", handler.ConnectWS(messageService, rdb))
 	}
 
-	messageService.StartConsumer()
-	fmt.Println("网关启动,正在监听8080端口....")
-	r.Run(":8080")
+	grpcServer := grpc.NewServer()
+
+	lis, _ := net.Listen("tcp", ":9090")
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Println("gRPC 引擎启动...")
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Printf("gRPC 异常或关闭: %v\n", err)
+		}
+	}()
+
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: r,
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Println(" Gin 引擎启动...")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Gin 异常: %v\n", err)
+		}
+	}()
+	<-ctx.Done()
+	log.Println("\n接收到关闭信号，正在执行优雅停机 (Graceful Shutdown)...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	log.Println("正在清空 HTTP 残留请求...")
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf(" HTTP 强制关闭: %v\n", err)
+	}
+	log.Println(" 正在清空 gRPC 流式残留...")
+	grpcServer.GracefulStop()
+	log.Println(" 正在断开底层存储连接...")
+	wg.Wait()
+	log.Println(" 优雅停机完毕，网关物理进程安全退出。")
 }

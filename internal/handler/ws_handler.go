@@ -243,7 +243,7 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 					// 异步存新消息（务必使用 Background，防止跟着当前对话一起被 cancel 取消掉）
 					go ai_service.SaveMessage(context.Background(), userID, usrMsg)
 
-					agentRunner, err := ai_service.BulidEinoAgent(ctx, "...", "...")
+					agentRunner, err := ai_service.BuildEinoAgent(ctx)
 					if err != nil {
 						failMsg := fmt.Sprintf("❌ Eino 引擎点火失败! 物理死因: %v", err)
 						fmt.Println(failMsg)

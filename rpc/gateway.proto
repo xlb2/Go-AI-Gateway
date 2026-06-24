@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package gateway;
+
+option go_package = "./rpc;rpc";
+
+service AgentGateway {
+    rpc StreamChat (stream ChatRequest) returns (stream ChatResponse);
+}
+
+message ChatRequest{
+    string session_id = 1;
+    string user_query = 2;
+}
+
+message ChatResponse{
+    int32 seq_num = 1;
+    string delta_text = 2;
+}

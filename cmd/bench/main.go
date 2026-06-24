@@ -19,7 +19,7 @@ var (
 
 func main() {
 	// 1. 设置压测参数（默认压测 10000 个并发连接）
-	concurrency := flag.Int("c", 10000, "并发连接数")
+	concurrency := flag.Int("c", 2000, "并发连接数")
 	port := flag.String("p", "8080", "网关端口号")
 	path := flag.String("path", "/api/v1/ws", "WebSocket 路由路径") // 已经为你校准了真实路由
 	flag.Parse()

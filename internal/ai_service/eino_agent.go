@@ -3,6 +3,7 @@ package ai_service
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/components/tool"
@@ -48,17 +49,35 @@ var DefenseTool, _ = utils.InferTool(
 	},
 )
 
-func BulidEinoAgent(ctx context.Context, apiKey string, endpoint string) (compose.Runnable[[]*schema.Message, any], error) {
+func BuildEinoAgent(ctx context.Context) (compose.Runnable[[]*schema.Message, any], error) {
+
+	// ⚡ [熔断器] 直接从操作系统的进程环境变量中提取私密配置
+	apiKey := os.Getenv("VOLC_ACCESS_KEY")
+	endpoint := os.Getenv("VOLC_ENDPOINT_ID")
+	baseURL := os.Getenv("VOLC_BASE_URL")
+
+	// 容错兜底：如果本地没有配 BaseURL，自动使用你原本的北京节点默认值
+	if baseURL == "" {
+		baseURL = "https://ark.cn-beijing.volces.com/api/v3"
+	}
+
+	// 🚨 [硬核风控] 生产环境安全断路：一旦发现核心凭证为空，绝不发起网络调用，直接就地熔断
+	if apiKey == "" || endpoint == "" {
+		return nil, fmt.Errorf("❌ 极其致命：Eino 点火失败，环境变量 VOLC_ACCESS_KEY 或 VOLC_ENDPOINT_ID 未正确挂载")
+	}
+
 	// 1. 点火火山引擎 (Eino 复用了 openai 的标准 API 格式)
 	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
-		APIKey:  apiKey,
-		Model:   endpoint,
-		BaseURL: "https://ark.cn-beijing.volces.com/api/v3",
+		APIKey:  apiKey,   // 安全注入
+		Model:   endpoint, // 安全注入
+		BaseURL: baseURL,
 	})
 	if err != nil {
 		return nil, err
 	}
+
 	// 2. 将机械臂直接挂载到大模型上！
+	// 下面是你原本极其优秀的有向无环图（DAG）流转拓扑，逻辑一行不改，保持原样原速运转！
 	toolInfo, err := DefenseTool.Info(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("❌ 机械臂图纸提取失败: %v", err)
@@ -86,6 +105,6 @@ func BulidEinoAgent(ctx context.Context, apiKey string, endpoint string) (compos
 	}, map[string]bool{"Tools": true, compose.END: true}))
 
 	graph.AddEdge("Tools", compose.END)
-	return graph.Compile(ctx)
 
+	return graph.Compile(ctx)
 }
