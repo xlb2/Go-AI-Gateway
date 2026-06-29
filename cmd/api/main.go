@@ -165,7 +165,9 @@ func main() {
 		v1.GET("/ws", handler.ConnectWS(messageService, rdb))
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.StreamInterceptor(handler.RateLimitInterceptor(rdb)),
+	)
 
 	lis, _ := net.Listen("tcp", ":9090")
 	wg.Add(1)

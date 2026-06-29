@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -22,23 +23,29 @@ func JWTAuthMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		tokenString := parts[1]
-		token, err := jwt.ParseWithClaims(tokenString, &CustomClaims{}, func(token *jwt.Token) (interface{}, error) {
-			return jwtSecret, nil
-		})
-		if err != nil || !token.Valid {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "护照已过期或防伪钢印被篡改"})
+		calims, err := ParseToken(parts[1])
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 			c.Abort()
 			return
 		}
-		claims, ok := token.Claims.(*CustomClaims)
-		if ok && token.Valid {
-			c.Set("user_id", claims.UserID)
-			c.Next()
-		} else {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "护照载荷解析失败"})
-			c.Abort()
-			return
-		}
+		c.Set("user_id", calims.UserID)
+		c.Next()
 	}
+}
+
+func ParseToken(tokenString string) (*CustomClaims, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &CustomClaims{}, func(token *jwt.Token) (interface{}, error) {
+		return jwtSecret, nil
+	})
+	if err != nil || !token.Valid {
+		return nil, fmt.Errorf("护照已过期或防伪钢印被篡改: %v", err)
+	}
+
+	claims, ok := token.Claims.(*CustomClaims)
+	if ok && token.Valid {
+		return claims, nil
+	}
+	return nil, fmt.Errorf("护照载荷解析失败")
+
 }

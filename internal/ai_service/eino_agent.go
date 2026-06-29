@@ -51,7 +51,7 @@ var DefenseTool, _ = utils.InferTool(
 
 func BuildEinoAgent(ctx context.Context) (compose.Runnable[[]*schema.Message, any], error) {
 
-	// ⚡ [熔断器] 直接从操作系统的进程环境变量中提取私密配置
+	//  [熔断器] 直接从操作系统的进程环境变量中提取私密配置
 	apiKey := os.Getenv("VOLC_ACCESS_KEY")
 	endpoint := os.Getenv("VOLC_ENDPOINT_ID")
 	baseURL := os.Getenv("VOLC_BASE_URL")
@@ -61,9 +61,9 @@ func BuildEinoAgent(ctx context.Context) (compose.Runnable[[]*schema.Message, an
 		baseURL = "https://ark.cn-beijing.volces.com/api/v3"
 	}
 
-	// 🚨 [硬核风控] 生产环境安全断路：一旦发现核心凭证为空，绝不发起网络调用，直接就地熔断
+	//  [硬核风控] 生产环境安全断路：一旦发现核心凭证为空，绝不发起网络调用，直接就地熔断
 	if apiKey == "" || endpoint == "" {
-		return nil, fmt.Errorf("❌ 极其致命：Eino 点火失败，环境变量 VOLC_ACCESS_KEY 或 VOLC_ENDPOINT_ID 未正确挂载")
+		return nil, fmt.Errorf(" 极其致命：Eino 点火失败，环境变量 VOLC_ACCESS_KEY 或 VOLC_ENDPOINT_ID 未正确挂载")
 	}
 
 	// 1. 点火火山引擎 (Eino 复用了 openai 的标准 API 格式)
@@ -80,11 +80,11 @@ func BuildEinoAgent(ctx context.Context) (compose.Runnable[[]*schema.Message, an
 	// 下面是你原本极其优秀的有向无环图（DAG）流转拓扑，逻辑一行不改，保持原样原速运转！
 	toolInfo, err := DefenseTool.Info(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("❌ 机械臂图纸提取失败: %v", err)
+		return nil, fmt.Errorf(" 机械臂图纸提取失败: %v", err)
 	}
 	err = chatModel.BindTools([]*schema.ToolInfo{toolInfo})
 	if err != nil {
-		return nil, fmt.Errorf("❌ 机械臂挂载至大模型失败: %v", err)
+		return nil, fmt.Errorf(" 机械臂挂载至大模型失败: %v", err)
 	}
 
 	toolsNode, _ := compose.NewToolNode(context.Background(), &compose.ToolsNodeConfig{Tools: []tool.BaseTool{DefenseTool}})
@@ -97,10 +97,10 @@ func BuildEinoAgent(ctx context.Context) (compose.Runnable[[]*schema.Message, an
 
 	graph.AddBranch("LLM", compose.NewGraphBranch(func(ctx context.Context, msg *schema.Message) (string, error) {
 		if len(msg.ToolCalls) > 0 {
-			fmt.Println("⚡ [雷达] 捕捉到工具调用，流量切入 Tools 物理车道！")
+			fmt.Println(" [雷达] 捕捉到工具调用，流量切入 Tools 物理车道！")
 			return "Tools", nil
 		}
-		fmt.Println("💬 [雷达] 纯聊天意图，流量直达终点！")
+		fmt.Println("[雷达] 纯聊天意图，流量直达终点！")
 		return compose.END, nil
 	}, map[string]bool{"Tools": true, compose.END: true}))
 

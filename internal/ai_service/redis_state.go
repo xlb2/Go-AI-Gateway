@@ -56,31 +56,57 @@ func ClearPendingAction(ctx context.Context, userID uint) {
 	Rdb.Del(ctx, key)
 }
 
-// CheckRateLimit 物理执行：Lua 单线程绝对霸占限流// CheckRateLimit 物理执行：Lua 单线程绝对霸占限流
+// CheckRateLimit 物理执行：基于 ZSET 滑动窗口的单线程原子限流
 func CheckRateLimit(ctx context.Context, rdb *redis.Client, userID uint) bool {
-	// 逻辑：把用户的访问次数加 1。如果是第一次，设置 10 秒过期。如果次数大于 5，返回 0（拦截），否则返回 1（放行）。
+	// 限流规则：10秒 (10000毫秒) 内最多 5 次请求
+	windowSizeMs := int64(10000)
+	maxRequests := 5
+
+	// 1. 提取当前物理时间戳（精确到毫秒）
+	now := time.Now().UnixMilli()
+	// 2. 划定窗口的起始线
+	windowStart := now - windowSizeMs
+
+	// 3. 真正的 ZSET 滑动窗口 Lua 脚本
 	script := `
-			local current  = redis.call('INCR',KEYS[1])
-			if tonumber(current) == 1 then 	
-					redis.call('EXPIRE',KEYS[1],ARGV[1])
-			end
-			if tonumber(current) > tonumber(ARGV[2]) then
-					return 0
-			else 	
-					return 1
-			end 
+		local key = KEYS[1]
+		local window_start = tonumber(ARGV[1])
+		local current_time = tonumber(ARGV[2])
+		local max_requests = tonumber(ARGV[3])
+
+		-- 动作1：斩断并清理窗口起始线之前的旧记录
+		redis.call('ZREMRANGEBYSCORE', key, 0, window_start)
+
+		-- 动作2：清点当前窗口内存活的打卡记录数
+		local current_requests = redis.call('ZCARD', key)
+
+		-- 动作3：物理判定
+		if current_requests >= max_requests then
+			return 0 -- 爆表，拦截！
+		else
+			-- 没爆表，将当前的毫秒时间戳作为 score 和 member 存入
+			redis.call('ZADD', key, current_time, current_time)
+			-- 设置物理兜底过期时间，防止死 Key 堆积（稍微大于窗口时间即可）
+			redis.call('EXPIRE', key, 20)
+			return 1 -- 放行！
+		end
 	`
+
 	key := fmt.Sprintf("ratelimit:user:%d", userID)
 
-	result, err := rdb.Eval(ctx, script, []string{key}, 10, 5).Result()
-
+	//  开火！将变量注入 Lua 引擎
+	result, err := rdb.Eval(ctx, script, []string{key}, windowStart, now, maxRequests).Result()
 	if err != nil {
-		fmt.Printf("Redis 执行 Lua 报错：%v\n", err)
+		fmt.Printf(" Redis 限流器底层执行崩溃：%v\n", err)
+		// 工程安全原则：限流器宕机时，默认放行，保障核心业务可用（Fail-open）
 		return true
 	}
+
 	res, ok := result.(int64)
 	if !ok {
 		return true
 	}
+
+	// 返回 true 表示放行 (1)，false 表示被限流拦截 (0)
 	return res == 1
 }
