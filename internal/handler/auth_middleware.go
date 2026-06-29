@@ -23,13 +23,13 @@ func JWTAuthMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		calims, err := ParseToken(parts[1])
+		claims, err := ParseToken(parts[1])
 		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 			c.Abort()
 			return
 		}
-		c.Set("user_id", calims.UserID)
+		c.Set("user_id", claims.UserID)
 		c.Next()
 	}
 }
