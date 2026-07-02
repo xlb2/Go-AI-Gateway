@@ -122,12 +122,26 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 		}
 		//======核心战术动作1：上锁，登记召册====
 		ClientMUtex.Lock()
+
+		// 1.  顶号防御机制：检查该 UserID 是否已经有旧连接存在
+		if oldClient, exists := ClientManager[userID]; exists {
+			fmt.Printf("【系统警告】检测到 UserID: %d 发生多端登录！正在强制掐断旧连接...\n", userID)
+			// 2.  核心修复：物理拔掉旧连接的网线！绝对不能漏掉这一步，否则直接 FD 泄漏！
+			oldClient.Conn.Close()
+		}
+
+		// 3. 安全登记新连接
 		ClientManager[userID] = &Client{
 			Conn:          conn,
 			LastHeartbeat: time.Now(),
 		}
+
+		// 4. 计算当前真实在线人数 (直接拿 Map 的长度最准，不需要自己搞个容易 Data Race 的变量)
+		currentOnline := len(ClientManager)
+
 		ClientMUtex.Unlock()
-		fmt.Printf("【系统广播】UserID: %d 已登记入册！当前在线人数: %d\n", userID, len(ClientManager))
+
+		fmt.Printf("【系统广播】UserID: %d 已登记入册！当前真实在线人数: %d\n", userID, currentOnline)
 
 		//核心战术2：设置拔网线时的物理回收机制====
 		defer func() {

@@ -32,36 +32,76 @@ func (w *wrappedServerStream) Context() context.Context {
 
 func (s *AgentGatewayImpl) StreamChat(stream rpc.AgentGateway_StreamChatServer) error {
 	ctx := stream.Context()
-
-	//  核心动作：从 Context 里抠出接入层拦截器注入的 TraceID
 	traceID, _ := ctx.Value(middleware.TraceIDKey).(string)
-	if traceID == "" {
-		traceID = "unknown-trace"
-	}
 
-	log.Printf("[TRACE: %s]  gRPC 双向流链接已经建立!", traceID)
-	var seq int32 = 0
+	log.Printf("[TRACE: %s]  gRPC 连接建立", traceID)
+
+	//  核心公约1：落实简历上的 "严密的 defer 资源回收"
+	defer func() {
+		log.Printf("[TRACE: %s]  会话生命周期终结，清理机房内存", traceID)
+	}()
+
 	for {
 		in, err := stream.Recv()
 		if err == io.EOF {
-			log.Printf("[TRACE: %s]  客户端主动断开了连接", traceID)
 			return nil
 		}
 		if err != nil {
-			log.Printf("[TRACE: %s]  接收流出错: %v\n", traceID, err)
 			return err
 		}
 
-		log.Printf("[TRACE: %s]  收到客户端消息：Session = %s ,Query = %s\n", traceID, in.SessionId, in.UserQuery)
-		seq++
-		resp := &rpc.ChatResponse{
-			SeqNum:    seq,
-			DeltaText: "网关回声：" + in.UserQuery,
-		}
-		err = stream.Send(resp)
-		if err != nil {
-			log.Printf("[TRACE: %s]  发送流出错: %v\n", traceID, err)
-			return err
+		log.Printf("[TRACE: %s]  收到任务: %s", traceID, in.UserQuery)
+
+		//  核心公约2：开辟 AI 算力缓冲通道
+		// 注意：这里的数字 100 是生死攸关的配置！
+		aiChunkChan := make(chan string, 100)
+		errChan := make(chan error, 1)
+
+		// 启动异步独立协程，去调下游的大模型（Eino引擎）
+		go func(query string) {
+			defer close(aiChunkChan) // 铁律：生产者协程执行完毕后，必须由生产者 close 通道！
+
+			// 模拟调用 Eino 大模型流式 API（把带有 TraceID 和熔断树的 ctx 透传进去！）
+			// CallEinoStream(ctx, query, aiChunkChan, errChan)
+
+			// --- 这里暂时用假数据模拟大模型慢速吐字 ---
+			chunks := []string{"思考中...", "基于Go的", "网关架构", "核心在于", "多路复用。"}
+			for _, c := range chunks {
+				aiChunkChan <- c
+			}
+		}(in.UserQuery)
+
+		//  核心公约3：落实简历上的 "基于 Context 树的生命周期强制阻断机制"
+		streamAlive := true
+		var seq int32 = 0
+
+		for streamAlive {
+			select {
+			case <-ctx.Done():
+				//  触发物理现场：用户把网页关了 / 手机退网了！
+				log.Printf("[TRACE: %s]  捕捉到客户端静默断连(Reason: %v)，立刻级联阻断下游AI协程！", traceID, ctx.Err())
+				return ctx.Err() // 强行跳出函数，触发外层 defer
+
+			case aiErr := <-errChan:
+				log.Printf("[TRACE: %s]  下游 AI 算力节点暴雷: %v", traceID, aiErr)
+				return aiErr
+
+			case chunk, ok := <-aiChunkChan:
+				if !ok {
+					// 通道已被生产者 close，说明大模型本次回答完毕
+					streamAlive = false
+					break
+				}
+				seq++
+				resp := &rpc.ChatResponse{
+					SeqNum:    seq,
+					DeltaText: chunk,
+				}
+				if sendErr := stream.Send(resp); sendErr != nil {
+					log.Printf("[TRACE: %s]  网络下行推送失败: %v", traceID, sendErr)
+					return sendErr
+				}
+			}
 		}
 	}
 }

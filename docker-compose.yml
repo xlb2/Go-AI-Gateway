@@ -21,23 +21,7 @@ services:
     ports:
       - "6379:6379"
 
-  # === 3. 部署你的 Go IM 网关 ===
-  im_app:
-    build: . 
-    container_name: im_gateway_app
-    ports:
-      - "8080:8080"
-      - "6060:6060"
-    depends_on:
-      - mysql
-      - redis
-      - rabbitmq
-    # 极其冷酷的网络注入：容器之间通过“服务名(mysql/redis)”互相通信，彻底抛弃 localhost
-    environment:
-      - DB_DSN=root:123456@tcp(mysql:3306)/im_gateway_db?charset=utf8mb4&parseTime=True&loc=Local
-      - REDIS_ADDR=redis:6379
-      - MQ_URL=amqp://guest:guest@rabbitmq:5672/
-  # === 4. 强行挂载 RabbitMQ 消息队列 ===
+  # === 3. 强行挂载 RabbitMQ 消息队列 ===
   rabbitmq:
     image: rabbitmq:3-management-alpine # 带 management 后缀意味着自带 Web 监控大屏
     container_name: im_rabbitmq
