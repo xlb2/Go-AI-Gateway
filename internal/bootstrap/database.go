@@ -30,7 +30,7 @@ func InitDB(dsn string) *gorm.DB {
 	}
 
 	// 自动迁移表结构
-	err = db.AutoMigrate(&model.User{}, &model.Message{})
+	err = db.AutoMigrate(&model.User{}, &model.Message{}, &model.Conversation{}, &model.ConversationMember{})
 	if err != nil {
 		panic("数据库迁移失败: " + err.Error())
 	}

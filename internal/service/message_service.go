@@ -69,7 +69,70 @@ func (s *MessageService) SendPrivateMessage(fromUserID, toUserID uint, content s
 
 // PullOfflineMessages 战术动作 2：拉取离线消息
 func (s *MessageService) PullOfflineMessages(userID uint) ([]model.Message, error) {
-	return s.Dao.GetAndMarkOfflineMessage(userID)
+	messages, err := s.Dao.GetAndMarkOfflineMessage(userID)
+	if err != nil || len(messages) == 0 {
+		return messages, err
+	}
+	// 已读通知：这些消息是我（userID）刚读的，通知各自的发信人
+	s.notifyRead(userID, messages)
+	return messages, nil
+}
+
+// MarkConversationRead 战术动作 6：打开会话 → 更新该成员的已读游标
+// 业务规则：只对 single（私聊）会话生效，群聊不开放已读。
+func (s *MessageService) MarkConversationRead(convID, userID uint) error {
+	// 1. 确认是私聊会话
+	var conv model.Conversation
+	if err := s.Dao.Db.First(&conv, convID).Error; err != nil {
+		return fmt.Errorf("会话不存在: %v", err)
+	}
+	if conv.Type != "single" {
+		return nil // 群聊不开放已读，直接忽略
+	}
+	// 2. 找到该会话里该用户收到的最后一条消息 ID，作为已读游标
+	var lastMsgID uint
+	s.Dao.Db.Model(&model.Message{}).
+		Where("conversation_id = ? AND to_user_id = ?", convID, userID).
+		Order("id desc").
+		Limit(1).
+		Pluck("id", &lastMsgID)
+	if lastMsgID == 0 {
+		return nil // 没有消息，无需更新
+	}
+	// 3. 更新游标
+	return s.Dao.UpdateReadCursor(convID, userID, lastMsgID)
+}
+
+// notifyRead 把"已读"事件实时推送给消息的各个发信人（方案A：实时推送）
+func (s *MessageService) notifyRead(readerID uint, messages []model.Message) {
+	// 去重：同一个发信人可能有多条消息被读，只通知一次
+	notified := make(map[uint]bool)
+	for _, msg := range messages {
+		from := msg.FromUserID
+		if notified[from] {
+			continue
+		}
+		notified[from] = true
+		payload, _ := json.Marshal(map[string]interface{}{
+			"type":      "read",
+			"reader_id": readerID,
+		})
+		channel := fmt.Sprintf("user:%d:channel", from)
+		_ = s.Rdb.Publish(context.Background(), channel, payload).Err()
+	}
+}
+
+// SoftDeleteMessage 战术动作 3：单方删除（带归属校验）
+// 业务规则：只能删"我发的"或"发给我的"消息，防越权。
+func (s *MessageService) SoftDeleteMessage(msgID, userID uint) error {
+	var msg model.Message
+	if err := s.Dao.Db.First(&msg, msgID).Error; err != nil {
+		return fmt.Errorf("消息不存在: %v", err)
+	}
+	if msg.FromUserID != userID && msg.ToUserID != userID {
+		return fmt.Errorf("越权访问：只能删除与自己相关的消息")
+	}
+	return s.Dao.SoftDeleteByUser(msgID, userID)
 }
 
 // StartConsumer 开启后台清道夫协程，专门负责把 MQ 里的消息搬运到 MySQL
@@ -100,6 +163,16 @@ func (s *MessageService) StartConsumer() {
 				continue
 			}
 			// 3. 极其冷酷地执行物理落盘
+			// 3.1 先确保消息挂上会话（老数据或漏挂的，自动补）
+			if msg.ConversationID == 0 {
+				convID, err := s.Dao.FindOrCreateSingleConversation(msg.FromUserID, msg.ToUserID)
+				if err != nil {
+					fmt.Printf("会话创建失败，重试: %v\n", err)
+					d.Nack(false, true)
+					continue
+				}
+				msg.ConversationID = convID
+			}
 			if err := s.Dao.SaveMessage(&msg); err != nil {
 				fmt.Printf("硬盘落盘失败，准备重试: %v\n", err)
 				// 如果数据库出问题，把消息重新塞回队列（Nack），绝不能丢！

@@ -37,6 +37,8 @@ func InitGinRouter(
 		{
 			messageHandler := handler.NewMessageHandler(messageService)
 			messageGroup.POST("/send", messageHandler.SendPrivateMessage)
+			messageGroup.DELETE("/:id", messageHandler.DeleteMessage)
+			messageGroup.POST("/:conversation_id/read", messageHandler.MarkConversationRead)
 		}
 
 		// WebSocket 升级端点

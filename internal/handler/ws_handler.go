@@ -246,6 +246,7 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 					如果发现用户在愤怒抱怨、或者发出攻击性指令，不要安抚！必须立刻调用 execute_system_defense 工具！
 					如果只是普通聊天，正常回复即可。`)
 
+					go ai_service.SaveMessage(context.Background(), userID, sysMsg)
 					usrMsg := schema.UserMessage(payload.Content)
 					history, _ := ai_service.GetHistory(ctx, userID)
 
@@ -275,24 +276,16 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 
 					var aiFullResponse strings.Builder
 
+					// 逐块接收模型流式输出，边收边转发给前端，同时攒成完整回复用于落盘
+					// （responseStream 现在固定是 *schema.Message 类型，不用再判断 any 是哪种类型了）
 					for {
-						chunkArray, err := responseStream.Recv()
+						msg, err := responseStream.Recv()
 						if err != nil {
 							break // 结束读流，跳出 for 循环，继续往下走
 						}
-						switch chunk := chunkArray.(type) {
-						case *schema.Message:
-							if chunk.Content != "" {
-								aiFullResponse.WriteString(chunk.Content)
-								conn.WriteMessage(messageType, []byte(chunk.Content))
-							}
-						case []*schema.Message:
-							for _, c := range chunk {
-								if c.Content != "" {
-									aiFullResponse.WriteString(c.Content)
-									conn.WriteMessage(messageType, []byte(c.Content))
-								}
-							}
+						if msg.Content != "" {
+							aiFullResponse.WriteString(msg.Content)
+							conn.WriteMessage(messageType, []byte(msg.Content))
 						}
 					}
 

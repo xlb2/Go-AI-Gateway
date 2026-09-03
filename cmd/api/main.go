@@ -40,10 +40,17 @@ func main() {
 	defer mqConn.Close()
 	defer mqCh.Close()
 
+	// 4.5 历史消息迁移：老数据按 (from,to) 自动补建会话
+	migrationDAO := dao.NewMessageDAO(db)
+	if err := migrationDAO.MigrateLegacyMessages(); err != nil {
+		log.Printf("⚠️ 历史消息迁移失败（不影响启动）: %v\n", err)
+	}
+
 	// 5. 依赖注入：按 DAO -> Service -> Handler 顺序组装
 	ai_service.Rdb = rdb
 	messageDAO := dao.NewMessageDAO(db)
 	messageService := service.NewMessageService(messageDAO, rdb, mqCh)
+	messageService.StartConsumer() // 启动 MQ 消费者：异步把消息落盘到 MySQL
 	userHandler := &handler.UserHandler{DB: db}
 
 	// 6. 组装 HTTP 路由
