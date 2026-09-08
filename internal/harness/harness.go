@@ -8,10 +8,10 @@
 //	approval 审批器官：人在回路挂起状态机
 //	hooks    钩子器官：横切需求插槽（pre 拦截 / post 观察）
 //	subagent 子智能体器官：一次性子 agent（delegate_task 工具派活，上下文不回流）
+//	spill    溢出存储器官：大内容外存留定位符（store/load_large_content 工具）
 //
 // 还没长出来的器官（README Roadmap，先留位）：
 //
-//	TODO spill 超大工具输出外存留定位符（compaction 的兄弟）
 //	TODO MCP 集成     外部 MCP server 工具桥进统一注册表
 //	TODO 沙箱         高危工具进隔离容器（了解级，用现成容器）
 //	TODO app-server   稳定版本化双向协议（当前是裸 WebSocket）

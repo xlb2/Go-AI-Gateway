@@ -22,6 +22,7 @@ import (
 
 	"go_im_gateway/internal/harness/approval"
 	"go_im_gateway/internal/harness/session"
+	"go_im_gateway/internal/harness/spill"
 	"go_im_gateway/internal/harness/subagent"
 )
 
@@ -117,6 +118,49 @@ var DelegateTool, _ = utils.InferTool(
 			return "", fmt.Errorf("子智能体执行失败: %v", err)
 		}
 		return res.Output, nil
+	},
+)
+
+// SpillSaveParams store_large_content 工具的入参
+type SpillSaveParams struct {
+	Name    string `json:"name" jsonschema:"description=给这段内容起的名字(便于辨认),required"`
+	Content string `json:"content" jsonschema:"description=要保存的大段内容,required"`
+}
+
+// SaveLargeContentTool 溢出存储工具：把大段内容存起来，只把定位符 + 取回指引给模型（M7 spill）。
+var SaveLargeContentTool, _ = utils.InferTool(
+	"store_large_content",
+	"当需要保存一段很长的内容(如大段文本/长文章)、不想每次都占用对话上下文时调用，返回一个定位符。",
+	func(ctx context.Context, params *SpillSaveParams) (string, error) {
+		userID, err := getUserID(ctx)
+		if err != nil {
+			return "", err
+		}
+		store := spill.RedisStore{}
+		ref, err := store.SaveText(ctx, userID, params.Name, params.Content)
+		if err != nil {
+			return "", fmt.Errorf("溢出存储失败: %v", err)
+		}
+		return fmt.Sprintf("已保存(%d 字节)。%s", ref.Bytes, ref.RetrievalHint), nil
+	},
+)
+
+// SpillLoadParams load_large_content 工具的入参
+type SpillLoadParams struct {
+	Locator string `json:"locator" jsonschema:"description=store_large_content 返回的定位符,required"`
+}
+
+// LoadLargeContentTool 溢出取回工具：按定位符取回之前保存的大段内容。
+var LoadLargeContentTool, _ = utils.InferTool(
+	"load_large_content",
+	"用定位符取回之前保存的大段内容。",
+	func(ctx context.Context, params *SpillLoadParams) (string, error) {
+		store := spill.RedisStore{}
+		content, err := store.LoadText(ctx, params.Locator)
+		if err != nil {
+			return "", err
+		}
+		return content, nil
 	},
 )
 
@@ -233,7 +277,7 @@ func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
 		// 用来把 react 内部吞掉的中间工具消息落盘成 tool/call + tool/result 事件。
 		MessageModifier: newMemoryLogModifier(userID),
 		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: []tool.BaseTool{ArchivalSearchTool, DefenseTool, DelegateTool},
+			Tools: []tool.BaseTool{ArchivalSearchTool, DefenseTool, DelegateTool, SaveLargeContentTool, LoadLargeContentTool},
 		},
 	})
 	if err != nil {
