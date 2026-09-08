@@ -8,6 +8,9 @@ import (
 	"go_im_gateway/internal/config"
 	"go_im_gateway/internal/dao"
 	"go_im_gateway/internal/handler"
+	"go_im_gateway/internal/harness/approval"
+	"go_im_gateway/internal/harness/hooks"
+	"go_im_gateway/internal/harness/session"
 	"go_im_gateway/internal/service"
 	"log"
 	"net/http"
@@ -47,8 +50,10 @@ func main() {
 	}
 
 	// 5. 依赖注入：按 DAO -> Service -> Handler 顺序组装
-	ai_service.Rdb = rdb
-	ai_service.RegisterDefaultHooks() // 注册内置横切钩子（敏感词/超长拦截 + 回复统计）
+	ai_service.Rdb = rdb         // 兼容 legacy 记忆/状态函数
+	session.Init(rdb)            // harness 记忆器官注入 Redis
+	approval.Init(rdb)           // harness 审批器官注入 Redis
+	hooks.RegisterDefaultHooks() // 内置横切钩子（敏感词/超长拦截 + 回复统计）
 	messageDAO := dao.NewMessageDAO(db)
 	messageService := service.NewMessageService(messageDAO, rdb, mqCh)
 	messageService.StartConsumer() // 启动 MQ 消费者：异步把消息落盘到 MySQL

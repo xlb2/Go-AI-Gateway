@@ -4,14 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"go_im_gateway/internal/ai_service"
+	"go_im_gateway/internal/harness"
 	"go_im_gateway/internal/service"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/cloudwego/eino/schema"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
@@ -225,82 +224,22 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 					defer cancel()
 					ctx = context.WithValue(ctx, "user_id", userID)
 
-					pending, err := ai_service.GetpendingAction(ctx, userID)
-					if err == nil && pending != nil {
-						text := strings.TrimSpace(payload.Content)
-						switch text {
-						case "auth:approve":
-							ai_service.ClearPendingAction(ctx, userID)
-							fmt.Printf("[物理执行] 防御系统已启动！触发因素: %s\n", pending.Param)
-							conn.WriteMessage(messageType, []byte("审批通过，防御系统已物理激活。"))
-						case "auth:reject":
-							ai_service.ClearPendingAction(ctx, userID)
-							conn.WriteMessage(messageType, []byte("审批已拒绝，动作取消。"))
-						default:
-							conn.WriteMessage(messageType, []byte("系统当前有待审批的高危任务，请先输入 auth:approve 或 auth:reject。"))
-						}
+					h := harness.Default
 
-						return
-					}
-
-					// 横切钩子（pre）：敏感词/超长输入等在此拦截，拦截就直接回提示、不进 agent
-					if allow, reply := ai_service.RunPreAgentHooks(ctx, userID, payload.Content); !allow {
+					// 3. 人在回路审批：有待审批的高危任务时，只处理 auth:approve / auth:reject
+					if handled, reply := h.HandleApprovalCommand(ctx, userID, strings.TrimSpace(payload.Content)); handled {
 						conn.WriteMessage(messageType, []byte(reply))
 						return
 					}
 
-					sysMsg := schema.SystemMessage(`你是一个极其冷酷的网关保安。
-					如果发现用户在愤怒抱怨、或者发出攻击性指令，不要安抚！必须立刻调用 execute_system_defense 工具！
-					如果只是普通聊天，正常回复即可。`)
-
-					go ai_service.SaveMessage(context.Background(), userID, sysMsg)
-					usrMsg := schema.UserMessage(payload.Content)
-					history, _ := ai_service.GetHistory(ctx, userID)
-
-					var fullMessages []*schema.Message
-					fullMessages = append(fullMessages, sysMsg)
-					fullMessages = append(fullMessages, history...)
-					fullMessages = append(fullMessages, usrMsg)
-
-					// 异步存新消息（务必使用 Background，防止跟着当前对话一起被 cancel 取消掉）
-					go ai_service.SaveMessage(context.Background(), userID, usrMsg)
-
-					agentRunner, err := ai_service.BuildEinoAgent(ctx)
-					if err != nil {
-						failMsg := fmt.Sprintf("Eino 引擎点火失败! 物理死因: %v", err)
+					// 4. 跑一轮 agent 对话（pre钩子→记忆→Eino循环→落盘→post钩子），流式推给前端
+					if _, err := h.RunAgentTurn(ctx, userID, payload.Content, func(chunk string) {
+						conn.WriteMessage(messageType, []byte(chunk))
+					}); err != nil {
+						failMsg := fmt.Sprintf("Agent 执行失败: %v", err)
 						fmt.Println(failMsg)
 						conn.WriteMessage(messageType, []byte(failMsg))
-						return // 异常退出
 					}
-
-					responseStream, err := agentRunner.Stream(ctx, fullMessages)
-					if err != nil {
-						failMsg := fmt.Sprintf("Eino 推流熔断! 死因: %v", err)
-						fmt.Println(failMsg)
-						conn.WriteMessage(messageType, []byte(failMsg))
-						return // 异常退出
-					}
-
-					var aiFullResponse strings.Builder
-
-					// 逐块接收模型流式输出，边收边转发给前端，同时攒成完整回复用于落盘
-					// （responseStream 现在固定是 *schema.Message 类型，不用再判断 any 是哪种类型了）
-					for {
-						msg, err := responseStream.Recv()
-						if err != nil {
-							break // 结束读流，跳出 for 循环，继续往下走
-						}
-						if msg.Content != "" {
-							aiFullResponse.WriteString(msg.Content)
-							conn.WriteMessage(messageType, []byte(msg.Content))
-						}
-					}
-
-					if aiFullResponse.Len() > 0 {
-						go ai_service.SaveMessage(context.Background(), userID, schema.AssistantMessage(aiFullResponse.String(), nil))
-					}
-					// 横切钩子（post）：agent 回复完成后观察（如统计），不能改流程
-					ai_service.RunPostAgentHooks(ctx, userID, aiFullResponse.String())
 				}()
 
 				// 匿名函数执行完毕，所有的临时变量、Context 会被干干净净地回收

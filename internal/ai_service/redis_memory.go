@@ -171,6 +171,7 @@ func GetHistory(ctx context.Context, userID uint) ([]*schema.Message, error) {
 //     一起喂出（模型侧协议要求 tool 消息必须紧跟在带 tool_calls 的 assistant 消息后面）；
 //   - 只出现一半的（有 call 没 result，或悬空的 result）整对丢弃，绝不喂悬空消息；
 //   - system/prompt 是 log-only，不进投影。
+//
 // 最后只保留最近 MaxHistory 条真消息；裁剪切在配对中间时，丢弃开头的悬空 tool 消息。
 func projectMessages(dtos []MemoryDTO) []*schema.Message {
 	history := make([]*schema.Message, 0, len(dtos))
