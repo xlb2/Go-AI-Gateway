@@ -43,7 +43,7 @@ func main() {
 	// 4.5 历史消息迁移：老数据按 (from,to) 自动补建会话
 	migrationDAO := dao.NewMessageDAO(db)
 	if err := migrationDAO.MigrateLegacyMessages(); err != nil {
-		log.Printf("⚠️ 历史消息迁移失败（不影响启动）: %v\n", err)
+		log.Printf("历史消息迁移失败（不影响启动）: %v\n", err)
 	}
 
 	// 5. 依赖注入：按 DAO -> Service -> Handler 顺序组装

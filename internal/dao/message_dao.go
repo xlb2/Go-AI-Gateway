@@ -136,7 +136,7 @@ func (dao *MessageDAO) MigrateLegacyMessages() error {
 		}
 	}
 	if len(legacy) > 0 {
-		fmt.Printf("✅ 历史消息迁移完成：%d 条老消息已补挂会话\n", len(legacy))
+		fmt.Printf("历史消息迁移完成：%d 条老消息已补挂会话\n", len(legacy))
 	}
 	return nil
 }

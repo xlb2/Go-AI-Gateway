@@ -17,10 +17,42 @@ const MaxHistory = 20
 // ArchiveDefaultTopK 检索默认返回条数
 const ArchiveDefaultTopK = 3
 
+// 事件类型（对应 dsh SessionEventMap 的最小剪影，见 HARNESS-STUDY.md M4）。
+// 只有 user/message、assistant/message 会进"投影"（GetHistory 喂给模型的那份历史）；
+// system/prompt 与 tool/result 是 log-only——只追加进日志、暂不进模型上下文。
+const (
+	// EventUserMessage 用户说的话（surface，喂模型）
+	EventUserMessage = "user/message"
+	// EventAssistantMessage 模型组装好的完整回复（surface，喂模型）
+	EventAssistantMessage = "assistant/message"
+	// EventSystemPrompt 系统提示词（log-only，不喂模型；对应 dsh 的 request/header）
+	EventSystemPrompt = "system/prompt"
+	// EventToolResult 工具执行结果（log-only：日志有、投影先没有，原因见 GetHistory）
+	EventToolResult = "tool/result"
+)
+
 type MemoryDTO struct {
+	Type    string    `json:"type"`
 	Role    string    `json:"role"`
 	Content string    `json:"content"`
 	Time    time.Time `json:"time"`
+}
+
+// inferEventType 把 Eino 的消息角色映射成事件类型。
+// 老数据没有 type 字段（Type==""），读取时用它按 Role 兜底推断，保证新旧记录兼容。
+func inferEventType(role schema.RoleType) string {
+	switch string(role) {
+	case "user":
+		return EventUserMessage
+	case "assistant":
+		return EventAssistantMessage
+	case "system":
+		return EventSystemPrompt
+	case "tool":
+		return EventToolResult
+	default:
+		return string(role)
+	}
 }
 
 // SaveMessage 把一条消息追加到唯一的记忆日志（agent:V2:history），只增不减、永久保存。
@@ -30,8 +62,9 @@ func SaveMessage(ctx context.Context, userID uint, msg *schema.Message) error {
 		fmt.Println(" [记忆中枢] 致命错误：Redis 连接池未挂载")
 		return fmt.Errorf("redis client is nil")
 	}
-	// 1. 降维抽离：把 Eino 的复杂对象，降级为我们自己的纯净 DTO
+	// 1. 降维抽离：把 Eino 的复杂对象，降级为我们自己的纯净 DTO（同时打上事件类型）
 	dto := MemoryDTO{
+		Type:    inferEventType(msg.Role),
 		Role:    string(msg.Role),
 		Content: msg.Content,
 		Time:    time.Now(),
@@ -69,13 +102,19 @@ func AppendToolEvent(ctx context.Context, userID uint, toolName, params, result 
 }
 
 // GetHistory 取出最近 MaxHistory 条消息，喂给模型当上下文。
+// 这就是"投影"（对应 dsh 的 deriveMessages）：从事件日志里挑出该给模型看的那部分。
+// 投影规则：只投影 user/message 与 assistant/message 两种 surface 事件；
+// system/prompt 与 tool/result 是 log-only——日志里有、模型视图里没有。
+// 为什么 tool/result 先不进投影？模型侧的协议要求"工具结果必须跟在一条带 tool_calls 的
+// assistant 消息后面"（成对出现），而 AppendToolEvent 落盘的是拍平的字符串、没有配对的
+// 调用消息，直接喂会给 provider 拒绝。配对这一步留作后续升级。
 func GetHistory(ctx context.Context, userID uint) ([]*schema.Message, error) {
 	if Rdb == nil {
 		return nil, fmt.Errorf("redis client is nil")
 	}
 	key := fmt.Sprintf("agent:V2:history:%d", userID)
 
-	// 全量读出来：先筛掉 system，再取最后 MaxHistory 条真消息（顺序不能反：先筛后切）
+	// 全量读出来：先按投影规则筛掉 log-only 事件，再取最后 MaxHistory 条真消息（顺序不能反：先筛后切）
 	dataList, err := Rdb.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
 		return nil, err
@@ -87,8 +126,13 @@ func GetHistory(ctx context.Context, userID uint) ([]*schema.Message, error) {
 			fmt.Printf(" [记忆中枢] 破译记忆碎片失败: %v\n", err)
 			continue
 		}
-		if dto.Role == "system" || dto.Role == "tool" {
-			continue
+		// 老记录没有 type 字段，按 Role 兜底推断，保证兼容
+		typ := dto.Type
+		if typ == "" {
+			typ = inferEventType(schema.RoleType(dto.Role))
+		}
+		if typ == EventSystemPrompt || typ == EventToolResult {
+			continue // log-only：只记不喂
 		}
 		msg := &schema.Message{
 			Role:    schema.RoleType(dto.Role),
@@ -146,8 +190,12 @@ func SearchArchival(ctx context.Context, userID uint, query string, topK int) ([
 		if err := json.Unmarshal([]byte(data), &dto); err != nil {
 			continue
 		}
-		if dto.Role == "system" || dto.Role == "tool" {
-			continue
+		typ := dto.Type
+		if typ == "" {
+			typ = inferEventType(schema.RoleType(dto.Role))
+		}
+		if typ == EventSystemPrompt || typ == EventToolResult {
+			continue // log-only：检索的也是"喂过模型的记忆"，不含日志噪声
 		}
 		msgTokens := tokenize(dto.Content)
 		score := 0

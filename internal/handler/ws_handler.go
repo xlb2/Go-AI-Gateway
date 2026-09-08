@@ -55,10 +55,10 @@ type AIResponse struct {
 
 func ExecuteSystemCommand(emotion string) {
 	fmt.Println("\n==================================================")
-	fmt.Printf("⚠️ 警告：系统检测到高危指令！用户当前情绪: [%s]\n", emotion)
-	fmt.Println("⚙️ 正在启动本地物理防御协议...")
-	fmt.Println("✅ 动作 1：已开启高频限流盾！")
-	fmt.Println("✅ 动作 2：已向系统管理员发送预警弹窗！")
+	fmt.Printf("警告：系统检测到高危指令！用户当前情绪: [%s]\n", emotion)
+	fmt.Println("正在启动本地物理防御协议...")
+	fmt.Println("动作 1：已开启高频限流盾！")
+	fmt.Println("动作 2：已向系统管理员发送预警弹窗！")
 }
 
 func (c *Client) SendMessage(msg []byte) error {
@@ -228,15 +228,16 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 					pending, err := ai_service.GetpendingAction(ctx, userID)
 					if err == nil && pending != nil {
 						text := strings.TrimSpace(payload.Content)
-						if text == "auth:approve" {
+						switch text {
+						case "auth:approve":
 							ai_service.ClearPendingAction(ctx, userID)
-							fmt.Printf("✅ [物理执行] 防御系统已启动！触发因素: %s\n", pending.Param)
-							conn.WriteMessage(messageType, []byte("✅ 审批通过，防御系统已物理激活。"))
-						} else if text == "auth:reject" {
+							fmt.Printf("[物理执行] 防御系统已启动！触发因素: %s\n", pending.Param)
+							conn.WriteMessage(messageType, []byte("审批通过，防御系统已物理激活。"))
+						case "auth:reject":
 							ai_service.ClearPendingAction(ctx, userID)
-							conn.WriteMessage(messageType, []byte("❌ 审批已拒绝，动作取消。"))
-						} else {
-							conn.WriteMessage(messageType, []byte("⚠️ 系统当前有待审批的高危任务，请先输入 auth:approve 或 auth:reject。"))
+							conn.WriteMessage(messageType, []byte("审批已拒绝，动作取消。"))
+						default:
+							conn.WriteMessage(messageType, []byte("系统当前有待审批的高危任务，请先输入 auth:approve 或 auth:reject。"))
 						}
 
 						return
@@ -260,7 +261,7 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 
 					agentRunner, err := ai_service.BuildEinoAgent(ctx)
 					if err != nil {
-						failMsg := fmt.Sprintf("❌ Eino 引擎点火失败! 物理死因: %v", err)
+						failMsg := fmt.Sprintf("Eino 引擎点火失败! 物理死因: %v", err)
 						fmt.Println(failMsg)
 						conn.WriteMessage(messageType, []byte(failMsg))
 						return // 异常退出
@@ -268,7 +269,7 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 
 					responseStream, err := agentRunner.Stream(ctx, fullMessages)
 					if err != nil {
-						failMsg := fmt.Sprintf("❌ Eino 推流熔断! 死因: %v", err)
+						failMsg := fmt.Sprintf("Eino 推流熔断! 死因: %v", err)
 						fmt.Println(failMsg)
 						conn.WriteMessage(messageType, []byte(failMsg))
 						return // 异常退出
@@ -300,7 +301,7 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 			}
 			err = msgService.SendPrivateMessage(userID, payload.ToUserID, payload.Content)
 			if err != nil {
-				conn.WriteMessage(messageType, []byte(fmt.Sprintf("系统警告：消息发送失败 %v", err)))
+				conn.WriteMessage(messageType, []byte("系统警告：消息发送失败 "+err.Error()))
 			} else {
 				conn.WriteMessage(messageType, []byte("系统：炮弹已升空，已交由参谋部全网路由！"))
 			}

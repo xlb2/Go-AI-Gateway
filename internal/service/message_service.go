@@ -148,10 +148,10 @@ func (s *MessageService) StartConsumer() {
 		nil,            // 额外参数
 	)
 	if err != nil {
-		fmt.Printf("🔴 消费者通道开启失败: %v\n", err)
+		fmt.Printf("消费者通道开启失败: %v\n", err)
 		return
 	}
-	fmt.Println("🎧 异步落盘清道夫已就位，正在监听 RabbitMQ...")
+	fmt.Println("异步落盘清道夫已就位，正在监听 RabbitMQ...")
 	go func() {
 		for d := range msgs {
 			// d.Body 就是你刚才打进来的那颗子弹（JSON 格式的字节流）
@@ -182,7 +182,7 @@ func (s *MessageService) StartConsumer() {
 			// 4. 落盘成功！向 RabbitMQ 发送物理回执，把这颗子弹从内存中销毁！
 			// 这就是大厂保证消息 100% 绝对落盘的终极奥义！
 			d.Ack(false)
-			fmt.Printf("✅ 消息异步落盘成功！发送者: %d, 接收者: %d\n", msg.FromUserID, msg.ToUserID)
+			fmt.Printf("消息异步落盘成功！发送者: %d, 接收者: %d\n", msg.FromUserID, msg.ToUserID)
 		}
 	}()
 }

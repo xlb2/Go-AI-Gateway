@@ -15,39 +15,50 @@ func InitRedis() {
 	Rdb = redis.NewClient(&redis.Options{Addr: "im_redis:6379"})
 }
 
-// 定义挂起状态的结构
+// PendingAction 挂起状态：agent 发起的高危动作先不执行，等管理员在终端输入
+// auth:approve / auth:reject 审批。对应 dsh 的"审批升级"（AskForApproval→Decision），
+// 见 HARNESS-STUDY.md M6。
 type PendingAction struct {
-	Action string `json:"action"` // 要执行的动作名称
-	Param  string `json:"param"`  // 动作的参数
+	// Action 要执行的动作名称（如 execute_system_defense）
+	Action string `json:"action"`
+	// Param 动作的参数（如触发防御的情绪）
+	Param string `json:"param"`
 }
 
-// 写入挂起状态 (TTL 5分钟，超时自动作废)
+// SetPendingAction 把一个高危动作挂起（Redis 5 分钟 TTL，超时自动作废）。
 func SetPendingAction(ctx context.Context, userID uint, action PendingAction) error {
 	if Rdb == nil {
-		return fmt.Errorf("Redis 客户端未初始化")
+		return fmt.Errorf("redis client is nil")
 	}
-	data, _ := json.Marshal(action)
+	data, err := json.Marshal(action)
+	if err != nil {
+		return err
+	}
 	key := fmt.Sprintf("agent:pending:%d", userID)
 	return Rdb.Set(ctx, key, data, 5*time.Minute).Err()
 }
 
-// 读取挂起状态
+// GetpendingAction 读取当前挂起的高危动作；没有挂起时返回 (nil, nil)，不算错误。
 func GetpendingAction(ctx context.Context, userID uint) (*PendingAction, error) {
 	if Rdb == nil {
-		return nil, fmt.Errorf("Redis 客户端未初始化")
+		return nil, fmt.Errorf("redis client is nil")
 	}
 	key := fmt.Sprintf("agent:pending:%d", userID)
 	data, err := Rdb.Get(ctx, key).Bytes()
+	if err == redis.Nil {
+		return nil, nil // 没有挂起动作
+	}
 	if err != nil {
 		return nil, err
 	}
 	var action PendingAction
-	json.Unmarshal(data, &action)
+	if err := json.Unmarshal(data, &action); err != nil {
+		return nil, err
+	}
 	return &action, nil
 }
 
-// 清除挂起状态
-
+// ClearPendingAction 清除挂起状态（审批完无论通过还是拒绝都清掉）。
 func ClearPendingAction(ctx context.Context, userID uint) {
 	if Rdb == nil {
 		return

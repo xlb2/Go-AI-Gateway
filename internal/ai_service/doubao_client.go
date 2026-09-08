@@ -51,9 +51,9 @@ func StreamChat(ctx context.Context, apiKey, endpoint string, history []Message,
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		fmt.Printf("❌ AI 请求惨遭物理击落！Error: %v\n", err)
+		fmt.Printf("AI 请求惨遭物理击落！Error: %v\n", err)
 		if resp != nil {
-			fmt.Printf("❌ 云端拒收状态码: %d\n", resp.StatusCode)
+			fmt.Printf("云端拒收状态码: %d\n", resp.StatusCode)
 
 			bodyBytes, _ := io.ReadAll(resp.Body)
 			fmt.Printf("【云端死亡回执】: %s\n", string(bodyBytes))

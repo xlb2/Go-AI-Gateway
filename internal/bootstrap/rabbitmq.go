@@ -38,7 +38,7 @@ func InitRabbitMQ(url, queueName string) (*amqp091.Connection, *amqp091.Channel)
 	if err != nil {
 		log.Fatalf("MQ 队列注册失败: %v", err)
 	}
-	fmt.Println("🐇 RabbitMQ 异步削峰管道已接通！")
+	fmt.Println("RabbitMQ 异步削峰管道已接通！")
 
 	return conn, ch
 }

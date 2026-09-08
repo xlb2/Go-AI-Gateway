@@ -19,7 +19,7 @@ func InitRedis(addr string) *redis.Client {
 	if err != nil {
 		panic("极其致命的异常：Redis 基站连接失败: " + err.Error())
 	}
-	fmt.Println("🔥 Redis 内存基站已成功物理挂载！")
+	fmt.Println("Redis 内存基站已成功物理挂载！")
 
 	return rdb
 }
