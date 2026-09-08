@@ -21,6 +21,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"go_im_gateway/internal/harness/approval"
+	"go_im_gateway/internal/harness/mcp"
 	"go_im_gateway/internal/harness/session"
 	"go_im_gateway/internal/harness/spill"
 	"go_im_gateway/internal/harness/subagent"
@@ -277,7 +278,9 @@ func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
 		// 用来把 react 内部吞掉的中间工具消息落盘成 tool/call + tool/result 事件。
 		MessageModifier: newMemoryLogModifier(userID),
 		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: []tool.BaseTool{ArchivalSearchTool, DefenseTool, DelegateTool, SaveLargeContentTool, LoadLargeContentTool},
+			Tools: append([]tool.BaseTool{
+				ArchivalSearchTool, DefenseTool, DelegateTool, SaveLargeContentTool, LoadLargeContentTool,
+			}, mcp.Tools()...),
 		},
 	})
 	if err != nil {
