@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"go_im_gateway/internal/handler"
+	"go_im_gateway/internal/harness"
 	"go_im_gateway/internal/service"
 
 	"github.com/gin-gonic/gin"
@@ -43,6 +44,9 @@ func InitGinRouter(
 
 		// WebSocket 升级端点
 		v1.GET("/ws", handler.ConnectWS(messageService, rdb))
+
+		// app-server 协议端点：JSON-RPC v1 双向契约（驱动 agent/审批）
+		v1.GET("/rpc", handler.RPCConnect(harness.Default))
 	}
 
 	return r

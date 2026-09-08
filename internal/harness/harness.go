@@ -10,11 +10,10 @@
 //	subagent 子智能体器官：一次性子 agent（delegate_task 工具派活，上下文不回流）
 //	spill    溢出存储器官：大内容外存留定位符（store/load_large_content 工具）
 //	mcp      MCP 集成器官：外部 MCP server 工具桥进统一注册表（mcp__server__tool 命名）
+//	sandbox  沙箱器官（了解级）：Executor 接口 + 占位实现，生产换容器隔离
+//	appserver app-server 协议器官（了解级）：JSON-RPC v1 双向契约（agent/run + approval/command）
 //
-// 还没长出来的器官（README Roadmap，先留位）：
-//
-//	TODO 沙箱         高危工具进隔离容器（了解级，用现成容器）
-//	TODO app-server   稳定版本化双向协议（当前是裸 WebSocket）
+// 框架至此 10 器官齐全；沙箱/app-server 是了解级骨架，生产需深化。
 package harness
 
 import (
