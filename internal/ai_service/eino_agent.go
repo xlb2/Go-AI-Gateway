@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/flow/agent/react"
+	"github.com/cloudwego/eino/schema"
 )
 
 // ArchivalSearchParams 归档记忆检索工具的入参
@@ -65,7 +67,6 @@ var ArchivalSearchTool, _ = utils.InferTool(
 		for i, msg := range results {
 			sb.WriteString(fmt.Sprintf("%d. [%s] %s\n", i+1, msg.Role, msg.Content))
 		}
-		go AppendToolEvent(context.Background(), userID, "search_memory_archive", params.Query, sb.String())
 		return sb.String(), nil
 	},
 )
@@ -91,6 +92,68 @@ var DefenseTool, _ = utils.InferTool(
 	},
 )
 
+// newMemoryLogModifier 返回一个 Eino 的 MessageModifier 钩子。
+// Eino 每次调模型前都会执行它，传入 react 内部累积的全部消息(state.Messages)；
+// 我们用"下标差分"找出本轮新增的工具消息，把它们按顺序落盘成 tool/call + tool/result 事件。
+// "hook 插槽"在 Eino 上的落地——Stream() 只吐最终消息，中间的配对全靠这个钩子拿。
+// 返回的切片原样交回（只观察、不修改，Eino 会把它发给模型）。
+func newMemoryLogModifier(userID uint) react.MessageModifier {
+	lastLen := -1 // -1 = 第一轮：输入的是完整请求消息，不记录（那些由 ws_handler 存）
+	return func(ctx context.Context, input []*schema.Message) []*schema.Message {
+		if lastLen == -1 {
+			lastLen = len(input)
+			return input
+		}
+		var pending []MemoryDTO
+		for _, msg := range input[lastLen:] {
+			switch {
+			case len(msg.ToolCalls) > 0:
+				// 模型发起的工具调用：assistant 消息带着 tool_calls → tool/call 事件
+				pending = append(pending, memoryDTOFromToolCall(msg))
+			case msg.Role == schema.Tool:
+				// 工具结果：tool 角色消息 → tool/result 事件（带 callId，和上面的 call 配对）
+				pending = append(pending, memoryDTOFromToolResult(msg))
+			}
+		}
+		lastLen = len(input)
+		if len(pending) > 0 {
+			// 异步、按顺序落盘（用 Background 防止跟着本轮请求的 ctx 一起被取消）
+			go writeMemoryEvents(context.Background(), userID, pending)
+		}
+		return input
+	}
+}
+
+// memoryDTOFromToolCall 把 Eino 的"带工具调用的 assistant 消息"降维成 tool/call 事件。
+func memoryDTOFromToolCall(msg *schema.Message) MemoryDTO {
+	dto := MemoryDTO{
+		Type:    EventToolCall,
+		Role:    string(msg.Role),
+		Content: msg.Content,
+		Time:    time.Now(),
+	}
+	for _, tc := range msg.ToolCalls {
+		dto.ToolCalls = append(dto.ToolCalls, ToolCallData{
+			ID:        tc.ID,
+			Name:      tc.Function.Name,
+			Arguments: tc.Function.Arguments,
+		})
+	}
+	return dto
+}
+
+// memoryDTOFromToolResult 把 Eino 的"工具结果消息"降维成 tool/result 事件。
+func memoryDTOFromToolResult(msg *schema.Message) MemoryDTO {
+	return MemoryDTO{
+		Type:       EventToolResult,
+		Role:       string(msg.Role),
+		Content:    msg.Content,
+		ToolCallID: msg.ToolCallID,
+		ToolName:   msg.ToolName,
+		Time:       time.Now(),
+	}
+}
+
 // BuildEinoAgent 组装并返回一个 ReAct 风格的 Eino agent：
 // 读取火山引擎的模型凭证 -> 点火 chatModel -> 挂载工具（记忆检索 search_memory_archive + 防御 execute_system_defense）-> 编译成可调用的 Agent。
 // 调用方（ws_handler.go）拿到这个 Agent 后，每次用户发消息就调它的 .Stream() 方法跑一轮对话。
@@ -111,6 +174,12 @@ func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
 		return nil, fmt.Errorf(" 极其致命：Eino 点火失败，环境变量 VOLC_ACCESS_KEY 或 VOLC_ENDPOINT_ID 未正确挂载")
 	}
 
+	// 0. 取出 user_id：MessageModifier 钩子落盘工具事件时要用
+	userID, err := getUserID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	// 1. 点火火山引擎 (Eino 复用了 openai 的标准 API 格式)
 	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
 		APIKey:  apiKey,   // 安全注入
@@ -125,6 +194,9 @@ func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
 	// 内部会自动做 Tools -> ChatModel 的回环，工具结果能被模型再读一遍组织成自然语言。
 	ragent, err := react.NewAgent(ctx, &react.AgentConfig{
 		Model: chatModel,
+		// MessageModifier 是 Eino 的 hook 插槽：每次调模型前都会执行，
+		// 我们用它把 react 内部吞掉的中间工具消息落盘成 tool/call + tool/result 事件。
+		MessageModifier: newMemoryLogModifier(userID),
 		ToolsConfig: compose.ToolsNodeConfig{
 			Tools: []tool.BaseTool{ArchivalSearchTool, DefenseTool},
 		},
