@@ -144,12 +144,36 @@ func GetHistory(ctx context.Context, userID uint) ([]*schema.Message, error) {
 	}
 	key := fmt.Sprintf("agent:V2:history:%d", userID)
 
-	// 全量读出来：按投影规则生成模型历史，再取最后 MaxHistory 条真消息（顺序不能反：先筛后切）
+	// 全量读出来：反序列化成事件列表，交给纯函数 projectMessages 做投影（pair-or-drop）
 	dataList, err := Rdb.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
 		return nil, err
 	}
-	var history []*schema.Message
+	dtos := make([]MemoryDTO, 0, len(dataList))
+	for _, data := range dataList {
+		var dto MemoryDTO
+		if err := json.Unmarshal([]byte(data), &dto); err != nil {
+			fmt.Printf(" [记忆中枢] 破译记忆碎片失败: %v\n", err)
+			continue
+		}
+		dtos = append(dtos, dto)
+	}
+	history := projectMessages(dtos)
+	// 战果汇报
+	fmt.Printf(" [记忆中枢] 成功为 UserID %d 唤醒了 %d 条前世记忆！\n", userID, len(history))
+	return history, nil
+}
+
+// projectMessages 把一组记忆事件投影成喂给模型的 []*schema.Message（纯函数，不依赖 Redis，便于单测）。
+// 投影规则（pair-or-drop）：
+//   - user/message、assistant/message：直接投影；
+//   - tool/call 必须等它所有 tool/result 到齐，才把 assistant(带 tool_calls)+全部 tool(结果)
+//     一起喂出（模型侧协议要求 tool 消息必须紧跟在带 tool_calls 的 assistant 消息后面）；
+//   - 只出现一半的（有 call 没 result，或悬空的 result）整对丢弃，绝不喂悬空消息；
+//   - system/prompt 是 log-only，不进投影。
+// 最后只保留最近 MaxHistory 条真消息；裁剪切在配对中间时，丢弃开头的悬空 tool 消息。
+func projectMessages(dtos []MemoryDTO) []*schema.Message {
+	history := make([]*schema.Message, 0, len(dtos))
 
 	// —— 工具配对的投影状态 ——
 	var pending *MemoryDTO               // 正在等待配对结果的 tool/call
@@ -165,12 +189,8 @@ func GetHistory(ctx context.Context, userID uint) ([]*schema.Message, error) {
 		pending, open, pendingResults = nil, map[string]bool{}, nil
 	}
 
-	for _, data := range dataList {
-		var dto MemoryDTO
-		if err := json.Unmarshal([]byte(data), &dto); err != nil {
-			fmt.Printf(" [记忆中枢] 破译记忆碎片失败: %v\n", err)
-			continue
-		}
+	for i := range dtos {
+		dto := dtos[i]
 		// 老记录没有 type 字段，按 Role 兜底推断，保证兼容
 		typ := dto.Type
 		if typ == "" {
@@ -214,9 +234,7 @@ func GetHistory(ctx context.Context, userID uint) ([]*schema.Message, error) {
 			history = history[1:]
 		}
 	}
-	// 战果汇报
-	fmt.Printf(" [记忆中枢] 成功为 UserID %d 唤醒了 %d 条前世记忆！\n", userID, len(history))
-	return history, nil
+	return history
 }
 
 // assistantMsgFromToolCall 把一个 tool/call 事件还原成"带 tool_calls 的 assistant 消息"。
