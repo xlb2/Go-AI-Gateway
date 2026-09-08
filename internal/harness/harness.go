@@ -7,11 +7,11 @@
 //	session  记忆器官：事件溯源日志 + 模型历史投影
 //	approval 审批器官：人在回路挂起状态机
 //	hooks    钩子器官：横切需求插槽（pre 拦截 / post 观察）
+//	subagent 子智能体器官：一次性子 agent（delegate_task 工具派活，上下文不回流）
 //
 // 还没长出来的器官（README Roadmap，先留位）：
 //
 //	TODO 压缩/spill   上下文超限压成摘要 + 超大输出外存（替代 MaxHistory 截断）
-//	TODO 子智能体     goroutine 派子 agent，上下文不回流
 //	TODO MCP 集成     外部 MCP server 工具桥进统一注册表
 //	TODO 沙箱         高危工具进隔离容器（了解级，用现成容器）
 //	TODO app-server   稳定版本化双向协议（当前是裸 WebSocket）

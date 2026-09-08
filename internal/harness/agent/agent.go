@@ -20,6 +20,7 @@ import (
 
 	"go_im_gateway/internal/harness/approval"
 	"go_im_gateway/internal/harness/session"
+	"go_im_gateway/internal/harness/subagent"
 )
 
 // ArchivalSearchParams 归档记忆检索工具的入参
@@ -95,6 +96,25 @@ var DefenseTool, _ = utils.InferTool(
 			return "", fmt.Errorf("挂起防御动作失败: %v", err)
 		}
 		return "⚠️ 防御动作已起草并挂起。请管理员在终端输入 auth:approve 确认执行，或输入 auth:reject 取消。", nil
+	},
+)
+
+// DelegateParams delegate_task 工具的入参
+type DelegateParams struct {
+	Task string `json:"task" jsonschema:"description=要交给子智能体完成的独立任务,required"`
+}
+
+// DelegateTool 子智能体工具：主 agent 把可拆分的独立子任务派给子智能体执行，
+// 子任务上下文与主对话隔离，只把结果带回来（对应 HARNESS-STUDY M8）。
+var DelegateTool, _ = utils.InferTool(
+	"delegate_task",
+	"当任务可以拆成独立的子任务、且不需要主对话上下文时调用，派一个子智能体去执行并返回结果。",
+	func(ctx context.Context, params *DelegateParams) (string, error) {
+		res, err := subagent.Run(ctx, params.Task)
+		if err != nil {
+			return "", fmt.Errorf("子智能体执行失败: %v", err)
+		}
+		return res.Output, nil
 	},
 )
 
@@ -190,7 +210,7 @@ func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
 		// 用来把 react 内部吞掉的中间工具消息落盘成 tool/call + tool/result 事件。
 		MessageModifier: newMemoryLogModifier(userID),
 		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: []tool.BaseTool{ArchivalSearchTool, DefenseTool},
+			Tools: []tool.BaseTool{ArchivalSearchTool, DefenseTool, DelegateTool},
 		},
 	})
 	if err != nil {

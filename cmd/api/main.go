@@ -8,9 +8,11 @@ import (
 	"go_im_gateway/internal/config"
 	"go_im_gateway/internal/dao"
 	"go_im_gateway/internal/handler"
+	"go_im_gateway/internal/harness/agent"
 	"go_im_gateway/internal/harness/approval"
 	"go_im_gateway/internal/harness/hooks"
 	"go_im_gateway/internal/harness/session"
+	"go_im_gateway/internal/harness/subagent"
 	"go_im_gateway/internal/service"
 	"log"
 	"net/http"
@@ -54,6 +56,10 @@ func main() {
 	session.Init(rdb)            // harness 记忆器官注入 Redis
 	approval.Init(rdb)           // harness 审批器官注入 Redis
 	hooks.RegisterDefaultHooks() // 内置横切钩子（敏感词/超长拦截 + 回复统计）
+	// 子智能体器官注入"造子 agent"的构造器（避免 subagent 包反向依赖 agent 包）
+	subagent.SetRunner(func(ctx context.Context) (subagent.ChildAgent, error) {
+		return agent.BuildEinoAgent(ctx)
+	})
 	messageDAO := dao.NewMessageDAO(db)
 	messageService := service.NewMessageService(messageDAO, rdb, mqCh)
 	messageService.StartConsumer() // 启动 MQ 消费者：异步把消息落盘到 MySQL
