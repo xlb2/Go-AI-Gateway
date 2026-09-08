@@ -11,7 +11,7 @@
 //
 // 还没长出来的器官（README Roadmap，先留位）：
 //
-//	TODO 压缩/spill   上下文超限压成摘要 + 超大输出外存（替代 MaxHistory 截断）
+//	TODO spill 超大工具输出外存留定位符（compaction 的兄弟）
 //	TODO MCP 集成     外部 MCP server 工具桥进统一注册表
 //	TODO 沙箱         高危工具进隔离容器（了解级，用现成容器）
 //	TODO app-server   稳定版本化双向协议（当前是裸 WebSocket）
@@ -85,7 +85,12 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 		return "", err
 	}
 
-	// 2. 组装上下文：系统提示 + 历史投影 + 本条用户消息
+	// 2. 上下文压缩（best-effort：早期对话压成摘要，替代粗暴截断；失败就跳过本次）
+	if err := h.Sessions.Compact(ctx, userID, agent.Summarize); err != nil {
+		fmt.Printf(" [压缩] 跳过本次压缩: %v\n", err)
+	}
+
+	// 3. 组装上下文：系统提示 + 历史投影 + 本条用户消息
 	usrMsg := schema.UserMessage(content)
 	history, err := h.Sessions.GetHistory(ctx, userID)
 	if err != nil {

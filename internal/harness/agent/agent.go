@@ -9,9 +9,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
 	"github.com/cloudwego/eino/compose"
@@ -176,9 +178,8 @@ func memoryDTOFromToolResult(msg *schema.Message) session.MemoryDTO {
 	}
 }
 
-// BuildEinoAgent 组装并返回一个 ReAct 风格的 Eino agent（固定内核）：
-// 读火山引擎凭证 -> 点火 chatModel -> 挂工具（记忆检索 + 防御）+ MessageModifier 钩子。
-func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
+// newChatModel 用环境变量配置火山引擎模型（openai 兼容协议）。
+func newChatModel(ctx context.Context) (model.ChatModel, error) {
 	apiKey := os.Getenv("VOLC_ACCESS_KEY")
 	endpoint := os.Getenv("VOLC_ENDPOINT_ID")
 	baseURL := os.Getenv("VOLC_BASE_URL")
@@ -186,14 +187,36 @@ func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
 		baseURL = "https://ark.cn-beijing.volces.com/api/v3"
 	}
 	if apiKey == "" || endpoint == "" {
-		return nil, fmt.Errorf("Eino 点火失败：环境变量 VOLC_ACCESS_KEY 或 VOLC_ENDPOINT_ID 未配置")
+		return nil, fmt.Errorf("模型凭证未配置：VOLC_ACCESS_KEY / VOLC_ENDPOINT_ID")
 	}
-
-	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+	return openai.NewChatModel(ctx, &openai.ChatModelConfig{
 		APIKey:  apiKey,
 		Model:   endpoint,
 		BaseURL: baseURL,
 	})
+}
+
+// Summarize 把一段消息列表压成一段中文摘要（供 session 压缩用，纯模型调用、无工具）。
+func Summarize(ctx context.Context, messages []string) (string, error) {
+	chatModel, err := newChatModel(ctx)
+	if err != nil {
+		return "", err
+	}
+	joined := strings.Join(messages, "\n")
+	out, err := chatModel.Generate(ctx, []*schema.Message{
+		schema.SystemMessage("你是一个对话压缩器。把下面的历史对话压成一段 100 字以内的中文摘要，保留关键事实。"),
+		schema.UserMessage(joined),
+	})
+	if err != nil {
+		return "", err
+	}
+	return out.Content, nil
+}
+
+// BuildEinoAgent 组装并返回一个 ReAct 风格的 Eino agent（固定内核）：
+// 读火山引擎凭证 -> 点火 chatModel -> 挂工具（记忆检索 + 防御 + 子智能体）+ MessageModifier 钩子。
+func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
+	chatModel, err := newChatModel(ctx)
 	if err != nil {
 		return nil, err
 	}

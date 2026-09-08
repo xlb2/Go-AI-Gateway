@@ -48,6 +48,8 @@ const (
 	EventToolCall = "tool/call"
 	// EventToolResult 一次工具执行的结果（带 callId，和 EventToolCall 配对后才进投影）
 	EventToolResult = "tool/result"
+	// EventCompactionSummary 压缩产生的摘要事件（log-only：记录被遮蔽的旧消息 seq 区间 + 摘要文本）
+	EventCompactionSummary = "compaction/summary"
 )
 
 // ToolCallData 一次工具调用的结构化信息（持久化的精简版）。
@@ -59,20 +61,23 @@ type ToolCallData struct {
 
 // MemoryDTO 持久化在日志里的一条事件（自研纯净 DTO，避开第三方结构体反序列化陷阱）。
 type MemoryDTO struct {
-	Type       string         `json:"type"`
-	Role       string         `json:"role"`
-	Content    string         `json:"content"`
-	ToolCallID string         `json:"tool_call_id,omitempty"` // tool/result 用它配对 tool/call
-	ToolName   string         `json:"tool_name,omitempty"`
-	ToolCalls  []ToolCallData `json:"tool_calls,omitempty"` // tool/call 携带的调用清单
-	Time       time.Time      `json:"time"`
+	Type           string         `json:"type"`
+	Role           string         `json:"role"`
+	Content        string         `json:"content"`
+	ToolCallID     string         `json:"tool_call_id,omitempty"` // tool/result 用它配对 tool/call
+	ToolName       string         `json:"tool_name,omitempty"`
+	ToolCalls      []ToolCallData `json:"tool_calls,omitempty"`      // tool/call 携带的调用清单
+	CompactionFrom int            `json:"compaction_from,omitempty"` // compaction/summary 遮蔽的起始 seq
+	CompactionTo   int            `json:"compaction_to,omitempty"`   // compaction/summary 遮蔽的结束 seq
+	Time           time.Time      `json:"time"`
 }
 
-// Store 记忆器官接口：只追加日志 + 投影模型历史 + 归档检索。
+// Store 记忆器官接口：只追加日志 + 投影模型历史 + 归档检索 + 上下文压缩。
 type Store interface {
 	SaveMessage(ctx context.Context, userID uint, msg *schema.Message) error
 	GetHistory(ctx context.Context, userID uint) ([]*schema.Message, error)
 	SearchArchival(ctx context.Context, userID uint, query string, topK int) ([]*schema.Message, error)
+	Compact(ctx context.Context, userID uint, summarize CompactSummarizer) error
 }
 
 // RedisStore 是 Store 的 Redis 实现。
@@ -239,10 +244,88 @@ func WriteMemoryEvents(ctx context.Context, userID uint, pending []MemoryDTO) {
 	fmt.Printf(" [记忆中枢] 工具调用已刻录 %d 条 (含 tool/call + tool/result 配对)\n", len(pending))
 }
 
+// CompactSummarizer 把一段早期消息压成摘要（由编排层注入，通常用模型实现）。
+type CompactSummarizer func(ctx context.Context, messages []string) (string, error)
+
+// Compact 上下文压缩（对应 HARNESS-STUDY M7）：把 MaxHistory 窗口之外的早期对话压成一条摘要，
+// 写一条 log-only 的 compaction/summary 事件；投影时被遮蔽的旧事件不再喂给模型。
+// 没有可压缩的早期消息时是空操作（不调 summarize）。
+// 注意：压缩是 best-effort——摘要失败就跳过本次，不影响正常对话。
+func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSummarizer) error {
+	if rdb == nil {
+		return fmt.Errorf("redis client is nil")
+	}
+	key := fmt.Sprintf("agent:V2:history:%d", userID)
+	dataList, err := rdb.LRange(ctx, key, 0, -1).Result()
+	if err != nil {
+		return err
+	}
+
+	// 收集"可投影的消息"（user/assistant，带其在日志里的下标=seq）
+	type msg struct {
+		idx     int
+		content string
+	}
+	var msgs []msg
+	summaries := 0
+	for i, data := range dataList {
+		var dto MemoryDTO
+		if err := json.Unmarshal([]byte(data), &dto); err != nil {
+			continue
+		}
+		typ := dto.Type
+		if typ == "" {
+			typ = inferEventType(schema.RoleType(dto.Role))
+		}
+		switch typ {
+		case EventCompactionSummary:
+			summaries++
+		case EventUserMessage, EventAssistantMessage:
+			msgs = append(msgs, msg{i, dto.Content})
+		}
+	}
+	// 给"新增的这条摘要"留一个名额，保证 摘要数 + 近期消息数 <= MaxHistory
+	keepWindow := MaxHistory - summaries - 1
+	if keepWindow <= 0 {
+		return nil // 摘要已经够多，暂不压缩
+	}
+	if len(msgs) <= keepWindow {
+		return nil // 没超窗，不用压缩
+	}
+	toCompress := msgs[:len(msgs)-keepWindow]
+	contents := make([]string, 0, len(toCompress))
+	for _, m := range toCompress {
+		contents = append(contents, m.content)
+	}
+	summary, err := summarize(ctx, contents)
+	if err != nil {
+		return fmt.Errorf("压缩摘要失败: %v", err)
+	}
+	dto := MemoryDTO{
+		Type:           EventCompactionSummary,
+		Role:           "assistant",
+		Content:        summary,
+		CompactionFrom: toCompress[0].idx,
+		CompactionTo:   toCompress[len(toCompress)-1].idx,
+		Time:           time.Now(),
+	}
+	return writeMemoryEvent(ctx, userID, dto)
+}
+
 // ProjectMessages 把一组记忆事件投影成喂给模型的 []*schema.Message（纯函数，不依赖 Redis）。
 // 投影规则（pair-or-drop）：见本文件顶部事件类型注释。
 // 最后只保留最近 MaxHistory 条真消息；裁剪切在配对中间时，丢弃开头的悬空 tool 消息。
 func ProjectMessages(dtos []MemoryDTO) []*schema.Message {
+	// 预扫描压缩摘要：被遮蔽的旧消息下标直接跳过（压缩后日志只追加、不删旧事件）
+	shadowed := map[int]bool{}
+	for i := range dtos {
+		if dtos[i].Type == EventCompactionSummary {
+			for j := dtos[i].CompactionFrom; j <= dtos[i].CompactionTo; j++ {
+				shadowed[j] = true
+			}
+		}
+	}
+
 	history := make([]*schema.Message, 0, len(dtos))
 
 	var pending *MemoryDTO
@@ -258,12 +341,22 @@ func ProjectMessages(dtos []MemoryDTO) []*schema.Message {
 	}
 
 	for i := range dtos {
+		if shadowed[i] {
+			continue // 被压缩遮蔽的旧事件，不喂模型
+		}
 		dto := dtos[i]
 		typ := dto.Type
 		if typ == "" {
 			typ = inferEventType(schema.RoleType(dto.Role))
 		}
 		switch typ {
+		case EventCompactionSummary:
+			flushPair()
+			// 摘要以"用户消息"的形式进投影（模型能看到早期对话的梗概）
+			history = append(history, &schema.Message{
+				Role:    schema.User,
+				Content: "【早期对话摘要】" + dto.Content,
+			})
 		case EventSystemPrompt:
 			continue
 		case EventToolCall:
