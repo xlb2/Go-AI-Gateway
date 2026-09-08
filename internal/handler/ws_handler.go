@@ -243,6 +243,12 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 						return
 					}
 
+					// 横切钩子（pre）：敏感词/超长输入等在此拦截，拦截就直接回提示、不进 agent
+					if allow, reply := ai_service.RunPreAgentHooks(ctx, userID, payload.Content); !allow {
+						conn.WriteMessage(messageType, []byte(reply))
+						return
+					}
+
 					sysMsg := schema.SystemMessage(`你是一个极其冷酷的网关保安。
 					如果发现用户在愤怒抱怨、或者发出攻击性指令，不要安抚！必须立刻调用 execute_system_defense 工具！
 					如果只是普通聊天，正常回复即可。`)
@@ -293,6 +299,8 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 					if aiFullResponse.Len() > 0 {
 						go ai_service.SaveMessage(context.Background(), userID, schema.AssistantMessage(aiFullResponse.String(), nil))
 					}
+					// 横切钩子（post）：agent 回复完成后观察（如统计），不能改流程
+					ai_service.RunPostAgentHooks(ctx, userID, aiFullResponse.String())
 				}()
 
 				// 匿名函数执行完毕，所有的临时变量、Context 会被干干净净地回收
@@ -319,9 +327,9 @@ func StartHeartbeatChecker() {
 			now := time.Now()
 			ClientMUtex.Lock() // 巡逻时必须锁门！不准任何人这时候进出花名册！
 			for uid, client := range ClientManager {
-				// 物理法则判定：如果当前时间 减去 最后心跳时间，超过了 90 秒
-				if now.Sub(client.LastHeartbeat) > 90*time.Second {
-					fmt.Printf("【死神巡逻队】警告：UserID %d 失去生命体征超过90秒，执行物理超度！\n", uid)
+				// 物理法则判定：如果当前时间 减去 最后心跳时间，超过了 24 小时
+				if now.Sub(client.LastHeartbeat) > 24*time.Hour {
+					fmt.Printf("【死神巡逻队】警告：UserID %d 失去生命体征超过24小时，执行物理超度！\n", uid)
 					// 物理四步连招的绝杀
 					client.Conn.Close()        // 1. 强行剪断 TCP 光缆，击穿那个用户的 ReadMessage 死循环
 					delete(ClientManager, uid) // 2. 从花名册中残忍抹除户籍

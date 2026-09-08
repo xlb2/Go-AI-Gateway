@@ -48,6 +48,7 @@ func main() {
 
 	// 5. 依赖注入：按 DAO -> Service -> Handler 顺序组装
 	ai_service.Rdb = rdb
+	ai_service.RegisterDefaultHooks() // 注册内置横切钩子（敏感词/超长拦截 + 回复统计）
 	messageDAO := dao.NewMessageDAO(db)
 	messageService := service.NewMessageService(messageDAO, rdb, mqCh)
 	messageService.StartConsumer() // 启动 MQ 消费者：异步把消息落盘到 MySQL
