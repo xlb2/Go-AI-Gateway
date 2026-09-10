@@ -7,7 +7,7 @@
 //	session  记忆器官：事件溯源日志 + 模型历史投影
 //	approval 审批器官：人在回路挂起状态机
 //	hooks    钩子器官：横切需求插槽（pre 拦截 / post 观察）
-//	subagent 子智能体器官：一次性子 agent（delegate_task 工具派活，上下文不回流）
+//	subagent 子智能体器官：一次性/并行子 agent（delegate_task 派活、delegate_tasks 并行 fan-out、递归深度上限）
 //	spill    溢出存储器官：大内容外存留定位符（store/load_large_content 工具）
 //	mcp      MCP 集成器官：外部 MCP server 工具桥进统一注册表（mcp__server__tool 命名）
 //	sandbox  沙箱器官（了解级）：Executor 接口 + 占位实现，生产换容器隔离

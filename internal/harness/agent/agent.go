@@ -165,6 +165,31 @@ var LoadLargeContentTool, _ = utils.InferTool(
 	},
 )
 
+// DelegateTasksParams delegate_tasks 工具的入参
+type DelegateTasksParams struct {
+	Tasks []string `json:"tasks" jsonschema:"description=要并行派发的多个独立任务,required"`
+}
+
+// DelegateTasksTool 并行子智能体工具：把多个互相独立的子任务并行派发，
+// 按输入顺序返回每个任务的结果（对应 M8 的"并行拆任务"）。
+var DelegateTasksTool, _ = utils.InferTool(
+	"delegate_tasks",
+	"当有多个互相独立的子任务可以同时做时调用，并行派发给多个子智能体，返回按顺序排列的每个任务结果。",
+	func(ctx context.Context, params *DelegateTasksParams) (string, error) {
+		results := subagent.RunParallel(ctx, params.Tasks, 4)
+		var sb strings.Builder
+		for i, r := range results {
+			sb.WriteString(fmt.Sprintf("任务%d: ", i+1))
+			if r.Err != nil {
+				sb.WriteString("失败(" + r.Err.Error() + ")\n")
+			} else {
+				sb.WriteString(r.Output + "\n")
+			}
+		}
+		return sb.String(), nil
+	},
+)
+
 // newMemoryLogModifier 返回一个 Eino 的 MessageModifier 钩子。
 // Eino 每次调模型前都会执行它，传入 react 内部累积的全部消息(state.Messages)；
 // 用"下标差分"找出本轮新增的工具消息，按顺序落盘成 tool/call + tool/result 事件。
@@ -279,7 +304,7 @@ func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
 		MessageModifier: newMemoryLogModifier(userID),
 		ToolsConfig: compose.ToolsNodeConfig{
 			Tools: append([]tool.BaseTool{
-				ArchivalSearchTool, DefenseTool, DelegateTool, SaveLargeContentTool, LoadLargeContentTool,
+				ArchivalSearchTool, DefenseTool, DelegateTool, DelegateTasksTool, SaveLargeContentTool, LoadLargeContentTool,
 			}, mcp.Tools()...),
 		},
 	})
