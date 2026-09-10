@@ -207,7 +207,7 @@ func newMemoryLogModifier(userID uint) react.MessageModifier {
 			case len(msg.ToolCalls) > 0:
 				pending = append(pending, memoryDTOFromToolCall(msg))
 			case msg.Role == schema.Tool:
-				pending = append(pending, memoryDTOFromToolResult(msg))
+				pending = append(pending, memoryDTOFromToolResult(ctx, msg))
 			}
 		}
 		lastLen = len(input)
@@ -236,12 +236,27 @@ func memoryDTOFromToolCall(msg *schema.Message) session.MemoryDTO {
 	return dto
 }
 
+// spillThreshold 工具结果超过该长度就自动外存（spill），事件里只留定位符+取回指引。
+const spillThreshold = 2000
+
 // memoryDTOFromToolResult 把 Eino 的"工具结果消息"降维成 tool/result 事件。
-func memoryDTOFromToolResult(msg *schema.Message) session.MemoryDTO {
+// 超大结果自动 spill（M7 自动策略）：内容外存，事件只留"定位符+取回指引"，
+// 避免大内容把记忆日志和模型上下文撑爆；模型需要时可调 load_large_content 取回。
+// spill 失败则回退存完整内容（best-effort）。
+func memoryDTOFromToolResult(ctx context.Context, msg *schema.Message) session.MemoryDTO {
+	content := msg.Content
+	if len([]rune(content)) > spillThreshold {
+		if userID, err := getUserID(ctx); err == nil {
+			store := spill.RedisStore{}
+			if ref, err := store.SaveText(ctx, userID, "tool_result", content); err == nil {
+				content = fmt.Sprintf("（工具结果过大已外存）定位符: %s；需要时用 load_large_content 工具取回", ref.Locator)
+			}
+		}
+	}
 	return session.MemoryDTO{
 		Type:       session.EventToolResult,
 		Role:       string(msg.Role),
-		Content:    msg.Content,
+		Content:    content,
 		ToolCallID: msg.ToolCallID,
 		ToolName:   msg.ToolName,
 		Time:       time.Now(),
