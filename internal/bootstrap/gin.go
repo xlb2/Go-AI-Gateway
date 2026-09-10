@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"go_im_gateway/internal/handler"
 	"go_im_gateway/internal/harness"
+	"go_im_gateway/internal/harness/metrics"
 	"go_im_gateway/internal/service"
 
 	"github.com/gin-gonic/gin"
@@ -47,6 +48,12 @@ func InitGinRouter(
 
 		// app-server 协议端点：JSON-RPC v1 双向契约（驱动 agent/审批）
 		v1.GET("/rpc", handler.RPCConnect(harness.Default))
+
+		// 可观测性：Prometheus 文本格式指标
+		v1.GET("/metrics", func(c *gin.Context) {
+			c.Header("Content-Type", "text/plain; version=0.0.4")
+			c.String(200, metrics.Default.Render())
+		})
 	}
 
 	return r

@@ -22,6 +22,7 @@ import (
 
 	"go_im_gateway/internal/harness/approval"
 	"go_im_gateway/internal/harness/mcp"
+	"go_im_gateway/internal/harness/metrics"
 	"go_im_gateway/internal/harness/session"
 	"go_im_gateway/internal/harness/spill"
 	"go_im_gateway/internal/harness/subagent"
@@ -205,6 +206,7 @@ func newMemoryLogModifier(userID uint) react.MessageModifier {
 		for _, msg := range input[lastLen:] {
 			switch {
 			case len(msg.ToolCalls) > 0:
+				metrics.Default.Inc("tool_calls_total")
 				pending = append(pending, memoryDTOFromToolCall(msg))
 			case msg.Role == schema.Tool:
 				pending = append(pending, memoryDTOFromToolResult(ctx, msg))

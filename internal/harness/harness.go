@@ -11,21 +11,24 @@
 //	spill    溢出存储器官：大内容外存留定位符（store/load_large_content 工具）
 //	mcp      MCP 集成器官：外部 MCP server 工具桥进统一注册表（mcp__server__tool 命名）
 //	sandbox  沙箱器官（了解级）：Executor 接口 + 占位实现，生产换容器隔离
-//	appserver app-server 协议器官（了解级）：JSON-RPC v1 双向契约（agent/run + approval/command）
+//	appserver app-server 协议器官（了解级）：JSON-RPC v1 双向契约（agent/run 流式 + approval/command）
+//	metrics  可观测性器官：计数器/求和/仪表 + Prometheus 文本导出（/metrics 端点）
 //
-// 框架至此 10 器官齐全；沙箱/app-server 是了解级骨架，生产需深化。
+// 框架至此 11 器官齐全；沙箱是了解级骨架，生产需深化。
 package harness
 
 import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cloudwego/eino/schema"
 
 	"go_im_gateway/internal/harness/agent"
 	"go_im_gateway/internal/harness/approval"
 	"go_im_gateway/internal/harness/hooks"
+	"go_im_gateway/internal/harness/metrics"
 	"go_im_gateway/internal/harness/session"
 )
 
@@ -70,7 +73,19 @@ func (h *Harness) HandleApprovalCommand(ctx context.Context, userID uint, text s
 // RunAgentTurn 执行一轮 agent 对话（harness 主脊：领取输入→组装上下文→请求模型→执行工具→写日志）。
 // 流程：pre 钩子(可拦) → 存系统提示/用户消息 → 投影历史 → Eino react 循环(流式) → 落盘回复 → post 钩子。
 // emit 逐块回调流式回复（WebSocket 直接转发）；返回完整回复文本。
-func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string, emit func(chunk string)) (string, error) {
+func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string, emit func(chunk string)) (out string, err error) {
+	// 埋点：每轮结束记录轮次计数 + 耗时；出错额外计 errors_total
+	start := time.Now()
+	defer func() {
+		metrics.Default.Inc("turns_total")
+		lat := time.Since(start).Seconds()
+		metrics.Default.Add("turn_latency_seconds_total", lat)
+		metrics.Default.SetGauge("last_turn_latency_seconds", lat)
+		if err != nil {
+			metrics.Default.Inc("errors_total")
+		}
+	}()
+
 	// 0. pre 钩子：敏感词/超长等横切拦截（拦截直接返回提示语，不进 agent）
 	if allow, reply := hooks.RunPre(ctx, userID, content); !allow {
 		return reply, nil
