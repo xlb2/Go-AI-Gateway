@@ -1,9 +1,8 @@
-// Package appserver app-server 协议器官（了解级）：GUI/IDE 驱动 agent 的稳定、版本化、双向 JSON-RPC 契约。
+// Package appserver app-server 协议器官（了解级）：GUI/IDE 驱动 agent 的稳定、版本化、双向、流式 JSON-RPC 契约。
 //
 // 定位：harness 解剖图里的"app-server 协议"（HARNESS-STUDY M11）。
-// 这是 v1 的最小骨架：JSON-RPC envelope + 两个方法 + 请求/响应模型。
-// 关键设计：契约带版本（Version="v1"）、双向（审批是 server→client 的反向回调，这里先做成
-// client 主动发 approval/command）；流式推送给前端（agent/run 边跑边推）留作下一步。
+// v1：JSON-RPC envelope + 方法（agent/run 流式推送 chunk 通知 + approval/command）+ 请求/响应。
+// 关键设计：契约带版本（Version="v1"）；agent/run 边跑边以 agent/chunk 通知推送流式回复。
 package appserver
 
 import (
@@ -58,12 +57,12 @@ func ServeWS(ctx context.Context, conn *websocket.Conn, runner AgentRunner, user
 		if msg.Method == "" {
 			continue // 通知：骨架阶段忽略
 		}
-		writeMessage(conn, dispatch(ctx, runner, userID, msg))
+		writeMessage(conn, dispatch(ctx, conn, runner, userID, msg))
 	}
 }
 
-// dispatch 按方法名分发（v1 支持：agent/run、approval/command）。
-func dispatch(ctx context.Context, runner AgentRunner, userID uint, msg Message) Message {
+// dispatch 按方法名分发（v1 支持：agent/run（流式）、approval/command）。
+func dispatch(ctx context.Context, conn *websocket.Conn, runner AgentRunner, userID uint, msg Message) Message {
 	switch msg.Method {
 	case "agent/run":
 		var p struct {
@@ -72,7 +71,14 @@ func dispatch(ctx context.Context, runner AgentRunner, userID uint, msg Message)
 		if err := json.Unmarshal(msg.Params, &p); err != nil {
 			return errResponse(msg.ID, -32602, "invalid params")
 		}
-		reply, err := runner.RunAgentTurn(ctx, userID, p.Content, nil)
+		// 流式：emit 回调把每个 chunk 作为 agent/chunk 通知推给前端
+		reply, err := runner.RunAgentTurn(ctx, userID, p.Content, func(chunk string) {
+			writeMessage(conn, Message{
+				Version: ProtocolVersion,
+				Method:  "agent/chunk",
+				Params:  jsonParams(map[string]string{"chunk": chunk}),
+			})
+		})
 		if err != nil {
 			return errResponse(msg.ID, -32000, err.Error())
 		}
@@ -94,12 +100,17 @@ func dispatch(ctx context.Context, runner AgentRunner, userID uint, msg Message)
 }
 
 func okResponse(id *int64, v any) Message {
-	data, _ := json.Marshal(v)
-	return Message{Version: ProtocolVersion, ID: id, Result: data}
+	return Message{Version: ProtocolVersion, ID: id, Result: jsonParams(v)}
 }
 
 func errResponse(id *int64, code int, message string) Message {
 	return Message{Version: ProtocolVersion, ID: id, Error: &RPCError{Code: code, Message: message}}
+}
+
+// jsonParams 把值序列化成 params/result 的 RawMessage。
+func jsonParams(v any) json.RawMessage {
+	data, _ := json.Marshal(v)
+	return data
 }
 
 func writeMessage(conn *websocket.Conn, msg Message) {
