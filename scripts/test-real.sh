@@ -20,4 +20,7 @@ if [ "$code" != "200" ]; then
     exit 1
 fi
 
-exec go run ./cmd/verify "$@"
+# 先编译再执行，不用 `go run`：这台机器上杀软/AppLocker 会随机拦截 go run 生成的临时 exe
+# （报 "An Application Control policy has blocked this file" 或 "contains a virus"）。
+go build -o bin/gwverify.exe ./cmd/verify
+exec ./bin/gwverify.exe "$@"
