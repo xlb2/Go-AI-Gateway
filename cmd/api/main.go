@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"go_im_gateway/internal/ai_service"
 	"go_im_gateway/internal/bootstrap"
 	"go_im_gateway/internal/config"
 	"go_im_gateway/internal/dao"
@@ -54,7 +53,6 @@ func main() {
 	}
 
 	// 5. 依赖注入：按 DAO -> Service -> Handler 顺序组装
-	ai_service.Rdb = rdb         // 兼容 legacy 记忆/状态函数
 	session.Init(rdb)            // harness 记忆器官注入 Redis
 	approval.Init(rdb)           // harness 审批器官注入 Redis
 	spill.Init(rdb)              // harness 溢出存储器官注入 Redis

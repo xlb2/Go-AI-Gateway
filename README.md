@@ -113,7 +113,19 @@ go run ./cmd/radar -token $t
 cmd/api             网关入口（装配 + 优雅停机）
 cmd/radar           WebSocket 终端调试客户端
 internal/
-  ai_service        Agent 核心：eino_agent(循环+工具) / redis_memory(记忆) / redis_state(挂起+限流)
+  harness/          自建 Agent Harness —— 固定内核 + 外包器官（每个器官一个子包，可单独替换）
+    agent           Eino 固定内核：模型适配器缝 + ReAct 循环 + 工具注册表
+    prompt          Prompt 组装：带 order 的片段排序拼接（身份/人设/工具指引/动态上下文）
+    session         记忆：只追加事件日志 + pair-or-drop 投影 + 滚动摘要压缩 + 折叠快照
+    approval        审批：人在回路挂起状态机（提案带可执行命令，批准后交给沙箱）
+    guard           把关：滑动窗口限流 + 工具执行流水线四道关（pre/guard/execute/post）
+    sandbox         沙箱 seam：Executor 接口 + 本机占位实现（生产换容器隔离）
+    hooks           钩子插槽：pre 拦截（waterfall）/ post 观察
+    subagent        子智能体：delegate_task / delegate_tasks 并行 fan-out + 深度上限
+    spill           溢出存储：大内容外存留定位符（store/load_large_content）
+    mcp             MCP 集成：外部 server 工具桥进统一注册表（mcp__server__tool）
+    appserver       app-server 协议：JSON-RPC v1 双向契约（流式推送 + 审批回调）
+    metrics         可观测性：计数/求和/仪表 + Prometheus 文本导出
   handler           HTTP/WS/gRPC 接入层 + JWT/限流中间件
   service           业务逻辑（消息路由、未读游标）
   dao / model       MySQL 数据访问 / 表结构
@@ -121,17 +133,32 @@ internal/
   config            配置加载（环境变量 > .env > 默认值）
 ```
 
+## 工具执行流水线（M5）
+
+模型的一次工具调用不会直接落到工具体上，要穿四道关：
+
+```
+工具调用 → pre-execute（业务策略，可 allow/deny/ask）
+        → guard（安全不变量，单调收紧：Deny > Ask > Allow）
+        → execute（超时 + 重试 + 指标包住）
+        → post-execute（结果脱敏/改写后交给模型）
+```
+
+两条纪律写在 `internal/harness/guard` 里：
+
+- **单调**：后注册的规则只能收紧，永远放不开别人收紧的结果。
+- **默认值按代价选**：限流这种"人为、可恢复"的过载 → fail-open 放行；
+  审批这种"没人介入就不该做"的动作 → fail-closed 拒绝。
+
 ## Roadmap：接下来要造的器官
 
 > 每个器官对应一个真实的 agent 工程能力；未完成前不会出现在"核心能力"里，绝不透支信用。
 
-- **Self-built Hook Slots（自建 hook 插槽）** —— 通用 pre/post 插件点：敏感词、审计、埋点这类横切需求，插进去就行，不动业务代码。
-- **Sandbox Execution（沙箱执行）** —— 高危工具调用进隔离容器，把"审批"补成"隔离"，安全从"问一句"升到"封起来"。
-- **Sub-Agent Fan-out（子智能体）** —— goroutine 派发子 Agent 并行拆任务，上下文互不污染。
-- **Context Compaction / Spill（上下文压缩与外存）** —— 超限时压成摘要、超大工具输出外存留定位符，告别粗暴截断。
-- **MCP Integration（协议互通）** —— 对接外部 MCP 生态，工具进统一注册表，一个名字一个命名空间。
-- **Web Console（可视化控制台）** —— 版本化双向协议驱动 agent，审批/进度可视化。
-- **Observability（可观测性）** —— TraceID 全链路 + 指标 + 多模型路由。
+- **Sandbox Execution（真沙箱）** —— seam 已就位（`Executor`），下一步把 `LocalExecutor` 换成容器隔离（`--network=none --read-only`）。
+- **Step-level Checkpoint（逐节点 checkpoint）** —— 现在是轮次级日志，还缺"每跑完一个 step 存快照 + resume"。
+- **策略配置化** —— guard 的 pre/guard 规则与 hooks 现在都是编译期注册，下一步做成配置驱动。
+- **Web Console（可视化控制台）** —— 版本化双向协议驱动 agent，审批/进度可视化（app-server 协议已具备）。
+- **Observability 深化** —— TraceID 全链路 + 直方图指标 + 多模型路由。
 
 ---
 

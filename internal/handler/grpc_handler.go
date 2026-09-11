@@ -2,7 +2,7 @@ package handler
 
 import (
 	"context"
-	"go_im_gateway/internal/ai_service"
+	"go_im_gateway/internal/harness/guard"
 	"go_im_gateway/internal/middleware"
 	"go_im_gateway/rpc"
 	"io"
@@ -139,7 +139,7 @@ func RateLimitInterceptor(rdb *redis.Client) grpc.StreamServerInterceptor {
 		}
 		userID := claims.UserID
 
-		pass := ai_service.CheckRateLimit(wrappedServerStream.Context(), rdb, userID)
+		pass := guard.AllowRequest(wrappedServerStream.Context(), rdb, userID)
 		if !pass {
 			log.Printf("[TRACE: %s]  [防线触发] 用户 %d 请求超载，已被物理熔断！", traceID, userID)
 			return status.Errorf(codes.ResourceExhausted, "触发防御机制：您的请求过于频繁，请稍后再试！")
