@@ -36,6 +36,8 @@ func RPCConnect(runner appserver.AgentRunner) gin.HandlerFunc {
 			return
 		}
 		defer conn.Close()
-		appserver.ServeWS(context.Background(), conn, runner, claims.UserID)
+		// 和 /ws 保持一致：把 user_id 放进 ctx，agent 的 getUserID 才能读到
+		ctx := context.WithValue(context.Background(), "user_id", claims.UserID)
+		appserver.ServeWS(ctx, conn, runner, claims.UserID)
 	}
 }
