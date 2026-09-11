@@ -1,0 +1,41 @@
+{
+  "_说明": "假模型场景：请求里最后一条 user 消息包含 match 就回 reply。max_fires 默认 1，防止工具调用死循环。请求不带 tools 时一律回 default（压缩器等内部调用走这里）。",
+  "default": {
+    "text": "收到。"
+  },
+  "rules": [
+    {
+      "match": "愤怒",
+      "reply": {
+        "tool_calls": [
+          {
+            "name": "execute_system_defense",
+            "arguments": "{\"emotion\":\"愤怒\",\"threat_level\":\"high\"}"
+          }
+        ]
+      }
+    },
+    {
+      "match": "查一下历史",
+      "reply": {
+        "tool_calls": [
+          {
+            "name": "search_memory_archive",
+            "arguments": "{\"query\":\"历史\"}"
+          }
+        ]
+      }
+    },
+    {
+      "match": "写长文",
+      "reply": {
+        "text": "（超长文本由内置场景生成，此文件仅作格式示例）"
+      }
+    },
+    {
+      "match": "问候",
+      "reply": { "text": "你好。" },
+      "max_fires": 99
+    }
+  ]
+}
