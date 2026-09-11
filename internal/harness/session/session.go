@@ -250,6 +250,13 @@ type CompactSummarizer func(ctx context.Context, messages []string) (string, err
 // Compact 上下文压缩（对应 HARNESS-STUDY M7）：把 MaxHistory 窗口之外的早期对话压成一条摘要，
 // 写一条 log-only 的 compaction/summary 事件；投影时被遮蔽的旧事件不再喂给模型。
 // 没有可压缩的早期消息时是空操作（不调 summarize）。
+//
+// 两条不变量（缺一就会退化成"每轮从头重摘一遍"）：
+//  1. 单调：只压"上一条摘要 CompactionTo 之后"的新消息（high-water mark），已摘要过的绝不再摘。
+//  2. 单一滚动摘要：新摘要 = 旧摘要 + 新增溢出消息，重写成一条总摘要，
+//     且 CompactionFrom 恒为 0 —— 旧摘要自身也是一个日志下标，会落进 [0,to] 被遮蔽，
+//     于是投影里永远只剩一条摘要，不会出现 N 条互相重叠的摘要同时喂给模型。
+//
 // 注意：压缩是 best-effort——摘要失败就跳过本次，不影响正常对话。
 func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSummarizer) error {
 	if rdb == nil {
@@ -261,14 +268,35 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 		return err
 	}
 
-	// 收集"可投影的消息"（user/assistant，带其在日志里的下标=seq）
+	// 第一遍：先找出"已经压到哪"和"当前摘要是什么"。
+	// 必须独立成一遍 —— 摘要事件排在它遮蔽的消息之后（日志只追加），
+	// 边扫边收的话，扫到早期消息时还没看见摘要，high-water mark 就是空的。
+	lastTo := -1      // 已经压缩到哪个下标（high-water mark）
+	prevSummary := "" // 当前生效的摘要正文，用来续写而不是重头再来
+	for _, data := range dataList {
+		var dto MemoryDTO
+		if err := json.Unmarshal([]byte(data), &dto); err != nil {
+			continue
+		}
+		if dto.Type != EventCompactionSummary {
+			continue
+		}
+		if dto.CompactionTo > lastTo {
+			lastTo = dto.CompactionTo
+		}
+		prevSummary = dto.Content // 按顺序扫，最后一条就是最新的
+	}
+
+	// 第二遍：只收 high-water mark 之后的消息（seq 即数组下标）
 	type msg struct {
 		idx     int
 		content string
 	}
 	var msgs []msg
-	summaries := 0
 	for i, data := range dataList {
+		if i <= lastTo {
+			continue // 已被现有摘要覆盖，跳过（否则每轮都会把早期对话重摘一遍）
+		}
 		var dto MemoryDTO
 		if err := json.Unmarshal([]byte(data), &dto); err != nil {
 			continue
@@ -278,22 +306,23 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 			typ = inferEventType(schema.RoleType(dto.Role))
 		}
 		switch typ {
-		case EventCompactionSummary:
-			summaries++
 		case EventUserMessage, EventAssistantMessage:
 			msgs = append(msgs, msg{i, dto.Content})
 		}
 	}
-	// 给"新增的这条摘要"留一个名额，保证 摘要数 + 近期消息数 <= MaxHistory
-	keepWindow := MaxHistory - summaries - 1
-	if keepWindow <= 0 {
-		return nil // 摘要已经够多，暂不压缩
-	}
+	// 生效的摘要恒为 1 条（新摘要取代旧摘要），所以窗口只给它留一个名额。
+	// 注意这里不能用"摘要条数"去减：日志里的历史摘要是只追加的、不会被删，
+	// 拿它当分母会让窗口越缩越小，最后变成每轮都压缩。
+	keepWindow := MaxHistory - 1
 	if len(msgs) <= keepWindow {
 		return nil // 没超窗，不用压缩
 	}
 	toCompress := msgs[:len(msgs)-keepWindow]
-	contents := make([]string, 0, len(toCompress))
+	// 摘要输入 = 旧摘要（如果有）+ 本轮新增的溢出消息，保证新摘要覆盖全部早期对话
+	contents := make([]string, 0, len(toCompress)+1)
+	if prevSummary != "" {
+		contents = append(contents, "【已有摘要，请在此基础上续写，不要丢失已有信息】\n"+prevSummary)
+	}
 	for _, m := range toCompress {
 		contents = append(contents, m.content)
 	}
@@ -302,10 +331,12 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 		return fmt.Errorf("压缩摘要失败: %v", err)
 	}
 	dto := MemoryDTO{
-		Type:           EventCompactionSummary,
-		Role:           "assistant",
-		Content:        summary,
-		CompactionFrom: toCompress[0].idx,
+		Type:    EventCompactionSummary,
+		Role:    "assistant",
+		Content: summary,
+		// from 恒为 0：这条摘要代表"到目前为止的全部早期对话"，
+		// 旧摘要的下标也在这段区间里，会被 ProjectMessages 自动遮蔽。
+		CompactionFrom: 0,
 		CompactionTo:   toCompress[len(toCompress)-1].idx,
 		Time:           time.Now(),
 	}
@@ -316,13 +347,23 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 // 投影规则（pair-or-drop）：见本文件顶部事件类型注释。
 // 最后只保留最近 MaxHistory 条真消息；裁剪切在配对中间时，丢弃开头的悬空 tool 消息。
 func ProjectMessages(dtos []MemoryDTO) []*schema.Message {
-	// 预扫描压缩摘要：被遮蔽的旧消息下标直接跳过（压缩后日志只追加、不删旧事件）
+	// 预扫描压缩摘要：
+	//  1. 被遮蔽的旧消息下标直接跳过（压缩后日志只追加、不删旧事件）
+	//  2. 摘要之间是"后者取代前者"的滚动语义：只有覆盖范围最大的那条进投影。
+	//     不能靠下标遮蔽来做到这点 —— 旧摘要自己排在它遮蔽的消息之后，
+	//     新摘要的 [0,to] 根本盖不到它的下标，于是 N 条内容重叠的摘要会一起
+	//     喂给模型，压缩反而把上下文喂胖了。
 	shadowed := map[int]bool{}
+	activeSummary := -1
 	for i := range dtos {
-		if dtos[i].Type == EventCompactionSummary {
-			for j := dtos[i].CompactionFrom; j <= dtos[i].CompactionTo; j++ {
-				shadowed[j] = true
-			}
+		if dtos[i].Type != EventCompactionSummary {
+			continue
+		}
+		for j := dtos[i].CompactionFrom; j <= dtos[i].CompactionTo; j++ {
+			shadowed[j] = true
+		}
+		if activeSummary == -1 || dtos[i].CompactionTo >= dtos[activeSummary].CompactionTo {
+			activeSummary = i
 		}
 	}
 
@@ -351,6 +392,9 @@ func ProjectMessages(dtos []MemoryDTO) []*schema.Message {
 		}
 		switch typ {
 		case EventCompactionSummary:
+			if i != activeSummary {
+				continue // 被更新的摘要取代了，不进投影
+			}
 			flushPair()
 			// 摘要以"用户消息"的形式进投影（模型能看到早期对话的梗概）
 			history = append(history, &schema.Message{
