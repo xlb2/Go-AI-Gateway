@@ -7,7 +7,10 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os/exec"
 	"time"
 )
@@ -38,6 +41,8 @@ type Executor interface {
 type LocalExecutor struct{}
 
 // Run 在宿主机直接跑命令（无隔离）。Timeout 为 0 时用默认 30s。
+// 注意：stdout 和 stderr 分开收——原来只用 cmd.Output() 会把 stderr 丢掉，
+// 命令失败时调用方只看得到 err.Error()（"exit status 1"），拿不到真正的原因。
 func (LocalExecutor) Run(ctx context.Context, req Request) (Result, error) {
 	if req.Timeout <= 0 {
 		req.Timeout = 30 * time.Second
@@ -47,13 +52,24 @@ func (LocalExecutor) Run(ctx context.Context, req Request) (Result, error) {
 
 	cmd := exec.CommandContext(runCtx, req.Command, req.Args...)
 	cmd.Dir = req.Workdir
-	out, err := cmd.Output()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	res := Result{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
-		code := -1
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			code = exitErr.ExitCode()
+		res.ExitCode = -1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			res.ExitCode = exitErr.ExitCode()
 		}
-		return Result{Stderr: err.Error(), ExitCode: code}, err
+		// 超时要区分出来：调用方需要知道"没跑完"和"跑完但失败"不是一回事
+		if runCtx.Err() == context.DeadlineExceeded {
+			res.Stderr = fmt.Sprintf("执行超时(%s)：%s", req.Timeout, res.Stderr)
+		}
+		return res, err
 	}
-	return Result{Stdout: string(out), ExitCode: 0}, nil
+	res.ExitCode = 0
+	return res, nil
 }

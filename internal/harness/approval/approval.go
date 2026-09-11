@@ -23,11 +23,26 @@ func Init(client *redis.Client) {
 }
 
 // PendingAction 挂起的高危动作。
+//
+// 关键设计（对齐 codex 的 AskForApproval → Decision → 执行/提权 决策链）：
+// 挂起时就要把"批准后到底跑什么"一起带上（Command/Args/Workdir），
+// 否则审批通过后无处执行，只能打印一行日志——那审批就是假的。
+// 人只负责"批不批"，批完执行什么由这份提案决定，人不能再改（避免审批被当参数注入的通道）。
 type PendingAction struct {
 	// Action 要执行的动作名称（如 execute_system_defense）
 	Action string `json:"action"`
 	// Param 动作的参数（如触发防御的情绪）
 	Param string `json:"param"`
+	// Reason 为什么需要审批（进审计日志，给人看）
+	Reason string `json:"reason,omitempty"`
+	// Command 审批通过后要真实执行的命令（argv[0]）
+	Command string `json:"command,omitempty"`
+	// Args 命令参数
+	Args []string `json:"args,omitempty"`
+	// Workdir 执行目录（留空用进程当前目录）
+	Workdir string `json:"workdir,omitempty"`
+	// RequestedAt 提案时间（审计用）
+	RequestedAt time.Time `json:"requested_at,omitempty"`
 }
 
 // Store 审批器官接口：挂起、读取、清除一个高危动作。

@@ -50,6 +50,16 @@ const (
 	EventToolResult = "tool/result"
 	// EventCompactionSummary 压缩产生的摘要事件（log-only：记录被遮蔽的旧消息 seq 区间 + 摘要文本）
 	EventCompactionSummary = "compaction/summary"
+	// EventAudit 审批与真实执行的审计记录（log-only，不喂模型）。
+	// 为什么要进日志：审批是"人介入"的动作，必须留下可追溯的一条——
+	// 谁批的、批了什么、真实执行的结果如何。不给模型看，但必须可审计。
+	EventAudit = "audit/action"
+	// EventCheckpoint 折叠快照（log-only）：标记某条水位之前的事件已被压成摘要，
+	// 读取时可以直接从标记处开始 LRange，不必每轮把整条日志拉回内存（对应事件溯源的 snapshot）。
+	EventCheckpoint = "session/checkpoint"
+	// EventCorrupt 读取侧标记：这条日志解不出来（保留占位以保证下标=seq 不错位）。
+	// 只在内存里用，不会写进日志。
+	EventCorrupt = "corrupt/event"
 )
 
 // ToolCallData 一次工具调用的结构化信息（持久化的精简版）。
@@ -69,6 +79,7 @@ type MemoryDTO struct {
 	ToolCalls      []ToolCallData `json:"tool_calls,omitempty"`      // tool/call 携带的调用清单
 	CompactionFrom int            `json:"compaction_from,omitempty"` // compaction/summary 遮蔽的起始 seq
 	CompactionTo   int            `json:"compaction_to,omitempty"`   // compaction/summary 遮蔽的结束 seq
+	FoldUpto       int            `json:"fold_upto,omitempty"`       // session/checkpoint 的折叠水位：此下标（含）之前的事件已被摘要覆盖
 	Time           time.Time      `json:"time"`
 }
 
@@ -78,6 +89,10 @@ type Store interface {
 	GetHistory(ctx context.Context, userID uint) ([]*schema.Message, error)
 	SearchArchival(ctx context.Context, userID uint, query string, topK int) ([]*schema.Message, error)
 	Compact(ctx context.Context, userID uint, summarize CompactSummarizer) error
+	// AppendEvent 追加一条自定义事件（审计/检查点这类 log-only 事件）。
+	AppendEvent(ctx context.Context, userID uint, dto MemoryDTO) error
+	// HasEvent 该类型的事件是否已写过（用于"系统提示只写一次"这类去重）。
+	HasEvent(ctx context.Context, userID uint, eventType string) (bool, error)
 }
 
 // RedisStore 是 Store 的 Redis 实现。
@@ -96,26 +111,92 @@ func (RedisStore) SaveMessage(ctx context.Context, userID uint, msg *schema.Mess
 
 // GetHistory 从日志投影出喂给模型的最近历史（pair-or-drop 规则）。
 func (RedisStore) GetHistory(ctx context.Context, userID uint) ([]*schema.Message, error) {
-	if rdb == nil {
-		return nil, fmt.Errorf("redis client is nil")
-	}
-	key := fmt.Sprintf("agent:V2:history:%d", userID)
-	dataList, err := rdb.LRange(ctx, key, 0, -1).Result()
+	dtos, base, err := RedisStore{}.loadActiveLog(ctx, userID)
 	if err != nil {
 		return nil, err
+	}
+	history := ProjectMessagesFrom(dtos, base)
+	fmt.Printf(" [记忆中枢] 成功为 UserID %d 唤醒了 %d 条前世记忆！(读 %d 条事件, 自 seq %d)\n",
+		userID, len(history), len(dtos), base)
+	return history, nil
+}
+
+// foldKey 折叠水位指针的 key（派生数据，不是日志本体）。
+func foldKey(userID uint) string { return fmt.Sprintf("agent:V2:fold:%d", userID) }
+
+// FoldPoint 日志的折叠水位：此下标之前的事件已被摘要整体覆盖，不必再读。
+//
+// 为什么要它：压缩语义修对之后，"读日志"仍然是每轮全量 LRange，对话越长每轮越慢（O(总长)）。
+// 事件溯源的标准解法是 snapshot —— 把已经摘要过的前缀折叠掉，读取只从最新快照开始。
+// 这里的最新快照就是最新那条 compaction/summary（滚动摘要自己代表了它之前的全部历史），
+// 所以折叠水位 = 最新摘要的下标 = 最后一条 checkpoint 事件的 FoldUpto + 1。
+//
+// 快速路径读指针键（O(1)）；指针丢了就从日志里的 checkpoint 事件重建一次（O(n)，只发生一次），
+// 重建不出来就返回 0 —— 等于全量读，语义不变、只是慢。
+func (RedisStore) FoldPoint(ctx context.Context, userID uint) int {
+	if rdb == nil {
+		return 0
+	}
+	key := fmt.Sprintf("agent:V2:history:%d", userID)
+	total, err := rdb.LLen(ctx, key).Result()
+	if err != nil || total == 0 {
+		return 0
+	}
+	if base, err := rdb.Get(ctx, foldKey(userID)).Int(); err == nil && base > 0 && int64(base) < total {
+		return base
+	}
+	// 慢路径：从日志尾部往前找最后一条 checkpoint
+	dataList, err := rdb.LRange(ctx, key, 0, -1).Result()
+	if err != nil {
+		return 0
+	}
+	for i := len(dataList) - 1; i >= 0; i-- {
+		var dto MemoryDTO
+		if json.Unmarshal([]byte(dataList[i]), &dto) != nil {
+			continue
+		}
+		if dto.Type == EventCheckpoint {
+			base := dto.FoldUpto + 1
+			setFoldPoint(ctx, userID, base)
+			return base
+		}
+	}
+	return 0
+}
+
+// setFoldPoint 写折叠水位（派生数据，写失败不影响正确性，下次压缩会再写一遍）。
+func setFoldPoint(ctx context.Context, userID uint, idx int) {
+	if rdb == nil || idx <= 0 {
+		return
+	}
+	rdb.Set(ctx, foldKey(userID), idx, 0)
+}
+
+// loadActiveLog 读出日志的"活跃尾部"：从折叠水位开始的事件 + 它们的真实起始下标。
+//
+// 起始下标必须一起带出去：日志下标就是 seq，投影/压缩的遮蔽区间全靠它对齐，
+// 只读尾部却不带偏移，所有区间都会错位（模型会看到本该被摘要顶掉的旧消息）。
+func (RedisStore) loadActiveLog(ctx context.Context, userID uint) ([]MemoryDTO, int, error) {
+	if rdb == nil {
+		return nil, 0, fmt.Errorf("redis client is nil")
+	}
+	key := fmt.Sprintf("agent:V2:history:%d", userID)
+	base := RedisStore{}.FoldPoint(ctx, userID)
+	dataList, err := rdb.LRange(ctx, key, int64(base), -1).Result()
+	if err != nil {
+		return nil, 0, err
 	}
 	dtos := make([]MemoryDTO, 0, len(dataList))
 	for _, data := range dataList {
 		var dto MemoryDTO
 		if err := json.Unmarshal([]byte(data), &dto); err != nil {
 			fmt.Printf(" [记忆中枢] 破译记忆碎片失败: %v\n", err)
-			continue
+			// 坏数据也要占一个位置：下标就是 seq，跳过会让后面所有事件错位。
+			dto = MemoryDTO{Type: EventCorrupt}
 		}
 		dtos = append(dtos, dto)
 	}
-	history := ProjectMessages(dtos)
-	fmt.Printf(" [记忆中枢] 成功为 UserID %d 唤醒了 %d 条前世记忆！\n", userID, len(history))
-	return history, nil
+	return dtos, base, nil
 }
 
 // SearchArchival 在完整日志里做词交集检索，取分数最高的 topK 条（滑动窗口外的旧记忆）。
@@ -200,6 +281,42 @@ func inferEventType(role schema.RoleType) string {
 	}
 }
 
+// AppendEvent 追加一条自定义事件（审计/检查点这类 log-only 事件）。
+// 走的是和别的写入完全相同的唯一写入口，保证"日志只追加"这条不变量不被绕开。
+func (RedisStore) AppendEvent(ctx context.Context, userID uint, dto MemoryDTO) error {
+	if dto.Time.IsZero() {
+		dto.Time = time.Now()
+	}
+	return writeMemoryEvent(ctx, userID, dto)
+}
+
+// HasEvent 判断该类型的事件是否已经在日志里出现过。
+// 用途：系统提示这类每轮都一样、又只是 log-only 的事件，只写一次就够了。
+func (RedisStore) HasEvent(ctx context.Context, userID uint, eventType string) (bool, error) {
+	if rdb == nil {
+		return false, fmt.Errorf("redis client is nil")
+	}
+	key := fmt.Sprintf("agent:V2:history:%d", userID)
+	dataList, err := rdb.LRange(ctx, key, 0, -1).Result()
+	if err != nil {
+		return false, err
+	}
+	for _, data := range dataList {
+		var dto MemoryDTO
+		if err := json.Unmarshal([]byte(data), &dto); err != nil {
+			continue
+		}
+		typ := dto.Type
+		if typ == "" {
+			typ = inferEventType(schema.RoleType(dto.Role))
+		}
+		if typ == eventType {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // writeMemoryEvent 把一条记忆事件序列化后 RPush 进记忆日志（唯一的写入口）。
 func writeMemoryEvent(ctx context.Context, userID uint, dto MemoryDTO) error {
 	if rdb == nil {
@@ -262,8 +379,9 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 	if rdb == nil {
 		return fmt.Errorf("redis client is nil")
 	}
-	key := fmt.Sprintf("agent:V2:history:%d", userID)
-	dataList, err := rdb.LRange(ctx, key, 0, -1).Result()
+	// 只读"活跃尾部"（折叠水位之后）——折叠就是事件溯源的 snapshot：
+	// 最新摘要自己代表了它之前的一切，之前的事件不必再拉回内存。
+	dtos, base, err := RedisStore{}.loadActiveLog(ctx, userID)
 	if err != nil {
 		return err
 	}
@@ -271,13 +389,9 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 	// 第一遍：先找出"已经压到哪"和"当前摘要是什么"。
 	// 必须独立成一遍 —— 摘要事件排在它遮蔽的消息之后（日志只追加），
 	// 边扫边收的话，扫到早期消息时还没看见摘要，high-water mark 就是空的。
-	lastTo := -1      // 已经压缩到哪个下标（high-water mark）
+	lastTo := -1      // 已经压缩到哪个 seq（high-water mark）
 	prevSummary := "" // 当前生效的摘要正文，用来续写而不是重头再来
-	for _, data := range dataList {
-		var dto MemoryDTO
-		if err := json.Unmarshal([]byte(data), &dto); err != nil {
-			continue
-		}
+	for _, dto := range dtos {
 		if dto.Type != EventCompactionSummary {
 			continue
 		}
@@ -287,19 +401,16 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 		prevSummary = dto.Content // 按顺序扫，最后一条就是最新的
 	}
 
-	// 第二遍：只收 high-water mark 之后的消息（seq 即数组下标）
+	// 第二遍：只收 high-water mark 之后的消息（seq = 折叠水位 + 数组下标）
 	type msg struct {
 		idx     int
 		content string
 	}
 	var msgs []msg
-	for i, data := range dataList {
-		if i <= lastTo {
+	for i, dto := range dtos {
+		seq := base + i
+		if seq <= lastTo {
 			continue // 已被现有摘要覆盖，跳过（否则每轮都会把早期对话重摘一遍）
-		}
-		var dto MemoryDTO
-		if err := json.Unmarshal([]byte(data), &dto); err != nil {
-			continue
 		}
 		typ := dto.Type
 		if typ == "" {
@@ -307,7 +418,7 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 		}
 		switch typ {
 		case EventUserMessage, EventAssistantMessage:
-			msgs = append(msgs, msg{i, dto.Content})
+			msgs = append(msgs, msg{seq, dto.Content})
 		}
 	}
 	// 生效的摘要恒为 1 条（新摘要取代旧摘要），所以窗口只给它留一个名额。
@@ -335,18 +446,48 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 		Role:    "assistant",
 		Content: summary,
 		// from 恒为 0：这条摘要代表"到目前为止的全部早期对话"，
-		// 旧摘要的下标也在这段区间里，会被 ProjectMessages 自动遮蔽。
+		// 旧摘要的下标也在这段区间里，会被投影自动遮蔽。
 		CompactionFrom: 0,
 		CompactionTo:   toCompress[len(toCompress)-1].idx,
 		Time:           time.Now(),
 	}
-	return writeMemoryEvent(ctx, userID, dto)
+	if err := writeMemoryEvent(ctx, userID, dto); err != nil {
+		return err
+	}
+
+	// 折叠：把读取水位推到刚写的这条摘要上，并落一条 checkpoint 事件把它记在日志里
+	// （日志仍然只追加、一条不删；"折叠到哪"本身也可审计、可在指针丢失时重建）。
+	key := fmt.Sprintf("agent:V2:history:%d", userID)
+	if n, err := rdb.LLen(ctx, key).Result(); err == nil && n > 0 {
+		summarySeq := int(n - 1) // 刚写的摘要的 seq
+		setFoldPoint(ctx, userID, summarySeq)
+		if err := writeMemoryEvent(ctx, userID, MemoryDTO{
+			Type: EventCheckpoint,
+			Role: "system",
+			// FoldUpto 指向摘要的"前一个"，这样投影预扫描不会把摘要自己也遮蔽掉
+			Content:  fmt.Sprintf("折叠水位推进到 seq %d：此前事件由 seq %d 的摘要代表", summarySeq, summarySeq),
+			FoldUpto: summarySeq - 1,
+			Time:     time.Now(),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ProjectMessages 把一组记忆事件投影成喂给模型的 []*schema.Message（纯函数，不依赖 Redis）。
 // 投影规则（pair-or-drop）：见本文件顶部事件类型注释。
 // 最后只保留最近 MaxHistory 条真消息；裁剪切在配对中间时，丢弃开头的悬空 tool 消息。
 func ProjectMessages(dtos []MemoryDTO) []*schema.Message {
+	return ProjectMessagesFrom(dtos, 0)
+}
+
+// ProjectMessagesFrom 同上，但显式给出 dtos[0] 在日志里的真实 seq。
+//
+// 折叠（snapshot）之后只读日志尾部，数组下标就不再等于 seq 了 ——
+// 而遮蔽区间（CompactionFrom/To、FoldUpto）记的都是真实 seq，
+// 不把 baseSeq 加回来的话所有区间都会错位。
+func ProjectMessagesFrom(dtos []MemoryDTO, baseSeq int) []*schema.Message {
 	// 预扫描压缩摘要：
 	//  1. 被遮蔽的旧消息下标直接跳过（压缩后日志只追加、不删旧事件）
 	//  2. 摘要之间是"后者取代前者"的滚动语义：只有覆盖范围最大的那条进投影。
@@ -356,6 +497,13 @@ func ProjectMessages(dtos []MemoryDTO) []*schema.Message {
 	shadowed := map[int]bool{}
 	activeSummary := -1
 	for i := range dtos {
+		if dtos[i].Type == EventCheckpoint {
+			// 折叠水位：这个下标之前的事件已经被摘要覆盖了，跳过即可（日志本身不动）
+			for j := 0; j <= dtos[i].FoldUpto; j++ {
+				shadowed[j] = true
+			}
+			continue
+		}
 		if dtos[i].Type != EventCompactionSummary {
 			continue
 		}
@@ -363,7 +511,7 @@ func ProjectMessages(dtos []MemoryDTO) []*schema.Message {
 			shadowed[j] = true
 		}
 		if activeSummary == -1 || dtos[i].CompactionTo >= dtos[activeSummary].CompactionTo {
-			activeSummary = i
+			activeSummary = i // 注意：这里是数组下标，不是 seq
 		}
 	}
 
@@ -382,8 +530,8 @@ func ProjectMessages(dtos []MemoryDTO) []*schema.Message {
 	}
 
 	for i := range dtos {
-		if shadowed[i] {
-			continue // 被压缩遮蔽的旧事件，不喂模型
+		if shadowed[baseSeq+i] {
+			continue // 被压缩/折叠遮蔽的旧事件，不喂模型
 		}
 		dto := dtos[i]
 		typ := dto.Type
@@ -401,8 +549,8 @@ func ProjectMessages(dtos []MemoryDTO) []*schema.Message {
 				Role:    schema.User,
 				Content: "【早期对话摘要】" + dto.Content,
 			})
-		case EventSystemPrompt:
-			continue
+		case EventSystemPrompt, EventAudit, EventCheckpoint:
+			continue // log-only：只存档/审计用，永远不喂模型
 		case EventToolCall:
 			flushPair()
 			pending = &dto

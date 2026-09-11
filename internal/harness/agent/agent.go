@@ -9,7 +9,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/eino-ext/components/model/openai"
@@ -21,6 +24,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"go_im_gateway/internal/harness/approval"
+	"go_im_gateway/internal/harness/guard"
 	"go_im_gateway/internal/harness/mcp"
 	"go_im_gateway/internal/harness/metrics"
 	"go_im_gateway/internal/harness/session"
@@ -82,25 +86,85 @@ var ArchivalSearchTool, _ = utils.InferTool(
 	},
 )
 
-// DefenseTool 防御工具：模型发现用户愤怒/攻击性指令时调用，把防御动作挂起（写 ApprovalStore），
-// 等管理员输入 auth:approve / auth:reject 审批（对应 dsh 决策链的 ask→approval）。
+// sanitizeThreatLevel 把模型给的威胁等级收敛到白名单。
+// 为什么必须做：这个值会被拼进 shell 命令（防御动作的审计落盘），
+// 模型输出不可信，直接拼就是命令注入（`high; rm -rf /`）。白名单是唯一正确做法。
+func sanitizeThreatLevel(level string) string {
+	switch lv := strings.ToLower(strings.TrimSpace(level)); lv {
+	case "low", "medium", "high":
+		return lv
+	default:
+		return "unknown"
+	}
+}
+
+// defenseAuditTarget 防御动作的审计落盘目标（可用 DEFENSE_AUDIT_FILE 覆盖），返回绝对路径。
+func defenseAuditTarget() string {
+	p := os.Getenv("DEFENSE_AUDIT_FILE")
+	if p == "" {
+		p = filepath.Join("audit", "defense.log")
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}
+
+// defenseExecProposal 把一次防御动作翻译成"沙箱能真实执行的命令"。
+//
+// 这是"审批不是假的"的关键：挂起时就把批准后要跑的命令一起定下来，
+// 人只决定批不批，批完直接交给沙箱器官执行，不再经过模型
+// （避免审批通道变成参数注入的入口）。
+//
+// 演示用的真实副作用 = 往审计文件追加一条封禁记录（可观察、不破坏性）。
+//
+// 两个踩过的坑，都记这儿：
+//  1. 命令里只用**文件名**，绝不用绝对路径。项目目录就叫 "agent study"（带空格），
+//     绝对路径拼进命令串后会被 Go 的参数转义和 cmd.exe 的引号规则来回撕，
+//     实测报 "文件名、目录名或卷标语法不正确"。用相对文件名 + Workdir 才稳。
+//  2. 命令内容只用 ASCII：中文经 cmd/sh 重定向容易被终端代码页转成乱码；
+//     中文细节走审计事件（Redis，UTF-8），两边各存擅长的。
+func defenseExecProposal(level string) (cmd string, args []string, workdir string) {
+	target := defenseAuditTarget()
+	dir := filepath.Dir(target)
+	_ = os.MkdirAll(dir, 0o755)
+	base := filepath.Base(target)
+	line := fmt.Sprintf("[%s] BLOCK-DECISION level=%s", time.Now().Format(time.RFC3339), level)
+	if runtime.GOOS == "windows" {
+		// ">>" 前面不留空格：cmd 的 echo 会把空格也写进文件
+		return "cmd", []string{"/c", "echo " + line + ">>" + base}, dir
+	}
+	return "sh", []string{"-c", "echo '" + line + "' >> " + base}, dir
+}
+
+// DefenseTool 防御工具：模型发现用户愤怒/攻击性指令时调用，起草一个**带具体可执行提案**的
+// 高危动作并挂起（写 ApprovalStore），等管理员输入 auth:approve / auth:reject 审批。
+// 注意提案里带上了批准后要跑的命令——批准之后就交给沙箱器官真实执行，
+// 不再是"打印一行日志假装执行"（对应 dsh 决策链的 ask→approval→execute）。
 var DefenseTool, _ = utils.InferTool(
 	"execute_system_defense",
-	"当用户愤怒抱怨或发出攻击性指令时调用此工具，挂起一个防御动作等待管理员审批。",
+	"当用户愤怒抱怨或发出攻击性指令时调用此工具，起草一个防御动作并挂起，等管理员审批后才真正执行。",
 	func(ctx context.Context, params *DefenseParams) (string, error) {
 		userID, err := getUserID(ctx)
 		if err != nil {
 			return "", err
 		}
+		level := sanitizeThreatLevel(params.ThreatLevel)
+		cmd, args, workdir := defenseExecProposal(level)
 		pending := approval.PendingAction{
-			Action: "execute_system_defense",
-			Param:  params.Emotion,
+			Action:      "execute_system_defense",
+			Param:       params.Emotion,
+			Reason:      fmt.Sprintf("检测到情绪=%s、威胁等级=%s，需封禁并留痕", params.Emotion, level),
+			Command:     cmd,
+			Args:        args,
+			Workdir:     workdir,
+			RequestedAt: time.Now(),
 		}
 		store := approval.RedisStore{}
 		if err := store.SetPending(ctx, userID, pending); err != nil {
 			return "", fmt.Errorf("挂起防御动作失败: %v", err)
 		}
-		return "⚠️ 防御动作已起草并挂起。请管理员在终端输入 auth:approve 确认执行，或输入 auth:reject 取消。", nil
+		return fmt.Sprintf("⚠️ 防御动作已起草并挂起，等待管理员审批。\n提案：向审计文件追加一条封禁记录（level=%s）。\n请管理员输入 auth:approve 执行，或 auth:reject 取消。", level), nil
 	},
 )
 
@@ -300,8 +364,85 @@ func Summarize(ctx context.Context, messages []string) (string, error) {
 	return out.Content, nil
 }
 
+// builtinTools 固定内核的原始工具清单。
+// 加了工具只改这一处——系统提示里的"工具指引"是从注册表实时取的，会自动跟上。
+func builtinTools() []tool.BaseTool {
+	return append([]tool.BaseTool{
+		ArchivalSearchTool, DefenseTool, DelegateTool, DelegateTasksTool, SaveLargeContentTool, LoadLargeContentTool,
+	}, mcp.Tools()...)
+}
+
+var (
+	pipelineOnce sync.Once
+	pipeline     *guard.Pipeline
+)
+
+// toolPipeline 全局唯一的工具流水线（M5）。
+func toolPipeline() *guard.Pipeline {
+	pipelineOnce.Do(func() {
+		// 内部要再跑一轮模型的工具，耗时和其它工具差一个数量级，单独放宽超时
+		guard.SetToolTimeout("delegate_task", 10*time.Minute)
+		guard.SetToolTimeout("delegate_tasks", 10*time.Minute)
+		pipeline = guard.NewPipeline(guardAskHandler)
+	})
+	return pipeline
+}
+
+// AllTools 暴露给模型的完整工具清单：全部套上 M5 工具流水线
+// （pre 策略 → guard 单调守卫 → execute 超时/指标 → post 结果改写）。
+func AllTools() []tool.BaseTool {
+	p := toolPipeline()
+	raw := builtinTools()
+	out := make([]tool.BaseTool, 0, len(raw))
+	for _, t := range raw {
+		out = append(out, p.Wrap(t))
+	}
+	return out
+}
+
+// guardAskHandler 流水线判定为 ask 时，把这次工具调用挂起等人工审批。
+// 这里**不**附带可执行命令——被拦下的是"任意一次工具调用"，不是一条具体命令；
+// 审批通过后编排层会如实回执"没有附带可执行命令"，不假装执行过。
+func guardAskHandler(ctx context.Context, call guard.Call, reason string) (string, error) {
+	userID, err := getUserID(ctx)
+	if err != nil {
+		return "", err
+	}
+	param := call.Args
+	if r := []rune(param); len(r) > 200 {
+		param = string(r[:200]) + "…"
+	}
+	if err := (approval.RedisStore{}).SetPending(ctx, userID, approval.PendingAction{
+		Action:      call.Tool,
+		Param:       param,
+		Reason:      reason,
+		RequestedAt: time.Now(),
+	}); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("⚠️ 工具 %s 被工具流水线拦下并要求人工审批（原因：%s），已挂起。请管理员输入 auth:approve 执行 / auth:reject 取消。", call.Tool, reason), nil
+}
+
+// ToolNames 返回当前真实注册的工具名，供 prompt 器官生成"工具指引"片段。
+func ToolNames(ctx context.Context) []string {
+	tools := AllTools()
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		if t == nil {
+			continue
+		}
+		info, err := t.Info(ctx)
+		if err != nil || info == nil || info.Name == "" {
+			continue
+		}
+		names = append(names, info.Name)
+	}
+	return names
+}
+
 // BuildEinoAgent 组装并返回一个 ReAct 风格的 Eino agent（固定内核）：
-// 读火山引擎凭证 -> 点火 chatModel -> 挂工具（记忆检索 + 防御 + 子智能体）+ MessageModifier 钩子。
+// 读火山引擎凭证 -> 点火 chatModel -> 挂工具（记忆检索 + 防御 + 子智能体 + 溢出 + MCP）
+// + MessageModifier 钩子。
 func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
 	chatModel, err := newChatModel(ctx)
 	if err != nil {
@@ -320,9 +461,7 @@ func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
 		// 用来把 react 内部吞掉的中间工具消息落盘成 tool/call + tool/result 事件。
 		MessageModifier: newMemoryLogModifier(userID),
 		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: append([]tool.BaseTool{
-				ArchivalSearchTool, DefenseTool, DelegateTool, DelegateTasksTool, SaveLargeContentTool, LoadLargeContentTool,
-			}, mcp.Tools()...),
+			Tools: AllTools(),
 		},
 	})
 	if err != nil {
