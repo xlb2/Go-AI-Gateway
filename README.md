@@ -139,7 +139,7 @@ $t = (Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/v1/user/log
 | `scripts/reset-state.sh [uid]` | 重置 `agent:*` 键与审批审计产物，从干净状态开始 | — |
 | `go run ./cmd/probe validate` | 体检存量日志：不变量违规 + 格式版本（只读） | 秒级 |
 
-测试覆盖的不变量（`test/e2e` 20 个 + `tokenmeter` / `retry` 各 6 个纯函数用例）：
+测试覆盖的不变量（`test/e2e` 26 个 + `sandbox` 14 个、`tokenmeter` / `retry` 各 6 个、`metrics` 4 个纯函数用例）：
 
 - 悬空的 `tool/result` 不进投影（pair-or-drop）；
 - 折叠后数组下标 ≠ seq，**遮蔽区间必须跟着偏移**（否则区间静默错位）；
@@ -152,7 +152,12 @@ $t = (Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/v1/user/log
 - 真实 usage 会落盘，并用来校准估算系数；
 - 崩溃留下的**开放轮次**能被认出并补合成收尾（幂等、不改历史）；流被切断的回复标 `interrupted` 且不冒充完整回答；
 - 429 两次能重试成功并留下 2 条 `llm/retry`；**400 参数错立刻失败**、一条重试记录都不留；
-- 结构非法的事件（缺 `ToolCallID` 的 `tool/result`）**在写入时就被拒绝**；读到更高版本的日志明确报错，而**没有版本号的老日志照常读**。
+- 结构非法的事件（缺 `ToolCallID` 的 `tool/result`）**在写入时就被拒绝**；读到更高版本的日志明确报错，而**没有版本号的老日志照常读**；
+- **执行计划只有 argv**：想交给 shell 解释器的计划会被拦下；防御动作走内置文件动作，带空格的路径与中文都不用转义也能落盘；
+- **没有执行计划的挂起**（被流水线拦下的工具调用）批准后被**如实拒绝**，不假装执行；
+- 审批是**两步**的（只敲 `auth:approve` 不执行、错误确认码不执行），过期提案明确回「已超时作废」而不是静默消失；
+- 轮次耗时与工具耗时以**直方图**导出（`_bucket{le=…}` / `_sum` / `_count`），能看到 P50/P99 而不只是总和；
+- 容器后端：隔离参数一个不少、镜像之后才是命令、只挂工作目录、外部命令**必须经 docker**（不裸跑）；配了 docker 但不可用时**拒绝一切执行**而不是退回裸跑。
 
 设计原则（借自 dsh 的 testing 文档）：**只 mock LLM**，Redis 用真的；**断言落到 Redis 的事件序列**，不断言模型回复的文案；外部依赖不可用就 **skip 而不是 fail**。详见 [`test/README.md`](test/README.md)。
 
@@ -210,13 +215,13 @@ internal/
     session         记忆：只追加事件日志 + pair-or-drop 投影 + 摘要压缩 + 折叠快照 + 写入侧不变量 + 格式版本
     approval        审批：人在回路挂起状态机（提案带可执行命令，批准后交给沙箱）
     guard           把关：滑动窗口限流 + 工具执行流水线四道关（pre/guard/execute/post）
-    sandbox         沙箱 seam：Executor 接口 + 本机占位实现（生产换容器隔离）
+    sandbox         沙箱：只收 argv（不经 shell）+ 内置文件动作 + 本机/容器两种后端 + 隔离等级诚实上报
     hooks           钩子插槽：pre 拦截（waterfall）/ post 观察
     subagent        子智能体：delegate_task / delegate_tasks 并行 fan-out + 深度上限
     spill           溢出存储：大内容外存留定位符（store/load_large_content）
     mcp             MCP 集成：外部 server 工具桥进统一注册表（mcp__server__tool）
     appserver       app-server 协议：JSON-RPC v1 双向契约（流式推送 + 审批回调）
-    metrics         可观测性：计数/求和/仪表 + Prometheus 文本导出
+    metrics         可观测性：计数/求和/仪表/直方图 + Prometheus 文本导出
   handler           HTTP/WS/gRPC 接入层 + JWT/限流中间件
   service           业务逻辑（消息路由、未读游标）
   dao / model       MySQL 数据访问 / 表结构
@@ -249,7 +254,7 @@ scripts/            本地开发与验证脚本（见上表）
 
 ### 审批不是打印一行日志
 
-`auth:approve` 之后是真的走沙箱执行器把命令跑起来，并把退出码和输出回执给你；
+`auth:approve` 之后是真的走沙箱执行器把动作跑起来，并把退出码和输出回执给你；
 回执里**始终写明隔离等级**（`none` / `partial` / `full`）和执行方式 ——
 人得知道批的是"沙箱内动作"还是"宿主机裸跑"。同时落一条 `audit/action` 审计事件
 （log-only，不喂模型），可追溯谁批的、批了什么、结果如何。
@@ -259,15 +264,47 @@ scripts/            本地开发与验证脚本（见上表）
 没人能保证安全时，宁可不做。（对比：限流这种"人为、可恢复"的过载是 fail-open ——
 默认值应该按"猜错的代价"选，而不是随手写死。）
 
+**执行计划只有 argv，没有"命令字符串"。** 挂起时定下的计划是 `sandbox.Request`
+（命令 + 参数数组，或一个内置动作），批准后原样交给执行器 ——
+没有"拼一段 shell 命令"这一步，所以没有注入面，也没有引号转义问题。
+本项目的"写审计文件"动作就走**内置文件动作**（纯 Go 写），不是 `sh -c 'echo x >> y'`：
+带空格的路径（这个项目的目录就叫 `agent study`）和中文内容都因此不再需要特殊处理。
+`Validate()` 会拦下任何想交给 shell 解释器（`cmd` / `sh` / `powershell`…）的计划，
+除非显式 `SANDBOX_ALLOW_SHELL=true`。
+
+**审批是两步的，超时是显式的。** 敲 `auth:approve` 只会回显完整执行计划
+（含「将要执行：…」原文、剩余有效期、可选项）和一个短确认码，**不执行**；
+要把码再打一遍（`auth:approve <码>`）才真的执行 —— 防的是"看都不看就批"。
+提案有有效期（默认 5 分钟），过期后批准会得到明确的「已超时作废」回执，
+而不是静默变成"没有待审批任务"（以前超时由 Redis TTL 隐式发生，超时了没人知道）。
+可选项由提案方给出（现在是批准 / 拒绝两个），将来加"仅本次允许 / 永久允许"不用改交互协议。
+
 一个刻意的选择：**流水线不拦 `execute_system_defense` 这个工具调用**。它只是"起草提案"、本身不高危；
-真正高危的是批准后执行的命令，所以不变量落在**执行点**而不是工具调用点——拦错地方会直接破坏审批链。
+真正高危的是批准后执行的动作，所以不变量落在**执行点**而不是工具调用点——拦错地方会直接破坏审批链。
+
+**沙箱有两种后端，按 `SANDBOX_BACKEND` 选。** `local`（默认）在宿主机直跑、如实上报
+隔离等级 `none`；`docker` 把命令放进一次性容器 —— `--rm --network=none --read-only
+--cap-drop=ALL --security-opt=no-new-privileges --pids-limit=64 --memory=256m --cpus=1`，
+上报 `full`。选 docker 但 docker 连不上时**所有审批都拒绝执行**（fail-closed），
+绝不悄悄退回本机直跑 ——「配了要隔离却实际裸跑」比「根本没配隔离」危险得多。
+
+想自己验证隔离真的生效（需要 docker 与 `alpine:3.20` 镜像，注意这两条直接调 docker，
+不经过本项目的沙箱接口 —— 那个接口不接受 shell 解释器）：
+
+```sh
+docker run --rm --network=none alpine:3.20 wget -T3 -qO- https://example.com || echo "✅ 出不去"
+docker run --rm --read-only alpine:3.20 touch /x || echo "✅ 根文件系统只读"
+```
+
+另一处**刻意保留的诚实缺口**：被工具流水线拦下的"某次工具调用"挂起时**没有**执行计划
+（它还没被翻译成 argv）。批准后会**如实拒绝执行**并说明原因，而不是假装执行过。
+要把这条链补全属于审批升级链（HARNESS-TODO P3-2）。
 
 ## Roadmap
 
 > 未完成前不会出现在"核心能力"里，绝不透支信用。
 > 完整清单（每条带优先级 / 为什么 / 对比 dsh+codex / 如何做 / 验收）见 `HARNESS-TODO.md`。
 
-- **真沙箱隔离** —— 诚实上报与 fail-closed 已就位（`Isolation` 三档 + `REQUIRE_SANDBOX_ISOLATION`），下一步把 `LocalExecutor` 换成容器后端（`--network=none --read-only`），并把命令从 shell 字符串改成 argv。
 - **Step-level Checkpoint** —— 现在是轮次级日志，还缺"每跑完一个 step 存快照 + resume"（开放轮次修复已经能认出中断的轮次，是它的前置）。
 - **策略配置化 / 审批升级链** —— guard 规则与 hooks 现在都是编译期注册，加一条策略要改代码重启；命令种类够多之后再做"批准即落规则"的升级链。
 - **MCP 真连一次** —— 代码在、从未真连过。

@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +29,7 @@ import (
 	"go_im_gateway/internal/harness/mcp"
 	"go_im_gateway/internal/harness/metrics"
 	"go_im_gateway/internal/harness/retry"
+	"go_im_gateway/internal/harness/sandbox"
 	"go_im_gateway/internal/harness/session"
 	"go_im_gateway/internal/harness/spill"
 	"go_im_gateway/internal/harness/subagent"
@@ -113,31 +113,29 @@ func defenseAuditTarget() string {
 	return p
 }
 
-// defenseExecProposal 把一次防御动作翻译成"沙箱能真实执行的命令"。
+// defenseExecProposal 把一次防御动作翻译成一份**结构化执行计划**（HARNESS-TODO 的 P2-1）。
 //
-// 这是"审批不是假的"的关键：挂起时就把批准后要跑的命令一起定下来，
+// 这是"审批不是假的"的关键：挂起时就把批准后要执行的东西一起定下来，
 // 人只决定批不批，批完直接交给沙箱器官执行，不再经过模型
 // （避免审批通道变成参数注入的入口）。
 //
 // 演示用的真实副作用 = 往审计文件追加一条封禁记录（可观察、不破坏性）。
 //
-// 两个踩过的坑，都记这儿：
-//  1. 命令里只用**文件名**，绝不用绝对路径。项目目录就叫 "agent study"（带空格），
-//     绝对路径拼进命令串后会被 Go 的参数转义和 cmd.exe 的引号规则来回撕，
-//     实测报 "文件名、目录名或卷标语法不正确"。用相对文件名 + Workdir 才稳。
-//  2. 命令内容只用 ASCII：中文经 cmd/sh 重定向容易被终端代码页转成乱码；
-//     中文细节走审计事件（Redis，UTF-8），两边各存擅长的。
-func defenseExecProposal(level string) (cmd string, args []string, workdir string) {
-	target := defenseAuditTarget()
-	dir := filepath.Dir(target)
-	_ = os.MkdirAll(dir, 0o755)
-	base := filepath.Base(target)
-	line := fmt.Sprintf("[%s] BLOCK-DECISION level=%s", time.Now().Format(time.RFC3339), level)
-	if runtime.GOOS == "windows" {
-		// ">>" 前面不留空格：cmd 的 echo 会把空格也写进文件
-		return "cmd", []string{"/c", "echo " + line + ">>" + base}, dir
+// 注意这里**不拼任何 shell 命令**：动作本质是"写文件"，就用沙箱的内置文件动作
+// （纯 Go 写），而不是 `sh -c 'echo x >> y'`。这一步把两个坑一起根治了：
+//  1. 项目目录叫 "agent study"（带空格），绝对路径拼进命令串后会被 Go 的参数转义
+//     和 cmd.exe 的引号规则来回撕（实测报"文件名、目录名或卷标语法不正确"）——
+//     现在路径只作为结构体字段传递，根本不进命令串。
+//  2. 中文经 cmd/sh 重定向容易被终端代码页转成乱码 —— 现在字节直接写文件，与代码页无关。
+func defenseExecProposal(level, emotion string) sandbox.Request {
+	line := fmt.Sprintf("[%s] BLOCK-DECISION level=%s emotion=%s\n",
+		time.Now().Format(time.RFC3339), level, emotion)
+	return sandbox.Request{
+		Kind:     sandbox.ActionAppendFile,
+		FilePath: defenseAuditTarget(),
+		FileText: line,
+		Timeout:  10 * time.Second,
 	}
-	return "sh", []string{"-c", "echo '" + line + "' >> " + base}, dir
 }
 
 // DefenseTool 防御工具：模型发现用户愤怒/攻击性指令时调用，起草一个**带具体可执行提案**的
@@ -153,15 +151,15 @@ var DefenseTool, _ = utils.InferTool(
 			return "", err
 		}
 		level := sanitizeThreatLevel(params.ThreatLevel)
-		cmd, args, workdir := defenseExecProposal(level)
 		pending := approval.PendingAction{
-			Action:      "execute_system_defense",
-			Param:       params.Emotion,
-			Reason:      fmt.Sprintf("检测到情绪=%s、威胁等级=%s，需封禁并留痕", params.Emotion, level),
-			Command:     cmd,
-			Args:        args,
-			Workdir:     workdir,
-			RequestedAt: time.Now(),
+			Action: "execute_system_defense",
+			Param:  params.Emotion,
+			Reason: fmt.Sprintf("检测到情绪=%s、威胁等级=%s，需封禁并留痕", params.Emotion, level),
+			Plan:   defenseExecProposal(level, params.Emotion),
+			// 可选项由**提案方**决定（P2-2）：现在是"批准 / 拒绝"两个，
+			// 将来加"仅本次允许 / 永久封禁"就往这个数组里加，交互协议不用动。
+			AvailableDecisions: []string{"approve", "reject"},
+			RequestedAt:        time.Now(),
 		}
 		store := approval.RedisStore{}
 		if err := store.SetPending(ctx, userID, pending); err != nil {
@@ -404,8 +402,12 @@ func AllTools() []tool.BaseTool {
 }
 
 // guardAskHandler 流水线判定为 ask 时，把这次工具调用挂起等人工审批。
-// 这里**不**附带可执行命令——被拦下的是"任意一次工具调用"，不是一条具体命令；
-// 审批通过后编排层会如实回执"没有附带可执行命令"，不假装执行过。
+//
+// 这里**不**附带执行计划：被拦下的是"任意一次工具调用"，它还没有被翻译成
+// 具体的 argv 或内置动作。于是批准后编排层会**如实拒绝执行**（执行计划非法），
+// 而不是假装执行过 —— 这是刻意保留的诚实缺口。
+// 把这条链补全（批准后真的把那次工具调用跑起来）属于 HARNESS-TODO 的 P3-2
+// （审批升级链），现在先明确地不做，而不是糊过去。
 func guardAskHandler(ctx context.Context, call guard.Call, reason string) (string, error) {
 	userID, err := getUserID(ctx)
 	if err != nil {

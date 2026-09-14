@@ -7,6 +7,7 @@ import (
 	"go_im_gateway/internal/config"
 	"go_im_gateway/internal/dao"
 	"go_im_gateway/internal/handler"
+	"go_im_gateway/internal/harness"
 	"go_im_gateway/internal/harness/agent"
 	"go_im_gateway/internal/harness/approval"
 	"go_im_gateway/internal/harness/hooks"
@@ -59,6 +60,13 @@ func main() {
 	approval.Init(rdb)                            // harness 审批器官注入 Redis
 	spill.Init(rdb)                               // harness 溢出存储器官注入 Redis
 	hooks.RegisterDefaultHooks()                  // 内置横切钩子（敏感词/超长拦截 + 回复统计）
+
+	// 沙箱后端：启动时明确打一行（HARNESS-TODO 的 P2-4）。
+	// 人必须知道"审批批准之后到底跑在什么环境里"——按 SANDBOX_BACKEND 选，
+	// 配了 docker 却连不上时这里会显示「沙箱不可用」，那种情况下
+	// 所有审批都不会被真正执行（fail-closed，不退回裸跑）。
+	log.Printf("沙箱后端: %s（隔离等级 = %s）\n",
+		harness.Default.Exec.Describe(), harness.Default.Exec.Isolation())
 
 	// MCP 集成（可选）：配了 MCP_SERVER_COMMAND 就连接并注册外部工具；失败只告警不挡启动
 	if err := mcp.ConnectFromEnv(ctx); err != nil {

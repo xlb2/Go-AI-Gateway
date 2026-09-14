@@ -7,11 +7,23 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// confirmCodeRe 抓回显里的确认码（P2-2 之后审批是两步的：
+// 先 auth:approve 拿到回显，再用 auth:approve <码> 确认执行）。
+var confirmCodeRe = regexp.MustCompile(`auth:approve ([0-9a-f]{6})`)
+
+func confirmCode(s string) string {
+	if m := confirmCodeRe.FindStringSubmatch(s); m != nil {
+		return m[1]
+	}
+	return ""
+}
 
 type rpcClient struct {
 	conn *websocket.Conn
@@ -108,8 +120,18 @@ func main() {
 		fmt.Println("\n== 3) 防御审批流 ==")
 		fmt.Println("回复:", c.call("agent/run", map[string]string{"content": "气死我了！我要投诉你们公司！"}))
 
-		fmt.Println("\n== 4) 审批：auth:approve ==")
-		fmt.Println("审批:", c.call("approval/command", map[string]string{"text": "auth:approve"}))
+		fmt.Println("\n== 4) 审批：两步确认 ==")
+		// P2-2 之后审批是**两步**的：只敲 auth:approve 只回显不执行，
+		// 要拿回显里的确认码再确认一次。
+		first := c.call("approval/command", map[string]string{"text": "auth:approve"})
+		fmt.Println("提案回显:", first)
+		code := confirmCode(first)
+		if code == "" {
+			fmt.Println("⚠️ 回显里没有确认码，第 4 段跳过")
+		} else {
+			fmt.Printf("（用确认码 %s 再确认一次）\n", code)
+			fmt.Println("确认执行:", c.call("approval/command", map[string]string{"text": "auth:approve " + code}))
+		}
 
 		fmt.Println("\n== 5) 逼出自动 spill（delegate_tasks 产出超长结果）==")
 		fmt.Println("回复:", c.call("agent/run", map[string]string{"content": `请必须调用 delegate_tasks 工具并行执行两个任务：

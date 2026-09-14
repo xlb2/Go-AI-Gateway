@@ -17,14 +17,18 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
 	"go_im_gateway/internal/harness"
 	"go_im_gateway/internal/harness/approval"
+	"go_im_gateway/internal/harness/metrics"
 	"go_im_gateway/internal/harness/sandbox"
 	"go_im_gateway/internal/harness/session"
 	"go_im_gateway/internal/harness/spill"
@@ -122,6 +126,31 @@ func (e *env) run(content string) string {
 		e.t.Fatalf("RunAgentTurn 失败: %v", err)
 	}
 	return out
+}
+
+// approve 走**两步确认**（P2-2）：先输入 auth:approve 拿回显里的确认码，再用码确认执行。
+// 返回第二步的回执；若第一步就没有码（例如已超时作废），原样返回第一步的结果。
+func (e *env) approve() (bool, string) {
+	e.t.Helper()
+	handled, prompt := e.h.HandleApprovalCommand(e.ctx(), e.uid, "auth:approve")
+	if !handled {
+		return false, ""
+	}
+	code := extractConfirmCode(prompt)
+	if code == "" {
+		return true, prompt
+	}
+	return e.h.HandleApprovalCommand(e.ctx(), e.uid, "auth:approve "+code)
+}
+
+// confirmCodeRe 从回显里抓确认码（回显那行是"确认执行请输入：auth:approve ab12cd"）。
+var confirmCodeRe = regexp.MustCompile(`auth:approve ([0-9a-f]{6})`)
+
+func extractConfirmCode(s string) string {
+	if m := confirmCodeRe.FindStringSubmatch(s); m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 // log 读出当前记忆日志（展开成 DTO 序列）。
@@ -328,7 +357,7 @@ func TestApprovalSuspendsThenReallyExecutes(t *testing.T) {
 	// 场景规则：包含"愤怒"就起草 execute_system_defense
 	e.run("气死我了，我很愤怒！")
 
-	// 1) 应该挂起，并且**带上批准后要跑的命令**（没有命令的审批是假的）
+	// 1) 应该挂起，并且**带上批准后要执行的计划**（没有计划的审批是假的）
 	pending, err := (approval.RedisStore{}).GetPending(e.ctx(), e.uid)
 	if err != nil {
 		t.Fatalf("读挂起状态失败: %v", err)
@@ -336,8 +365,16 @@ func TestApprovalSuspendsThenReallyExecutes(t *testing.T) {
 	if pending == nil {
 		t.Fatal("模型调了 execute_system_defense，但没有挂起待审批动作")
 	}
-	if pending.Command == "" {
-		t.Fatal("挂起的提案没有带可执行命令 —— 批准之后将无事可做（审批是假的）")
+	if pending.Plan.Kind == "" {
+		t.Fatal("挂起的提案没有带执行计划 —— 批准之后将无事可做（审批是假的）")
+	}
+	// 计划必须是合法的：不能是"交给 shell 解释器"那种（argv 化是 P2-1 的要求）
+	if err := sandbox.Validate(pending.Plan); err != nil {
+		t.Fatalf("挂起了一个非法的执行计划：%v", err)
+	}
+	// 而且计划里**不该出现 shell 解释器**：这个动作本质是写文件，就该用内置文件动作
+	if pending.Plan.Kind != sandbox.ActionAppendFile {
+		t.Fatalf("防御动作应该是内置文件动作（不经 shell），实际是 %q", pending.Plan.Kind)
 	}
 	if pending.Reason == "" {
 		t.Fatal("挂起的提案没有原因，审计时无法追溯为什么要批")
@@ -349,7 +386,7 @@ func TestApprovalSuspendsThenReallyExecutes(t *testing.T) {
 	}
 
 	// 3) 批准 → 必须经沙箱执行器真实执行
-	handled, reply := e.h.HandleApprovalCommand(e.ctx(), e.uid, "auth:approve")
+	handled, reply := e.approve()
 	if !handled {
 		t.Fatal("auth:approve 没被处理")
 	}
@@ -357,8 +394,13 @@ func TestApprovalSuspendsThenReallyExecutes(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("期望恰好执行 1 次，实际 %d 次。回执=%s", len(calls), reply)
 	}
-	if calls[0].Command != pending.Command {
-		t.Fatalf("执行的命令与提案不一致：执行=%q 提案=%q", calls[0].Command, pending.Command)
+	// 执行的必须**就是提案里那一个计划**（不能"批准时另拼一个"）
+	if calls[0].Kind != pending.Plan.Kind || calls[0].FilePath != pending.Plan.FilePath {
+		t.Fatalf("执行的计划与提案不一致：执行=%+v 提案=%+v", calls[0], pending.Plan)
+	}
+	// 而且计划里绝不能出现外部命令 —— 这个动作不该经过任何 shell 或子进程
+	if calls[0].Command != "" {
+		t.Fatalf("内置文件动作不该带外部命令，实际 command=%q（说明还在拼 shell 命令）", calls[0].Command)
 	}
 
 	// 4) 必须落一条审计事件（log-only，不喂模型，但要可追溯）
@@ -368,7 +410,7 @@ func TestApprovalSuspendsThenReallyExecutes(t *testing.T) {
 	}
 
 	// 5) 同一提案不能被执行两次
-	if _, again := e.h.HandleApprovalCommand(e.ctx(), e.uid, "auth:approve"); again != "" {
+	if _, again := e.approve(); again != "" {
 		if len(exec.calls()) != 1 {
 			t.Fatalf("重复 approve 又被执行了一次，共 %d 次", len(exec.calls()))
 		}
@@ -532,7 +574,7 @@ func TestApprovalReceiptReportsIsolation(t *testing.T) {
 	e.h = e.newHarness(exec)
 
 	e.run("气死我了，我很愤怒！")
-	_, reply := e.h.HandleApprovalCommand(e.ctx(), e.uid, "auth:approve")
+	_, reply := e.approve()
 
 	if !strings.Contains(reply, "full") {
 		t.Fatalf("回执里没有隔离等级，人无法判断批的是什么：\n%s", reply)
@@ -551,7 +593,7 @@ func TestApprovalRefusedWithoutIsolation(t *testing.T) {
 	t.Setenv("REQUIRE_SANDBOX_ISOLATION", "true")
 
 	e.run("气死我了，我很愤怒！")
-	handled, reply := e.h.HandleApprovalCommand(e.ctx(), e.uid, "auth:approve")
+	handled, reply := e.approve()
 
 	if !handled {
 		t.Fatal("auth:approve 没被处理")
@@ -576,7 +618,7 @@ func TestApprovalWarnsWhenRunningWithoutIsolation(t *testing.T) {
 	e.h = e.newHarness(exec)
 
 	e.run("气死我了，我很愤怒！")
-	_, reply := e.h.HandleApprovalCommand(e.ctx(), e.uid, "auth:approve")
+	_, reply := e.approve()
 
 	if len(exec.calls()) != 1 {
 		t.Fatalf("默认不要求隔离时应该照常执行，实际执行了 %d 次", len(exec.calls()))
@@ -829,5 +871,236 @@ func TestUnknownLogVersionRefusesToLoad(t *testing.T) {
 	}
 	if len(hist) == 0 {
 		t.Fatal("老日志没有被投影出来")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 命令 argv 化（P2-1）
+// ---------------------------------------------------------------------------
+
+// P2-1 的验收：内置文件动作**不经 shell** 也能完成，
+// 而且带空格的路径与中文内容都安全（这两样正是以前拼 shell 命令时必然出问题的地方）。
+func TestApprovalAppendFileNeedsNoShell(t *testing.T) {
+	e := newEnv(t, 9025)
+	// 用**真**执行器：这个用例要验的就是"真的写进去了"，用 fake 就没意义了
+	e.h = e.newHarness(sandbox.LocalExecutor{})
+
+	// 路径里同时放空格和中文 —— 以前这套组合会撞上 "文件名、目录名或卷标语法不正确"
+	auditPath := filepath.Join(t.TempDir(), "带 空格 的目录", "defense.log")
+	t.Setenv("DEFENSE_AUDIT_FILE", auditPath)
+
+	e.run("气死我了，我很愤怒！")
+
+	handled, reply := e.approve()
+	if !handled {
+		t.Fatal("auth:approve 没被处理")
+	}
+
+	// 回执里不该再出现任何 shell 解释器 —— 这是 argv 化的直接证据
+	for _, bad := range []string{"cmd /c", "sh -c", "powershell"} {
+		if strings.Contains(reply, bad) {
+			t.Fatalf("回执里出现了 shell 调用（%q），说明计划还在拼命令串：\n%s", bad, reply)
+		}
+	}
+
+	data, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("审批通过了但审计文件没写进去（执行链断了）：%v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "BLOCK-DECISION") {
+		t.Fatalf("审计文件内容不对：%q", content)
+	}
+	// 中文要原样落盘：以前经 cmd/sh 重定向会被终端代码页转成乱码，
+	// 现在字节直接写文件，与代码页无关 —— 这是根治而不是绕开。
+	if !strings.Contains(content, "愤怒") {
+		t.Fatalf("中文没写进审计文件（应该不经 shell 直接写）：%q", content)
+	}
+}
+
+// 没有执行计划的挂起（例如被工具流水线拦下的"某次工具调用"）：
+// 批准后必须**如实拒绝**，而不是假装执行过 —— 宁可留一个诚实的能力缺口。
+func TestApproveWithoutPlanIsRefusedNotFaked(t *testing.T) {
+	e := newEnv(t, 9026)
+	exec := &recordingExecutor{res: sandbox.Result{ExitCode: 0}}
+	e.h = e.newHarness(exec)
+
+	// 手工制造这种挂起（guard 的 ask 处理就是这样：只有工具名和参数，没有 argv）
+	if err := (approval.RedisStore{}).SetPending(e.ctx(), e.uid, approval.PendingAction{
+		Action: "mcp__ext__some_tool", Param: "{}", Reason: "外部 MCP 工具默认需人工审批",
+	}); err != nil {
+		t.Fatalf("挂起失败: %v", err)
+	}
+
+	_, reply := e.approve()
+
+	if len(exec.calls()) != 0 {
+		t.Fatalf("没有执行计划却执行了 %d 次 —— 那就是凭空执行", len(exec.calls()))
+	}
+	if !strings.Contains(reply, "拒绝") {
+		t.Fatalf("应如实拒绝执行，实际回执：\n%s", reply)
+	}
+	// 拒绝也是一次决策，同样要可追溯
+	if c := e.countTypes(); c[session.EventAudit] == 0 {
+		t.Fatal("拒绝执行也要留审计记录")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 审批工程细节（P2-2）
+// ---------------------------------------------------------------------------
+
+// 两步确认：只敲 auth:approve **不执行**，必须把回显里的确认码再打一遍。
+func TestApprovalNeedsTwoSteps(t *testing.T) {
+	e := newEnv(t, 9027)
+	exec := &recordingExecutor{res: sandbox.Result{ExitCode: 0}}
+	e.h = e.newHarness(exec)
+
+	e.run("气死我了，我很愤怒！")
+
+	// 第一步：只回显，不执行
+	handled, prompt := e.h.HandleApprovalCommand(e.ctx(), e.uid, "auth:approve")
+	if !handled {
+		t.Fatal("auth:approve 应该被处理")
+	}
+	if len(exec.calls()) != 0 {
+		t.Fatalf("只敲一次 auth:approve 就执行了 %d 次 —— 两步确认没生效", len(exec.calls()))
+	}
+	// 回显里必须能看到"将要执行什么"：人是在为这段具体内容背书
+	if !strings.Contains(prompt, "将要执行") {
+		t.Fatalf("回显里没有执行计划原文，人没法确认自己在批什么：\n%s", prompt)
+	}
+
+	code := extractConfirmCode(prompt)
+	if code == "" {
+		t.Fatalf("回显里没有确认码：\n%s", prompt)
+	}
+
+	// 错误的确认码 → 拒绝执行（挑一个和真码不同的值）
+	wrong := "000000"
+	if wrong == code {
+		wrong = "ffffff"
+	}
+	if _, reply := e.h.HandleApprovalCommand(e.ctx(), e.uid, "auth:approve "+wrong); strings.Contains(reply, "已真实执行") {
+		t.Fatalf("错误的确认码居然执行了：%s", reply)
+	}
+	if len(exec.calls()) != 0 {
+		t.Fatal("错误确认码不该执行任何动作")
+	}
+
+	// 正确的确认码 → 执行
+	if _, reply := e.h.HandleApprovalCommand(e.ctx(), e.uid, "auth:approve "+code); !strings.Contains(reply, "已真实执行") {
+		t.Fatalf("正确确认码应该执行，实际：%s", reply)
+	}
+	if len(exec.calls()) != 1 {
+		t.Fatalf("期望执行 1 次，实际 %d 次", len(exec.calls()))
+	}
+}
+
+// 超时必须**显式**说出来：不能让人以为提案还挂着，也不能静默退化成"没有待审批任务"。
+func TestExpiredApprovalSaysSo(t *testing.T) {
+	e := newEnv(t, 9028)
+	exec := &recordingExecutor{res: sandbox.Result{ExitCode: 0}}
+	e.h = e.newHarness(exec)
+
+	// 手工挂一个"已经过期"的提案 —— 对应真实场景：用户过了有效期才想起来批
+	past := time.Now().Add(-time.Minute)
+	if err := (approval.RedisStore{}).SetPending(e.ctx(), e.uid, approval.PendingAction{
+		Action:      "execute_system_defense",
+		Param:       "愤怒",
+		Reason:      "测试用",
+		Plan:        sandbox.Request{Kind: sandbox.ActionAppendFile, FilePath: "/tmp/expired.log", FileText: "x\n"},
+		RequestedAt: past.Add(-approval.TTL),
+		ExpiresAt:   past,
+	}); err != nil {
+		t.Fatalf("挂起失败: %v", err)
+	}
+
+	handled, reply := e.h.HandleApprovalCommand(e.ctx(), e.uid, "auth:approve")
+	if !handled {
+		t.Fatal("超时的提案也要被当成审批命令处理，否则会掉进正常对话、用户更摸不着头脑")
+	}
+	if !strings.Contains(reply, "超时") {
+		t.Fatalf("回执应明确说「已超时作废」，实际：\n%s", reply)
+	}
+	if len(exec.calls()) != 0 {
+		t.Fatal("已过期的提案不该执行")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 指标直方图（P2-3）
+// ---------------------------------------------------------------------------
+
+// 只有"总和"的话能算出平均耗时，但看不到分布 —— 平均 200ms 到底是
+// "每次 200ms"还是"99 次 10ms + 1 次 19 秒"，前者没事、后者是事故。
+// 所以 /metrics 里必须有桶。
+func TestMetricsExposeHistogramBuckets(t *testing.T) {
+	e := newEnv(t, 9029)
+	e.h = e.newHarness(&recordingExecutor{})
+
+	e.run("你好")
+
+	out := metrics.Default.Render()
+	if !strings.Contains(out, `turn_latency_seconds_bucket{le="1"}`) {
+		t.Fatalf("导出里没有 turn 耗时的桶（只有总和就看不到 P50/P99）：\n%s", out)
+	}
+	if !strings.Contains(out, "turn_latency_seconds_count") {
+		t.Fatalf("直方图缺 _count（没有它算不出分位数）：\n%s", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 沙箱容器后端（P2-4）
+// ---------------------------------------------------------------------------
+
+// 容器后端下审批链要**经 docker 执行**，回执要如实写 full。
+//
+// 用注入的假 Runner：这条测的是"链路与回执"，不是"docker 本身能不能跑"
+// （后者依赖环境，不该进秒级回归）。
+func TestApprovalUnderDockerBackendGoesThroughContainer(t *testing.T) {
+	e := newEnv(t, 9030)
+	fake := &recordingExecutor{res: sandbox.Result{ExitCode: 0}}
+	// 真的 DockerExecutor，只把"最后一跳"换成假的 —— 参数拼装逻辑是真的
+	e.h = e.newHarness(sandbox.DockerExecutor{Image: "alpine:3.20", Runner: fake})
+
+	// 手工挂一个"跑外部命令"的提案：防御动作是内置文件动作、不进容器，
+	// 这里要验的正是"外部命令必须经容器"那条路。
+	if err := (approval.RedisStore{}).SetPending(e.ctx(), e.uid, approval.PendingAction{
+		Action: "run_diagnostic",
+		Param:  "echo hi",
+		Reason: "测试：容器后端",
+		Plan:   sandbox.Request{Command: "echo", Args: []string{"hi"}},
+	}); err != nil {
+		t.Fatalf("挂起失败: %v", err)
+	}
+
+	_, reply := e.approve()
+	if !strings.Contains(reply, "已真实执行") {
+		t.Fatalf("审批应该执行成功，实际回执：\n%s", reply)
+	}
+
+	calls := fake.calls()
+	if len(calls) != 1 {
+		t.Fatalf("期望恰好执行 1 次，实际 %d 次", len(calls))
+	}
+	// 关键：递到最后一跳的必须是 docker，而不是裸跑那条命令
+	if calls[0].Command != "docker" {
+		t.Fatalf("应经 docker 执行，实际直接跑了 %q（沙箱没生效）", calls[0].Command)
+	}
+	joined := strings.Join(calls[0].Args, " ")
+	if !strings.Contains(joined, "--network=none") {
+		t.Fatalf("docker 参数里没有隔离参数：%v", calls[0].Args)
+	}
+	if !strings.Contains(joined, "echo hi") {
+		t.Fatalf("原命令没被带进容器：%v", calls[0].Args)
+	}
+
+	// 回执要如实写 full，而且**不该**再出现"没有任何隔离"的警告
+	if !strings.Contains(reply, "full") {
+		t.Fatalf("回执应写明隔离等级 full，实际：\n%s", reply)
+	}
+	if strings.Contains(reply, "没有任何隔离") {
+		t.Fatalf("full 隔离却给了无隔离警告，回执在说谎：\n%s", reply)
 	}
 }

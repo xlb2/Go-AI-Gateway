@@ -244,10 +244,12 @@ func (g *gatedTool) execute(ctx context.Context, call Call, args string, opts ..
 		runCtx, cancel := context.WithTimeout(ctx, timeout)
 		start := time.Now()
 		out, err := g.inner.InvokableRun(runCtx, args, opts...)
-		elapsed := time.Since(start).Seconds()
+		elapsed := time.Since(start)
 		cancel()
 
-		metrics.Default.Add("tool_duration_seconds_total", elapsed)
+		// 直方图而不是只有求和：只有总和的话，平均耗时看不出
+		// "每次都慢"和"个别请求慢到离谱"的区别（P2-3）。
+		metrics.Default.ObserveDuration("tool_duration_seconds", elapsed)
 		if err == nil {
 			return out, nil
 		}

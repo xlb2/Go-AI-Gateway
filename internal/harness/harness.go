@@ -53,7 +53,10 @@ func New() *Harness {
 	return &Harness{
 		Sessions:  session.RedisStore{},
 		Approvals: approval.RedisStore{},
-		Exec:      sandbox.LocalExecutor{},
+		// 沙箱后端按 SANDBOX_BACKEND 选（默认 local 本机直跑）。
+		// 注意：配了 docker 但 docker 起不来时会拿到一个"永远拒绝执行"的实现，
+		// **不会**静默退回本机直跑 —— 那比不配隔离危险得多。
+		Exec: sandbox.FromEnv(),
 	}
 }
 
@@ -61,47 +64,111 @@ func New() *Harness {
 var Default = New()
 
 // HandleApprovalCommand 处理人在回路审批命令（auth:approve / auth:reject）。
-// 有挂起的高危动作时：识别命令、真实执行/取消，返回 (handled=true, 提示语)；
-// 没有挂起动作时返回 (false, "")，由调用方继续走正常 agent 对话。
 //
 // 对齐 codex 的 AskForApproval → Decision → 执行/提权 决策链：
-// 审批不是打印一行日志，批准之后必须经沙箱器官真的把命令跑起来，并把真实回执（退出码/输出）返回给人。
+// 审批不是打印一行日志，批准之后必须经沙箱器官真的把动作执行起来，并把真实回执返回给人。
+//
+// 交互是**两步**的（HARNESS-TODO 的 P2-2）：
+//
+//	auth:approve        → 回显完整执行计划 + 一个短确认码，**不执行**
+//	auth:approve <码>   → 校验确认码之后才执行
+//	auth:reject         → 一步取消（拒绝不需要慎重）
+//
+// 为什么要两步：敲一下 approve 就执行的话，人完全可以看都不看就批 ——
+// 而这条链的另一端会真的跑命令、真的写文件。多打 6 个字符，
+// 强制人看一眼"到底要执行什么"，成本极低。
+//
+// 有挂起动作时返回 (handled=true, 提示语)；没有则返回 (false, "")，
+// 由调用方继续走正常 agent 对话。
 func (h *Harness) HandleApprovalCommand(ctx context.Context, userID uint, text string) (handled bool, reply string) {
 	pending, err := h.Approvals.GetPending(ctx, userID)
-	if err != nil || pending == nil {
+	switch {
+	case errors.Is(err, approval.ErrExpired):
+		// 超时是**显式**事件（P2-2）：必须说出来，
+		// 而不是让用户以为"没有待审批任务"（人还以为提案还挂着）。
+		return true, fmt.Sprintf("⌛ 刚才挂起的高危动作已超时作废（有效期 %s），没有执行任何动作。\n要执行的话请重新发起。",
+			approval.TTL)
+	case err != nil || pending == nil:
 		return false, ""
 	}
-	switch strings.TrimSpace(text) {
+
+	cmd, arg := splitCommand(text)
+	switch cmd {
 	case "auth:approve":
+		if arg == "" {
+			// 第一步：只回显，不执行
+			return true, approvalPrompt(*pending)
+		}
+		if arg != pending.ConfirmCode() {
+			return true, "❌ 确认码不对，没有执行任何动作。\n再次输入 auth:approve 可以看到完整提案与当前确认码。"
+		}
 		h.Approvals.ClearPending(ctx, userID)
 		metrics.Default.Inc("approvals_approved_total")
 		outcome := h.executeApproved(ctx, userID, *pending)
 		h.audit(ctx, userID, *pending, "approved", outcome)
 		return true, outcome
 	case "auth:reject":
+		// 拒绝一步即可：不多问，因为"不做"本身就是安全的那一边
 		h.Approvals.ClearPending(ctx, userID)
 		metrics.Default.Inc("approvals_rejected_total")
-		outcome := "审批已拒绝，动作取消（未执行任何命令）。"
+		outcome := "审批已拒绝，动作取消（未执行任何动作）。"
 		h.audit(ctx, userID, *pending, "rejected", outcome)
 		return true, outcome
 	default:
-		return true, "系统当前有待审批的高危任务，请先输入 auth:approve 或 auth:reject。"
+		return true, approvalPrompt(*pending)
 	}
+}
+
+// approvalPrompt 回显待审批提案：要执行什么、什么时候作废、可以怎么回。
+//
+// 回显里**必须有执行计划原文** —— 人是在为"这段具体内容"背书，
+// 而不是为"某个工具被调用了"背书。
+func approvalPrompt(p approval.PendingAction) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "⏸️ 有待审批的高危动作（%s）\n", p.Action)
+	if p.Reason != "" {
+		fmt.Fprintf(&b, "原因：%s\n", p.Reason)
+	}
+	fmt.Fprintf(&b, "将要执行：%s\n", p.Plan.Summary())
+	if !p.ExpiresAt.IsZero() {
+		fmt.Fprintf(&b, "有效期：还剩 %s（%s 作废）\n",
+			p.Remaining().Truncate(time.Second), p.ExpiresAt.Format("15:04:05"))
+	}
+	fmt.Fprintf(&b, "可选项：%s\n", strings.Join(p.Decisions(), " / "))
+	fmt.Fprintf(&b, "确认执行请输入：auth:approve %s\n", p.ConfirmCode())
+	fmt.Fprintf(&b, "取消请输入：auth:reject")
+	return b.String()
+}
+
+// splitCommand 把 "auth:approve ab12cd" 拆成 ("auth:approve", "ab12cd")。
+func splitCommand(text string) (string, string) {
+	fields := strings.Fields(strings.TrimSpace(text))
+	if len(fields) == 0 {
+		return "", ""
+	}
+	if len(fields) == 1 {
+		return fields[0], ""
+	}
+	return fields[0], fields[1]
 }
 
 // executeApproved 经沙箱器官真实执行挂起的动作，返回给人看的执行回执。
 //
-// 两条诚实纪律（这一版之前都缺）：
-//  1. **回执里必须写明隔离等级**。人批的是"沙箱内的动作"还是"裸跑"，是完全不同的两件事；
-//     不写清楚，审批链上流通的就是假信息 —— 那比没有沙箱更危险。
-//  2. **要求隔离时拿不到就拒绝执行（fail-closed）**，而不是"跑了再说"。
-//     审批这条链上的默认值必须往"不做"那边偏：没人能保证安全时，宁可不做。
-//
-// 没有携带可执行命令的动作只回执"未执行"——不假装执行。
+// 三道关，缺一不可（对应 HARNESS-TODO 的 P0-3 / P2-1）：
+//  1. **计划合法性**：非法计划（缺字段、或者想把命令交给 shell 解释器）直接拒绝执行。
+//     没有携带执行计划的动作也在这一关被挡下 —— 回执如实说"拒绝"，不假装执行。
+//     校验放在这里，执行器内部还会再校验一次（纵深防御，换后端也照抄这条）。
+//  2. **隔离要求**：策略要求隔离而当前执行器给不出 → fail-closed。
+//     人批的是"沙箱内的动作"还是"裸跑"是完全不同的两件事，回执里必须写明 ——
+//     不写清楚，审批链上流通的就是假信息，那比没有沙箱更危险。
+//  3. **如实回执**：写清"到底执行了什么、在什么隔离条件下"，失败了也要说。
 func (h *Harness) executeApproved(ctx context.Context, userID uint, p approval.PendingAction) string {
-	if strings.TrimSpace(p.Command) == "" {
-		return fmt.Sprintf("审批已通过，但该动作没有附带可执行命令（action=%s），未执行任何命令。", p.Action)
+	if err := sandbox.Validate(p.Plan); err != nil {
+		metrics.Default.Inc("sandbox_refused_total")
+		fmt.Printf("[沙箱] 拒绝执行（执行计划非法）: %v\n", err)
+		return fmt.Sprintf("⛔ 已拒绝执行（%s）：%v\n", p.Action, err)
 	}
+
 	exec := h.Exec
 	if exec == nil {
 		exec = sandbox.LocalExecutor{}
@@ -109,26 +176,24 @@ func (h *Harness) executeApproved(ctx context.Context, userID uint, p approval.P
 	level := exec.Isolation()
 
 	// fail-closed：策略要求隔离，而当前执行器给不出隔离 → 拒绝，不执行。
+	//
+	// 注意内置文件动作**也**受这一条约束：不是因为它自己需要隔离，
+	// 而是不给审批链留任何"某种动作可以绕过要求"的口子 ——
+	// 一旦开了例外，将来加新动作类型时漏判就是漏洞。
 	if requireSandboxIsolation() && level == sandbox.IsolationNone {
 		metrics.Default.Inc("sandbox_refused_total")
 		msg := fmt.Sprintf("⛔ 已拒绝执行（%s）：当前沙箱是「%s」，隔离等级 none，"+
-			"而 REQUIRE_SANDBOX_ISOLATION 要求有隔离。命令未运行。\n"+
+			"而 REQUIRE_SANDBOX_ISOLATION 要求有隔离。动作未执行。\n"+
 			"要执行的话：换成有隔离的沙箱实现，或显式关掉 REQUIRE_SANDBOX_ISOLATION（并自行承担风险）。",
 			p.Action, exec.Describe())
-		fmt.Printf("[沙箱] 拒绝执行（fail-closed，无隔离）: %s\n", p.Command)
+		fmt.Printf("[沙箱] 拒绝执行（fail-closed，无隔离）: %s\n", p.Plan.Summary())
 		return msg
 	}
 
-	req := sandbox.Request{
-		Command: p.Command,
-		Args:    p.Args,
-		Workdir: p.Workdir,
-		Timeout: 30 * time.Second,
-	}
 	metrics.Default.Inc("sandbox_runs_total")
 	start := time.Now()
-	res, runErr := exec.Run(ctx, req)
-	metrics.Default.Add("sandbox_run_seconds_total", time.Since(start).Seconds())
+	res, runErr := exec.Run(ctx, p.Plan)
+	metrics.Default.ObserveDuration("sandbox_run_seconds", time.Since(start))
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "审批通过，动作已真实执行（%s）。\n", p.Action)
@@ -136,7 +201,7 @@ func (h *Harness) executeApproved(ctx context.Context, userID uint, p approval.P
 	if level == sandbox.IsolationNone {
 		fmt.Fprintf(&b, "⚠️ 本次执行没有任何隔离（宿主机直跑），请确认这符合预期。\n")
 	}
-	fmt.Fprintf(&b, "命令: %s %s\n退出码: %d\n", p.Command, strings.Join(p.Args, " "), res.ExitCode)
+	fmt.Fprintf(&b, "执行内容: %s\n退出码: %d\n", p.Plan.Summary(), res.ExitCode)
 	if s := strings.TrimSpace(res.Stdout); s != "" {
 		fmt.Fprintf(&b, "标准输出: %s\n", s)
 	}
@@ -159,7 +224,7 @@ func (h *Harness) audit(ctx context.Context, userID uint, p approval.PendingActi
 		"action":   p.Action,
 		"param":    p.Param,
 		"reason":   p.Reason,
-		"command":  strings.TrimSpace(p.Command + " " + strings.Join(p.Args, " ")),
+		"plan":     p.Plan.Summary(),
 		"outcome":  outcome,
 	})
 	if err != nil {
@@ -234,11 +299,17 @@ func (h *Harness) ensureSystemPrompt(ctx context.Context, userID uint, msg *sche
 // 流程：pre 钩子(可拦) → 存系统提示/用户消息 → 投影历史 → Eino react 循环(流式) → 落盘回复 → post 钩子。
 // emit 逐块回调流式回复（WebSocket 直接转发）；返回完整回复文本。
 func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string, emit func(chunk string)) (out string, err error) {
-	// 埋点：每轮结束记录轮次计数 + 耗时；出错额外计 errors_total
+	// 埋点：每轮结束记录轮次计数 + 耗时分布；出错额外计 errors_total
 	start := time.Now()
 	defer func() {
 		metrics.Default.Inc("turns_total")
-		lat := time.Since(start).Seconds()
+		elapsed := time.Since(start)
+		lat := elapsed.Seconds()
+		// 三者各有用途，不是重复：
+		//   直方图 → P50/P99（"有没有慢请求在拖后腿"只能从这里看）
+		//   求和   → 总耗时（算吞吐/成本）
+		//   仪表   → 最近一次（排查时先看这一眼）
+		metrics.Default.ObserveHistogram("turn_latency_seconds", lat)
 		metrics.Default.Add("turn_latency_seconds_total", lat)
 		metrics.Default.SetGauge("last_turn_latency_seconds", lat)
 		if err != nil {
