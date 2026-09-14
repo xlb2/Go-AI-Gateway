@@ -9,11 +9,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/cloudwego/eino/schema"
 	"github.com/redis/go-redis/v9"
+
+	"go_im_gateway/internal/harness/tokenmeter"
 )
 
 // rdb 本器官的 Redis 客户端（由 Init 注入，main 启动时调用一次）。
@@ -24,9 +27,20 @@ func Init(client *redis.Client) {
 	rdb = client
 }
 
-// MaxHistory 是"喂给模型的上限"：GetHistory 每次只取最近 20 条，防止大模型 Token 撑爆。
-// 注意：它只在"读"的时候截取；存储层只增不减、永久保存，旧对话仍可被 SearchArchival 查到。
-const MaxHistory = 20
+// budget 上下文预算：什么时候该压缩、压缩后保留多长。
+//
+// 以前这里是 `const MaxHistory = 20` —— 按**消息条数**判窗口。那是错的：
+// 20 条"收到"和 20 条千字长文差两个数量级，条数一样但在上下文里差 100 倍。
+// 现在一律按 token 算（tokenmeter），条数不再参与判断。
+var budget = tokenmeter.DefaultBudget()
+
+// SetBudget 注入上下文预算（main 启动时按环境变量调一次）。
+func SetBudget(b tokenmeter.Budget) {
+	budget = b.Sanitized()
+}
+
+// GetBudget 读当前预算（日志/排查用）。
+func GetBudget() tokenmeter.Budget { return budget }
 
 // ArchiveDefaultTopK 检索默认返回条数
 const ArchiveDefaultTopK = 3
@@ -54,13 +68,99 @@ const (
 	// 为什么要进日志：审批是"人介入"的动作，必须留下可追溯的一条——
 	// 谁批的、批了什么、真实执行的结果如何。不给模型看，但必须可审计。
 	EventAudit = "audit/action"
+	// EventUsage 模型返回的真实 token 用量（log-only，不喂模型）。
+	// 为什么要进日志：它是"预算判断"的唯一真实依据（估算只是估算），
+	// 落盘之后可以回溯每次调用的实际成本、也可以据此核对估算系数是否漂了。
+	EventUsage = "usage/report"
 	// EventCheckpoint 折叠快照（log-only）：标记某条水位之前的事件已被压成摘要，
 	// 读取时可以直接从标记处开始 LRange，不必每轮把整条日志拉回内存（对应事件溯源的 snapshot）。
 	EventCheckpoint = "session/checkpoint"
+	// EventTurnEnd 一轮对话的收尾标记（log-only，不喂模型）。
+	// 正常收尾由编排层写入；崩溃/中断留下的"开放轮次"由 Repair 补一条合成收尾。
+	// 为什么必须有它：没有它的话，"用户说了话但没有回复"这一格
+	// 分不清是"模型没回"还是"进程死在半路"—— 这两件事的处置完全不同。
+	EventTurnEnd = "turn/end"
+	// EventLLMRetry 模型调用重试（log-only，对应 HARNESS-TODO 的 P1-3）。
+	// 为什么必须进日志：重试是"这一轮为什么变慢"的唯一解释；
+	// 而且本轮的重试预算从日志恢复（RetryAttemptsInTurn），
+	// 进程在轮内重启也不会把预算凭空重置 —— 对齐 dsh 那句"重试状态幂等于日志"。
+	EventLLMRetry = "llm/retry"
 	// EventCorrupt 读取侧标记：这条日志解不出来（保留占位以保证下标=seq 不错位）。
 	// 只在内存里用，不会写进日志。
 	EventCorrupt = "corrupt/event"
 )
+
+// LogFormatVersion 当前写出的日志格式版本（对应 HARNESS-TODO 的 P1-5）。
+//
+// 为什么需要版本号：MemoryDTO 的结构会变（FoldUpto / Interrupted / V 都是后加的），
+// 而 json.Unmarshal 对"多出来的字段"和"缺失的字段"**一律不报错** ——
+// 旧日志读进新结构，新字段静默变成零值，表现是"旧数据莫名失效"却没有任何信号。
+//
+// 规则（对齐 dsh 的持久化：宁可拒绝，不要猜）：
+//   - 读到**比本版本更新**的日志 → 明确报错拒绝加载，而不是拿零值继续跑；
+//   - 读到比本版本旧的 → 照常读（0 = 加版本号之前的老日志，按 v1 对待）。
+//
+// 老数据绝不能因为"没有版本号"就被判定为非法 —— 那等于一次升级废掉用户全部历史。
+const LogFormatVersion = 1
+
+// Validate 校验一条事件在**结构上**是否合法（写入前调用，对应 P1-4）。
+//
+// 为什么要在写入侧校验：pair-or-drop 是投影时发现悬空就丢掉 —— 那是事后兜底，
+// 脏数据**已经写进日志了**，靠投影默默丢弃来掩盖，问题永远查不出来
+// （你会看到"工具结果凭空消失"，但日志里明明有）。
+// 这里只放"一定是 bug"的结构性规则，不掺业务判断，免得把正常写法误判成违规。
+func Validate(dto MemoryDTO) error {
+	switch dto.Type {
+	case EventToolResult:
+		// 没有 ToolCallID 的 tool/result 配对不上任何 tool/call，投影时只能被丢弃 ——
+		// 而模型会以为这个工具压根没返回。
+		if strings.TrimSpace(dto.ToolCallID) == "" {
+			return fmt.Errorf("不变量违反：tool/result 必须带 ToolCallID（否则配对不上 tool/call，投影时会被静默丢弃）")
+		}
+	case EventToolCall:
+		// 空调用的 tool/call 会让模型看到一条"要求调用但没说要调什么"的消息。
+		if len(dto.ToolCalls) == 0 {
+			return fmt.Errorf("不变量违反：tool/call 必须携带至少一条调用清单")
+		}
+	case EventCompactionSummary:
+		// 区间反了的摘要会让遮蔽逻辑把"负数范围"也标成已覆盖，历史被无声吞掉。
+		if dto.CompactionTo < dto.CompactionFrom {
+			return fmt.Errorf("不变量违反：compaction/summary 的 CompactionTo(%d) 不能小于 CompactionFrom(%d)",
+				dto.CompactionTo, dto.CompactionFrom)
+		}
+	}
+	return nil
+}
+
+// prepareForWrite 写入前的统一把关：盖版本号 + 走不变量校验。
+//
+// 所有写入路径（单条 / 批量）都要过这一关，这样"日志里不会有结构性非法事件"
+// 就是**写入侧保证**的，而不是读取侧事后擦屁股。
+//
+// 严格度由环境变量 INVARIANTS 控制：
+//   - 默认（strict）：校验不过就**拒绝写入**并返回错误。理由同 fail-closed ——
+//     写进去也是垃圾（投影时会丢），还不如当场炸出来，让 bug 在源头可见。
+//   - warn：只打日志、仍然写入（排查线上问题时用，别长期开）。
+//   - off：跳过校验。
+func prepareForWrite(dto *MemoryDTO) error {
+	if dto.V == 0 {
+		dto.V = LogFormatVersion
+	}
+	err := Validate(*dto)
+	if err == nil {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("INVARIANTS"))) {
+	case "off":
+		return nil
+	case "warn":
+		fmt.Printf(" [不变量] %v（INVARIANTS=warn，仍然写入）\n", err)
+		return nil
+	default:
+		fmt.Printf(" [不变量] 拒绝写入：%v\n", err)
+		return err
+	}
+}
 
 // ToolCallData 一次工具调用的结构化信息（持久化的精简版）。
 type ToolCallData struct {
@@ -80,19 +180,33 @@ type MemoryDTO struct {
 	CompactionFrom int            `json:"compaction_from,omitempty"` // compaction/summary 遮蔽的起始 seq
 	CompactionTo   int            `json:"compaction_to,omitempty"`   // compaction/summary 遮蔽的结束 seq
 	FoldUpto       int            `json:"fold_upto,omitempty"`       // session/checkpoint 的折叠水位：此下标（含）之前的事件已被摘要覆盖
+	Interrupted    bool           `json:"interrupted,omitempty"`     // assistant/message：这次流是被切断的，不是正常结束
+	// V 日志格式版本（见 LogFormatVersion）。
+	// 为什么要有：结构一变（FoldUpto / Interrupted 都是后加的），旧日志读进新结构时
+	// json.Unmarshal **不会报错**，新字段静默变成零值 —— 表现是"旧数据莫名失效"却没有任何信号。
+	// 0 = 加版本号之前的日志，按 v1 对待（兼容，绝不能因为老数据没版本号就废掉它）。
+	V              int            `json:"v,omitempty"`
 	Time           time.Time      `json:"time"`
 }
 
 // Store 记忆器官接口：只追加日志 + 投影模型历史 + 归档检索 + 上下文压缩。
 type Store interface {
 	SaveMessage(ctx context.Context, userID uint, msg *schema.Message) error
+	// SaveReply 落盘一条助手回复；interrupted=true 表示这次流是被切断的（不是正常结束）。
+	// 为什么要区分：半截回复被当成"模型的完整回答"永久写进历史，会污染后续所有轮次 ——
+	// 模型会以为自己说过那些话。已投递的文本是真实发生过的，照存，但必须打上标记。
+	SaveReply(ctx context.Context, userID uint, content string, interrupted bool) error
 	GetHistory(ctx context.Context, userID uint) ([]*schema.Message, error)
 	SearchArchival(ctx context.Context, userID uint, query string, topK int) ([]*schema.Message, error)
 	Compact(ctx context.Context, userID uint, summarize CompactSummarizer) error
+	// Repair 检出"未闭合的轮次"并补一条合成收尾；返回修了几轮（0 = 无需修复）。
+	Repair(ctx context.Context, userID uint) (int, error)
 	// AppendEvent 追加一条自定义事件（审计/检查点这类 log-only 事件）。
 	AppendEvent(ctx context.Context, userID uint, dto MemoryDTO) error
 	// HasEvent 该类型的事件是否已写过（用于"系统提示只写一次"这类去重）。
 	HasEvent(ctx context.Context, userID uint, eventType string) (bool, error)
+	// RetryAttemptsInTurn 本轮（最近一条用户消息之后）已经用掉的重试次数。
+	RetryAttemptsInTurn(ctx context.Context, userID uint) (int, error)
 }
 
 // RedisStore 是 Store 的 Redis 实现。
@@ -110,14 +224,21 @@ func (RedisStore) SaveMessage(ctx context.Context, userID uint, msg *schema.Mess
 }
 
 // GetHistory 从日志投影出喂给模型的最近历史（pair-or-drop 规则）。
+//
+// 投影之后还有一道**硬保护**：按 token 裁到窗口以内。
+// 为什么需要它：压缩是 best-effort（摘要失败就跳过本次），
+// 万一压缩连续失败，不能把整个超长上下文直接塞给模型 —— 那是会直接报错的。
 func (RedisStore) GetHistory(ctx context.Context, userID uint) ([]*schema.Message, error) {
 	dtos, base, err := RedisStore{}.loadActiveLog(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
 	history := ProjectMessagesFrom(dtos, base)
-	fmt.Printf(" [记忆中枢] 成功为 UserID %d 唤醒了 %d 条前世记忆！(读 %d 条事件, 自 seq %d)\n",
-		userID, len(history), len(dtos), base)
+	before := len(history)
+	history = tokenmeter.TrimToBudget(history, budget.ContextWindow)
+	used := tokenmeter.Used(history)
+	fmt.Printf(" [记忆中枢] 为 UserID %d 唤醒 %d 条记忆（投影 %d 条, 裁剪掉 %d 条, 约 %d token, 预算 %s）\n",
+		userID, len(history), before, before-len(history), used, budget.String())
 	return history, nil
 }
 
@@ -187,12 +308,19 @@ func (RedisStore) loadActiveLog(ctx context.Context, userID uint) ([]MemoryDTO, 
 		return nil, 0, err
 	}
 	dtos := make([]MemoryDTO, 0, len(dataList))
-	for _, data := range dataList {
+	for i, data := range dataList {
 		var dto MemoryDTO
 		if err := json.Unmarshal([]byte(data), &dto); err != nil {
 			fmt.Printf(" [记忆中枢] 破译记忆碎片失败: %v\n", err)
 			// 坏数据也要占一个位置：下标就是 seq，跳过会让后面所有事件错位。
 			dto = MemoryDTO{Type: EventCorrupt}
+		}
+		// 版本比本程序新 → 这些日志是更高版本写出来的，里面有本版本不认识的字段。
+		// 宁可明确拒绝，也不要用零值继续跑（那会把"读不懂"伪装成"读到空"）。
+		if dto.V > LogFormatVersion {
+			return nil, base, fmt.Errorf(
+				"日志格式 v%d 本版本(v%d)不认识，拒绝加载（userID=%d, seq=%d）：宁可不读，也不用零值猜",
+				dto.V, LogFormatVersion, userID, base+i)
 		}
 		dtos = append(dtos, dto)
 	}
@@ -281,6 +409,82 @@ func inferEventType(role schema.RoleType) string {
 	}
 }
 
+// SaveReply 落盘一条助手回复。
+//
+// interrupted=true 表示这次流是被切断的（网络断、服务重启、用户取消），不是正常结束。
+// 为什么必须区分：半截回复被当成"模型的完整回答"永久写进历史，会污染后续所有轮次 ——
+// 模型之后会以为自己说过那些话。已投递的文本确实发生过，所以照存，但必须打标记。
+func (RedisStore) SaveReply(ctx context.Context, userID uint, content string, interrupted bool) error {
+	return writeMemoryEvent(ctx, userID, MemoryDTO{
+		Type:        EventAssistantMessage,
+		Role:        "assistant",
+		Content:     content,
+		Interrupted: interrupted,
+		Time:        time.Now(),
+	})
+}
+
+// Repair 检出"未闭合的轮次"并补一条**合成**的收尾事件，返回修了几轮（0 = 无需修复）。
+//
+// 为什么需要：RunAgentTurn 跑到一半进程被杀/崩溃时，日志里 user/message 后面什么都没有。
+// 下一轮投影时它只是被当成"模型没回"，**没人分得清那轮是断了还是真没回** ——
+// 这两件事的处置完全不同（一个该重试，一个该换问法）。
+//
+// 对齐 dsh（session-persistence/coordinator.ts）：遇到没有 turn/end 的开放轮次，
+// 合成一条 turn/end{interrupted}。**只追加、绝不截断或改写历史**——
+// 这也是整个记忆器官从头到尾守的那条纪律。
+func (RedisStore) Repair(ctx context.Context, userID uint) (int, error) {
+	dtos, _, err := RedisStore{}.loadActiveLog(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+
+	open := false
+	unclosed := 0
+	for _, dto := range dtos {
+		typ := dto.Type
+		if typ == "" {
+			typ = inferEventType(schema.RoleType(dto.Role))
+		}
+		switch typ {
+		case EventUserMessage:
+			if open {
+				unclosed++ // 上一条用户消息开的轮次，一直没闭合
+			}
+			open = true
+		case EventAssistantMessage:
+			// 被中断的回复**不算闭合** —— 那一轮没走完，用户的问题没被答完。
+			// 这条判断是必须的：被中断的轮次同样会留下一条 assistant/message（半截的），
+			// 如果一律当成闭合，就恰好漏掉了最该被认出来的那种情况。
+			if dto.Interrupted {
+				continue
+			}
+			open = false
+		case EventTurnEnd:
+			open = false
+		}
+	}
+	if open {
+		unclosed++
+	}
+	if unclosed == 0 {
+		return 0, nil
+	}
+
+	// 只补一条收尾事件，内容里写清有几轮没闭合。
+	// 不在中间插：日志只追加，插进去等于改写历史。
+	if err := writeMemoryEvent(ctx, userID, MemoryDTO{
+		Type:    EventTurnEnd,
+		Role:    "system",
+		Content: fmt.Sprintf("interrupted：检测到 %d 个未闭合的轮次（进程中断/崩溃/回复被切断），已合成收尾；原始事件一条未改。", unclosed),
+		Time:    time.Now(),
+	}); err != nil {
+		return 0, err
+	}
+	fmt.Printf(" [修复] UserID %d 补了 1 条 turn/end（%d 轮未闭合）\n", userID, unclosed)
+	return unclosed, nil
+}
+
 // AppendEvent 追加一条自定义事件（审计/检查点这类 log-only 事件）。
 // 走的是和别的写入完全相同的唯一写入口，保证"日志只追加"这条不变量不被绕开。
 func (RedisStore) AppendEvent(ctx context.Context, userID uint, dto MemoryDTO) error {
@@ -317,11 +521,45 @@ func (RedisStore) HasEvent(ctx context.Context, userID uint, eventType string) (
 	return false, nil
 }
 
+// RetryAttemptsInTurn 数出"本轮已经重试过几次"（对应 P1-3 第 4 点）。
+//
+// 为什么预算按"轮"而不是按"次调用"：一轮里 agent 会调很多次模型
+// （每次工具调用之后都要再调一次），如果每次调用都各自从 0 开始算 5 次预算，
+// 一个坏上游能让这一轮实际重试几十次。
+//
+// 为什么数日志而不是数内存：日志是唯一真相。以后做 P3-1（step 级 checkpoint）、
+// 进程能在轮内续跑时，计数必须来自日志，否则重启一次预算就被重置 ——
+// 这正是 dsh 那句"重试状态幂等于日志"的意思。
+func (RedisStore) RetryAttemptsInTurn(ctx context.Context, userID uint) (int, error) {
+	dtos, _, err := RedisStore{}.loadActiveLog(ctx, userID)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	// 从尾部往前数，遇到本轮的用户消息就停 —— 再往前就是上一轮了。
+	for i := len(dtos) - 1; i >= 0; i-- {
+		typ := dtos[i].Type
+		if typ == "" {
+			typ = inferEventType(schema.RoleType(dtos[i].Role))
+		}
+		if typ == EventUserMessage {
+			break
+		}
+		if typ == EventLLMRetry {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // writeMemoryEvent 把一条记忆事件序列化后 RPush 进记忆日志（唯一的写入口）。
 func writeMemoryEvent(ctx context.Context, userID uint, dto MemoryDTO) error {
 	if rdb == nil {
 		fmt.Println(" [记忆中枢] 致命错误：Redis 连接池未挂载")
 		return fmt.Errorf("redis client is nil")
+	}
+	if err := prepareForWrite(&dto); err != nil {
+		return err
 	}
 	data, err := json.Marshal(dto)
 	if err != nil {
@@ -347,6 +585,13 @@ func WriteMemoryEvents(ctx context.Context, userID uint, pending []MemoryDTO) {
 	key := fmt.Sprintf("agent:V2:history:%d", userID)
 	pipe := rdb.Pipeline()
 	for _, dto := range pending {
+		// 批量路径不能成为"绕过不变量"的后门：和单条写入走同一道把关。
+		// 这里没法把错误往上抛（函数签名不返回 error），所以处理方式是**跳过这一条**并打日志 ——
+		// 宁可少写一条非法事件，也不要让它进了日志再靠投影去丢。
+		if err := prepareForWrite(&dto); err != nil {
+			fmt.Printf(" [记忆中枢] 跳过一条非法事件（不变量校验未通过）：%v\n", err)
+			continue
+		}
 		data, err := json.Marshal(dto)
 		if err != nil {
 			fmt.Printf(" [记忆中枢] 记忆序列化崩溃: %v\n", err)
@@ -364,17 +609,20 @@ func WriteMemoryEvents(ctx context.Context, userID uint, pending []MemoryDTO) {
 // CompactSummarizer 把一段早期消息压成摘要（由编排层注入，通常用模型实现）。
 type CompactSummarizer func(ctx context.Context, messages []string) (string, error)
 
-// Compact 上下文压缩（对应 HARNESS-STUDY M7）：把 MaxHistory 窗口之外的早期对话压成一条摘要，
+// Compact 上下文压缩（对应 HARNESS-STUDY M7）：把窗口之外的早期对话压成一条摘要，
 // 写一条 log-only 的 compaction/summary 事件；投影时被遮蔽的旧事件不再喂给模型。
 // 没有可压缩的早期消息时是空操作（不调 summarize）。
 //
-// 两条不变量（缺一就会退化成"每轮从头重摘一遍"）：
-//  1. 单调：只压"上一条摘要 CompactionTo 之后"的新消息（high-water mark），已摘要过的绝不再摘。
-//  2. 单一滚动摘要：新摘要 = 旧摘要 + 新增溢出消息，重写成一条总摘要，
+// 三条不变量（缺一条都会退化）：
+//  1. **按 token 判断，不按条数**：用量超过 `窗口 × thresholdRatio` 才压，
+//     压完保留尾部约 `窗口 × retainRatio`。条数和上下文成本差两个数量级，不能拿它当尺子。
+//  2. **单调**：只压"上一条摘要 CompactionTo 之后"的新消息（high-water mark），已摘要过的绝不再摘。
+//  3. **单一滚动摘要**：新摘要 = 旧摘要 + 新增溢出消息，重写成一条总摘要，
 //     且 CompactionFrom 恒为 0 —— 旧摘要自身也是一个日志下标，会落进 [0,to] 被遮蔽，
 //     于是投影里永远只剩一条摘要，不会出现 N 条互相重叠的摘要同时喂给模型。
 //
-// 注意：压缩是 best-effort——摘要失败就跳过本次，不影响正常对话。
+// 注意：压缩是 best-effort——摘要失败就跳过本次，不影响正常对话；
+// 真正的硬保护在 GetHistory 里（按窗口 token 硬裁）。
 func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSummarizer) error {
 	if rdb == nil {
 		return fmt.Errorf("redis client is nil")
@@ -421,14 +669,55 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 			msgs = append(msgs, msg{seq, dto.Content})
 		}
 	}
-	// 生效的摘要恒为 1 条（新摘要取代旧摘要），所以窗口只给它留一个名额。
-	// 注意这里不能用"摘要条数"去减：日志里的历史摘要是只追加的、不会被删，
-	// 拿它当分母会让窗口越缩越小，最后变成每轮都压缩。
-	keepWindow := MaxHistory - 1
-	if len(msgs) <= keepWindow {
-		return nil // 没超窗，不用压缩
+	// ---- 判断该不该压：按 token，不按条数 ----
+	// 用"投影后的完整消息"来算 —— 那正是模型真正会看到的东西（含配对的工具结果）。
+	projected := ProjectMessagesFrom(dtos, base)
+	used := tokenmeter.Used(projected)
+	if used <= budget.TriggerTokens() {
+		return nil // 还没用到触发线，不压
 	}
-	toCompress := msgs[:len(msgs)-keepWindow]
+
+	// ---- 决定压到哪：从日志尾部往前累加 token，直到落进 retain 预算 ----
+	// 这里走**日志事件**（含 tool/result）而不是只看 user/assistant：
+	// 工具结果往往才是上下文里最大的一块，漏掉它会导致"以为留了尾巴、其实早超了"。
+	retain := budget.RetainTokens()
+	acc := 0
+	keepSeq := base
+	for i := len(dtos) - 1; i >= 0; i-- {
+		seq := base + i
+		if seq <= lastTo {
+			break // 只管 high-water mark 之后的部分
+		}
+		typ := dtos[i].Type
+		if typ == "" {
+			typ = inferEventType(schema.RoleType(dtos[i].Role))
+		}
+		switch typ {
+		case EventUserMessage, EventAssistantMessage, EventToolResult:
+			acc += tokenmeter.Estimate(dtos[i].Content) + 4
+		default:
+			continue
+		}
+		keepSeq = seq
+		if acc >= retain {
+			break
+		}
+	}
+
+	// 保留区（keepSeq 起）之前的 user/assistant 全进摘要
+	var toCompress []msg
+	for _, m := range msgs {
+		if m.idx < keepSeq {
+			toCompress = append(toCompress, m)
+		}
+	}
+	if len(toCompress) == 0 {
+		// 极端情况：一两条消息就把窗口撑爆（比如单条就是巨型文本）。
+		// 这时候没有"早期对话"可压 —— 交给 GetHistory 的硬裁兜底，不要硬造一条空摘要。
+		return nil
+	}
+	fmt.Printf(" [压缩] UserID %d 用量约 %d token 超过触发线 %d，压缩 %d 条早期消息（保留自 seq %d）\n",
+		userID, used, budget.TriggerTokens(), len(toCompress), keepSeq)
 	// 摘要输入 = 旧摘要（如果有）+ 本轮新增的溢出消息，保证新摘要覆盖全部早期对话
 	contents := make([]string, 0, len(toCompress)+1)
 	if prevSummary != "" {
@@ -475,18 +764,15 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 	return nil
 }
 
-// ProjectMessages 把一组记忆事件投影成喂给模型的 []*schema.Message（纯函数，不依赖 Redis）。
-// 投影规则（pair-or-drop）：见本文件顶部事件类型注释。
-// 最后只保留最近 MaxHistory 条真消息；裁剪切在配对中间时，丢弃开头的悬空 tool 消息。
-func ProjectMessages(dtos []MemoryDTO) []*schema.Message {
-	return ProjectMessagesFrom(dtos, 0)
-}
-
-// ProjectMessagesFrom 同上，但显式给出 dtos[0] 在日志里的真实 seq。
+// ProjectMessagesFrom 把一组记忆事件投影成喂给模型的 []*schema.Message（纯函数，不依赖 Redis）。
 //
-// 折叠（snapshot）之后只读日志尾部，数组下标就不再等于 seq 了 ——
-// 而遮蔽区间（CompactionFrom/To、FoldUpto）记的都是真实 seq，
-// 不把 baseSeq 加回来的话所有区间都会错位。
+// 投影规则（pair-or-drop）：见本文件顶部事件类型注释。
+// dtos[0] 在日志里的真实 seq 由 baseSeq 给出 —— 遮蔽区间（CompactionFrom/To、FoldUpto）
+// 记的都是真实 seq，折叠之后只读尾部就必须把偏移加回来，否则所有区间静默错位。
+//
+// **这里不做任何长度/条数裁剪**：投影只负责"把日志翻译成消息"，
+// 窗口大小是预算的事（见 Compact 与 GetHistory 的 TrimToBudget）。
+// 两者混在一起正是原来"按条数截断"的病根。
 func ProjectMessagesFrom(dtos []MemoryDTO, baseSeq int) []*schema.Message {
 	// 预扫描压缩摘要：
 	//  1. 被遮蔽的旧消息下标直接跳过（压缩后日志只追加、不删旧事件）
@@ -549,8 +835,8 @@ func ProjectMessagesFrom(dtos []MemoryDTO, baseSeq int) []*schema.Message {
 				Role:    schema.User,
 				Content: "【早期对话摘要】" + dto.Content,
 			})
-		case EventSystemPrompt, EventAudit, EventCheckpoint:
-			continue // log-only：只存档/审计用，永远不喂模型
+		case EventSystemPrompt, EventAudit, EventCheckpoint, EventUsage, EventTurnEnd, EventCorrupt:
+			continue // log-only：只存档/审计/计量/收尾标记用，永远不喂模型
 		case EventToolCall:
 			flushPair()
 			pending = &dto
@@ -570,20 +856,21 @@ func ProjectMessagesFrom(dtos []MemoryDTO, baseSeq int) []*schema.Message {
 			}
 		default:
 			flushPair()
+			content := dto.Content
+			// 被中断的半截回复要标出来：不标的话模型会以为自己当时把话说完了，
+			// 于是接着半截话继续答，或者引用一段它从没真正表达完整的意思。
+			if typ == EventAssistantMessage && dto.Interrupted {
+				content = "【上一轮回复被中断，以下是已生成的部分】" + content
+			}
 			history = append(history, &schema.Message{
 				Role:    schema.RoleType(dto.Role),
-				Content: dto.Content,
+				Content: content,
 			})
 		}
 	}
 	flushPair()
 
-	if len(history) > MaxHistory {
-		history = history[len(history)-MaxHistory:]
-		for len(history) > 0 && history[0].Role == schema.Tool {
-			history = history[1:]
-		}
-	}
+	// 这里刻意不做条数截断：窗口由 token 预算决定（GetHistory 的 TrimToBudget 兜底）。
 	return history
 }
 

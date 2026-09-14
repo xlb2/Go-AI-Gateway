@@ -75,6 +75,15 @@ func DefaultScenario() Scenario {
 				Match: "写长文",
 				Reply: Reply{Text: longText()},
 			},
+
+			// ---- 流中途坏掉（验"被中断的回复"不会冒充完整回复写进历史）----
+			{
+				Match: "掐断",
+				Reply: Reply{
+					Text:       "这是一段会被中途打断的回复，它本应该更长一些。",
+					AbortAfter: 1,
+				},
+			},
 		},
 	}
 }

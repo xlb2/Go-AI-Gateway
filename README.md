@@ -12,6 +12,7 @@
 - [技术栈](#技术栈)
 - [快速开始](#快速开始)
 - [验证与测试](#验证与测试)
+- [在公司电脑上开发（端点防护 / EDR）](#在公司电脑上开发端点防护--edr)
 - [目录结构](#目录结构)
 - [两个关键设计](#两个关键设计)
 - [Roadmap](#roadmap)
@@ -44,7 +45,8 @@
 - **Prompt 组装器官** —— 系统提示不是一坨写死的字符串，而是「身份 / 人设 / 工具指引 / 动态上下文」按 `order` 排序拼接；**工具指引里的工具名从注册表实时取**，加了工具提示词自动跟上。
 - **人在回路高危审批** —— 模型触发防御动作不直接执行，**挂起**等管理员回 `auth:approve` / `auth:reject`；**提案里带着批准后要跑的命令**，批准即经沙箱真实执行，并落一条审计事件。
 - **工具执行流水线** —— 一次工具调用要穿四道关（策略 → 单调守卫 → 超时执行 → 结果脱敏），不是直接落到工具体上。
-- **事件溯源式记忆** —— 唯一一份只追加日志是"唯一真相"，喂给模型的历史是**从日志投影**出来的；滚动摘要压缩 + **折叠快照**让读取始终只扫尾部，不随对话变长而变慢。
+- **模型调用重试** —— 429 / 上游 5xx / 连接抖动按指数退避重试（带抖动，防多会话同时重试的惊群）；**只重试"再试可能好"的错误**，参数错与鉴权错直接失败不白等。每次重试都落一条 `llm/retry` 事件，事后能回答"这一轮为什么这么慢"。
+- **事件溯源式记忆** —— 唯一一份只追加日志是"唯一真相"，喂给模型的历史是**从日志投影**出来的；滚动摘要压缩 + **折叠快照**让读取始终只扫尾部，不随对话变长而变慢。写入侧带**不变量校验**（结构非法的事件当场拒绝）与**格式版本号**（读到更高版本宁可拒绝加载，也不用零值猜）。
 - **工具调用配对喂回** —— 每次工具调用和结果按 callId 成对落盘、成对喂回；悬空的一律丢弃（pair-or-drop）。
 - **子智能体 / 溢出存储 / MCP** —— 并行 fan-out 且上下文隔离；大内容外存只留定位符；外部 MCP 工具桥进统一注册表。
 - **全双工流式推流 + 异步削峰** —— WebSocket 打字机体验；RabbitMQ 隔离接入层与算力层；90s 无心跳连接自动释放。
@@ -111,12 +113,13 @@ go run ./cmd/api
 
 ```powershell
 Copy-Item .env.example .env   # 填 VOLC_ACCESS_KEY / VOLC_ENDPOINT_ID
-go run ./cmd/api
+scripts/build.sh
+scripts/run-api.sh
 
 # 注册登录拿 token，连终端调试客户端
 Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/v1/user/register" -ContentType "application/json" -Body '{"username":"alice","password":"123456"}'
 $t = (Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/v1/user/login" -ContentType "application/json" -Body '{"username":"alice","password":"123456"}').token
-go run ./cmd/radar -token $t
+./bin/gwradar -token $t
 ```
 
 > 体验人在回路：发一句"气死我了！我要投诉！"触发防御挂起，再回 `auth:approve`——
@@ -128,20 +131,67 @@ go run ./cmd/radar -token $t
 
 | 命令 | 用途 | 耗时 |
 |---|---|---|
+| `scripts/build.sh` | 一次编译出全部命令行工具到 `bin/` | 几秒 |
 | `scripts/test-fast.sh` | 秒级回归：假模型 + 真 Redis，**不需要真 key、不烧 token** | ~5 秒 |
+| `scripts/run-api.sh` | 起网关服务（编译到 `bin/` 再执行） | — |
 | `scripts/fake-model.sh` | 起假模型（让整个服务跑在确定性场景上） | — |
 | `scripts/test-real.sh [pump]` | 真模型端到端 6 段冒烟（`pump` 只跑"灌对话逼压缩"） | 几分钟 |
 | `scripts/reset-state.sh [uid]` | 重置 `agent:*` 键与审批审计产物，从干净状态开始 | — |
+| `go run ./cmd/probe validate` | 体检存量日志：不变量违规 + 格式版本（只读） | 秒级 |
 
-测试覆盖的不变量（`test/e2e`，7 个用例）：
+测试覆盖的不变量（`test/e2e` 20 个 + `tokenmeter` / `retry` 各 6 个纯函数用例）：
 
 - 悬空的 `tool/result` 不进投影（pair-or-drop）；
 - 折叠后数组下标 ≠ seq，**遮蔽区间必须跟着偏移**（否则区间静默错位）；
 - `system/prompt` 每会话只写一次（3 轮之后仍是 1 条）；
 - `tool/call` 与 `tool/result` 数量恒等，且每条结果都能找到配对的调用；
-- 审批挂起**必须带可执行命令**；批准前不许执行；批准后恰好执行一次；重复批准不重复执行；拒绝不执行但仍留审计。
+- 审批挂起**必须带可执行命令**；批准前不许执行；批准后恰好执行一次；重复批准不重复执行；拒绝不执行但仍留审计；
+- 审批回执**必须写明隔离等级**；要求隔离却拿不到时 **fail-closed 一次都不执行**；没有隔离时执行必须带警告；
+- **20 条短消息既不压缩也不被截断**（它们很便宜）；几条长消息则必须触发压缩，且压完落在触发线以内；
+- 单条消息就撑爆窗口时老实交给硬裁兜底，不硬造空摘要；
+- 真实 usage 会落盘，并用来校准估算系数；
+- 崩溃留下的**开放轮次**能被认出并补合成收尾（幂等、不改历史）；流被切断的回复标 `interrupted` 且不冒充完整回答；
+- 429 两次能重试成功并留下 2 条 `llm/retry`；**400 参数错立刻失败**、一条重试记录都不留；
+- 结构非法的事件（缺 `ToolCallID` 的 `tool/result`）**在写入时就被拒绝**；读到更高版本的日志明确报错，而**没有版本号的老日志照常读**。
 
 设计原则（借自 dsh 的 testing 文档）：**只 mock LLM**，Redis 用真的；**断言落到 Redis 的事件序列**，不断言模型回复的文案；外部依赖不可用就 **skip 而不是 fail**。详见 [`test/README.md`](test/README.md)。
+
+## 在公司电脑上开发（端点防护 / EDR）
+
+公司电脑上的端点防护（EDR）经常会对 Go 编译产物报毒 —— **这不是代码有问题，是编译产物"长得像"而已**：
+未签名、自带运行时、会开网络连接和子进程，这正是远控木马的画像。
+
+而 `go run` 会让这件事**每次都发生**：它每次都生成一个**全新的临时 exe**
+（`%TEMP%\go-buildXXX\...`），对 EDR 来说每次都是一个没见过的样本。
+
+三条办法，按推荐顺序：
+
+1. **在 WSL 里跑**（最有效，不需要 IT 权限）。Windows 的端点代理管不到 WSL 内部的 Linux 进程：
+   ```bash
+   # WSL 里（项目在 E 盘，通过 /mnt/e 访问）
+   cd "/mnt/e/agent study/Go-AI-Gateway"
+   scripts/test-fast.sh        # 秒级回归
+   scripts/build.sh            # 编译 Linux 版到 bin/
+   scripts/run-api.sh          # 起服务
+   ```
+   Redis / MySQL 仍走 Docker Desktop 暴露的 `localhost` 端口，直接能用。
+   脚本已经做了 Windows / Linux 双平台适配（自动识别可执行文件后缀）。
+
+2. **把三个目录加进 EDR 白名单**（需要 IT 权限，最彻底）：
+   - Go 编译缓存：`%LOCALAPPDATA%\go-build`
+   - Go 模块缓存：`%USERPROFILE%\go\pkg\mod`
+   - 本项目产物：`<项目目录>\bin`
+
+3. **不用 `go run`，改成"编译一次、复用同一个文件"**（本项目脚本已经全部这么做）：
+   - `scripts/build.sh` 一次编译出全部工具；`scripts/run-api.sh` / `scripts/fake-model.sh`
+     都是"先 build 到固定路径再执行"，不再产生新临时文件；
+   - 秒级回归用 `scripts/test-fast.sh`：测试在**进程内**用 httptest 起假模型，
+     **不启动任何独立服务**，是触发面最小的一条路。
+
+> 顺带一条纪律：这台机器上**凡是 `cmd/` 下的工具，一律编译到 `bin/` 再执行**，
+> 不要用 `go run`。踩过两次，两种报错都是它——
+> `An Application Control policy has blocked this file`（AppLocker 按文件名拦）
+> 和 `Operation did not complete successfully because the file contains a virus`（杀软拦）。
 
 ## 目录结构
 
@@ -150,13 +200,14 @@ cmd/api             网关入口（装配 + 优雅停机）
 cmd/radar           WebSocket 终端调试客户端
 cmd/fakemodel       本地假模型（OpenAI 兼容，开发/测试用）
 cmd/verify          6 段端到端冒烟（本地验证工具）
-cmd/probe           只读扫描 Redis 记忆日志，统计压缩/溢出/事件分布
+cmd/probe           只读扫描 Redis 记忆日志，统计压缩/溢出/事件分布；`probe validate` 全量体检
 cmd/bench           压测工具
 internal/
   harness/          自建 Agent Harness —— 固定内核 + 外包器官（每个器官一个子包，可单独替换）
     agent           Eino 固定内核：模型适配器缝 + ReAct 循环 + 工具注册表
     prompt          Prompt 组装：带 order 的片段排序拼接（身份/人设/工具指引/动态上下文）
-    session         记忆：只追加事件日志 + pair-or-drop 投影 + 滚动摘要压缩 + 折叠快照
+    retry           模型调用重试：指数退避 + 抖动，只重试可重试错误，每次重试落 llm/retry 事件
+    session         记忆：只追加事件日志 + pair-or-drop 投影 + 摘要压缩 + 折叠快照 + 写入侧不变量 + 格式版本
     approval        审批：人在回路挂起状态机（提案带可执行命令，批准后交给沙箱）
     guard           把关：滑动窗口限流 + 工具执行流水线四道关（pre/guard/execute/post）
     sandbox         沙箱 seam：Executor 接口 + 本机占位实现（生产换容器隔离）
@@ -198,8 +249,15 @@ scripts/            本地开发与验证脚本（见上表）
 
 ### 审批不是打印一行日志
 
-`auth:approve` 之后是真的走沙箱执行器把命令跑起来，并把**退出码和输出回执**给你；同时落一条
-`audit/action` 审计事件（log-only，不喂模型），可追溯谁批的、批了什么、结果如何。
+`auth:approve` 之后是真的走沙箱执行器把命令跑起来，并把退出码和输出回执给你；
+回执里**始终写明隔离等级**（`none` / `partial` / `full`）和执行方式 ——
+人得知道批的是"沙箱内动作"还是"宿主机裸跑"。同时落一条 `audit/action` 审计事件
+（log-only，不喂模型），可追溯谁批的、批了什么、结果如何。
+
+打开 `REQUIRE_SANDBOX_ISOLATION=true` 后，沙箱给不出隔离就 **fail-closed 拒绝执行**，
+而不是"反正批都批了，跑吧"。审批这条链上的默认值必须往"不做"那边偏：
+没人能保证安全时，宁可不做。（对比：限流这种"人为、可恢复"的过载是 fail-open ——
+默认值应该按"猜错的代价"选，而不是随手写死。）
 
 一个刻意的选择：**流水线不拦 `execute_system_defense` 这个工具调用**。它只是"起草提案"、本身不高危；
 真正高危的是批准后执行的命令，所以不变量落在**执行点**而不是工具调用点——拦错地方会直接破坏审批链。
@@ -207,14 +265,14 @@ scripts/            本地开发与验证脚本（见上表）
 ## Roadmap
 
 > 未完成前不会出现在"核心能力"里，绝不透支信用。
+> 完整清单（每条带优先级 / 为什么 / 对比 dsh+codex / 如何做 / 验收）见 `HARNESS-TODO.md`。
 
-- **Token 预算替换条数窗口** —— 现在上下文窗口按"消息条数"算（`MaxHistory=20`），要改成按 token 占窗口比例触发压缩。
-- **崩溃恢复与中断语义** —— 开放轮次合成收尾（repair）、流中断打 `interrupted` 标记、LLM 重试并把重试记进日志。
-- **真沙箱** —— seam 已就位（`Executor`），下一步把 `LocalExecutor` 换成容器隔离（`--network=none --read-only`），并如实上报隔离等级。
-- **Step-level Checkpoint** —— 现在是轮次级日志，还缺"每跑完一个 step 存快照 + resume"。
-- **策略配置化** —— guard 规则与 hooks 现在都是编译期注册，下一步做成配置驱动。
+- **真沙箱隔离** —— 诚实上报与 fail-closed 已就位（`Isolation` 三档 + `REQUIRE_SANDBOX_ISOLATION`），下一步把 `LocalExecutor` 换成容器后端（`--network=none --read-only`），并把命令从 shell 字符串改成 argv。
+- **Step-level Checkpoint** —— 现在是轮次级日志，还缺"每跑完一个 step 存快照 + resume"（开放轮次修复已经能认出中断的轮次，是它的前置）。
+- **策略配置化 / 审批升级链** —— guard 规则与 hooks 现在都是编译期注册，加一条策略要改代码重启；命令种类够多之后再做"批准即落规则"的升级链。
+- **MCP 真连一次** —— 代码在、从未真连过。
 - **Web Console** —— 版本化双向协议驱动 agent，审批/进度可视化（app-server 协议已具备）。
-- **Observability 深化** —— TraceID 全链路 + 直方图指标 + 多模型路由。
+- **Observability 深化** —— 直方图指标（现在只有总量，看不到 P50/P99）+ 多模型路由。
 
 ---
 

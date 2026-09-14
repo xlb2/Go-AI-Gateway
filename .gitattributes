@@ -1,0 +1,8 @@
+# Shell 脚本必须在 WSL / Linux 下能直接执行。
+# Windows 的 core.autocrlf=true 会把检出内容换成 CRLF，而 CRLF 的 shebang 在 Linux 下
+# 会直接报 "bad interpreter: /bin/sh^M" —— 这类问题排查起来很费时间，用规则锁死。
+*.sh   text eol=lf
+
+# Dockerfile / YAML 同理（镜像里的入口脚本如果带 CRLF 会起不来）
+*.yml  text eol=lf
+Dockerfile text eol=lf

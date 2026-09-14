@@ -7,10 +7,12 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +29,7 @@ import (
 	"go_im_gateway/internal/harness/guard"
 	"go_im_gateway/internal/harness/mcp"
 	"go_im_gateway/internal/harness/metrics"
+	"go_im_gateway/internal/harness/retry"
 	"go_im_gateway/internal/harness/session"
 	"go_im_gateway/internal/harness/spill"
 	"go_im_gateway/internal/harness/subagent"
@@ -455,6 +458,15 @@ func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
 		return nil, err
 	}
 
+	// 包一层重试（HARNESS-TODO 的 P1-3）：429 / 5xx / 连接抖动不再直接把整轮打挂。
+	// 预算按"轮"算，起始值从日志恢复（session.RetryAttemptsInTurn）——
+	// 这样同一轮里 agent 调多次模型时共享一个预算，而不是每次调用各自再重试 5 次。
+	chatModel = retry.Wrap(chatModel, retry.Config{
+		Policy:         retryPolicyFromEnv(),
+		InitialAttempt: retryAttemptsSoFar(ctx, userID),
+		Observer:       retryLogger(ctx, userID),
+	})
+
 	ragent, err := react.NewAgent(ctx, &react.AgentConfig{
 		Model: chatModel,
 		// MessageModifier 是 Eino 的 hook 插槽：每次调模型前都会执行，
@@ -468,4 +480,72 @@ func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
 		return nil, fmt.Errorf("ReAct 引擎组装失败: %v", err)
 	}
 	return ragent, nil
+}
+
+// retryPolicyFromEnv 允许用环境变量调重试策略 —— 线上发现"重试太凶"（烧钱）
+// 或"退避太久"（用户等得着急）时改配置重启即可，不用改代码重编译。
+// 全部有默认值，一个都不配也能跑。
+func retryPolicyFromEnv() retry.Policy {
+	p := retry.DefaultPolicy()
+	if n, ok := envInt("RETRY_MAX_ATTEMPTS"); ok && n >= 0 {
+		p.MaxAttempts = n
+	}
+	if n, ok := envInt("RETRY_BASE_DELAY_MS"); ok && n >= 0 {
+		p.BaseDelay = time.Duration(n) * time.Millisecond
+	}
+	if n, ok := envInt("RETRY_MAX_DELAY_MS"); ok && n >= 0 {
+		p.MaxDelay = time.Duration(n) * time.Millisecond
+	}
+	return p
+}
+
+// envInt 读一个整型环境变量；没配或不是整数就返回 ok=false（调用方用默认值）。
+func envInt(key string) (int, bool) {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// retryAttemptsSoFar 本轮已经用掉的重试次数（读日志，best-effort）。
+// 读不到就当 0 —— 重试预算是保护措施，不该因为它自己失败而把对话打挂。
+func retryAttemptsSoFar(ctx context.Context, userID uint) int {
+	n, err := session.RedisStore{}.RetryAttemptsInTurn(ctx, userID)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// retryLogger 把每次重试落成 llm/retry 事件 + 指标。
+//
+// 为什么非记不可：没有它，用户只会看到"这一轮特别慢"，
+// 而"慢是因为上游限流、重试了 3 次"这个事实没有任何痕迹。
+// 记账失败也只打日志 —— 绝不能因为"记不下来"就不让对话继续。
+func retryLogger(ctx context.Context, userID uint) retry.Observer {
+	return func(attempt int, reason string, backoff time.Duration) {
+		metrics.Default.Inc("llm_retries_total")
+		fmt.Printf(" [重试] 第 %d 次（原因 %s），退避 %s\n", attempt, reason, backoff)
+		payload, _ := json.Marshal(map[string]any{
+			"attempt":    attempt,
+			"reason":     reason,
+			"backoff_ms": backoff.Milliseconds(),
+		})
+		// 注意：这里必须先把 store 取出来再调用 —— 写成
+		// `if err := session.RedisStore{}.AppendEvent(...); err != nil` 过不了编译，
+		// 因为 if 的控制子句里复合字面量后面的 `{` 会被当成语句块的开始。
+		store := session.RedisStore{}
+		if err := store.AppendEvent(ctx, userID, session.MemoryDTO{
+			Type:    session.EventLLMRetry,
+			Role:    "system",
+			Content: string(payload),
+		}); err != nil {
+			fmt.Printf(" [重试] 落盘 llm/retry 事件失败: %v\n", err)
+		}
+	}
 }

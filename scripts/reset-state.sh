@@ -9,7 +9,7 @@
 #   2) audit/ 目录下审批真实执行留下的日志（.gitignore 已忽略）
 # 不碰 MySQL 里的业务数据，也不碰别的 Redis 键。
 set -e
-cd "$(dirname "$0")/.."
+. "$(dirname "$0")/_common.sh"
 
 if command -v redis-cli >/dev/null 2>&1; then
     RC="redis-cli"

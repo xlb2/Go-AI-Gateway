@@ -19,8 +19,8 @@ import (
 
 // 限流规则：窗口 10 秒内最多 5 次请求。
 const (
-	rateWindowMs     int64 = 10000
-	rateMaxRequests        = 5
+	rateWindowMs    int64 = 10000
+	rateMaxRequests       = 5
 	// rateKeyTTL 物理兜底过期，防止死 Key 堆积（略大于窗口即可）。
 	rateKeyTTL = 20 * time.Second
 )

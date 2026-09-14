@@ -14,6 +14,7 @@ import (
 	"go_im_gateway/internal/harness/session"
 	"go_im_gateway/internal/harness/spill"
 	"go_im_gateway/internal/harness/subagent"
+	"go_im_gateway/internal/harness/tokenmeter"
 	"go_im_gateway/internal/service"
 	"log"
 	"net/http"
@@ -53,10 +54,11 @@ func main() {
 	}
 
 	// 5. 依赖注入：按 DAO -> Service -> Handler 顺序组装
-	session.Init(rdb)            // harness 记忆器官注入 Redis
-	approval.Init(rdb)           // harness 审批器官注入 Redis
-	spill.Init(rdb)              // harness 溢出存储器官注入 Redis
-	hooks.RegisterDefaultHooks() // 内置横切钩子（敏感词/超长拦截 + 回复统计）
+	session.Init(rdb)                             // harness 记忆器官注入 Redis
+	session.SetBudget(tokenmeter.BudgetFromEnv()) // 上下文预算（按 token，不再是消息条数）
+	approval.Init(rdb)                            // harness 审批器官注入 Redis
+	spill.Init(rdb)                               // harness 溢出存储器官注入 Redis
+	hooks.RegisterDefaultHooks()                  // 内置横切钩子（敏感词/超长拦截 + 回复统计）
 
 	// MCP 集成（可选）：配了 MCP_SERVER_COMMAND 就连接并注册外部工具；失败只告警不挡启动
 	if err := mcp.ConnectFromEnv(ctx); err != nil {

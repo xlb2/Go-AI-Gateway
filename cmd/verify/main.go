@@ -117,12 +117,15 @@ func main() {
 任务2：用中文写一篇不少于1000字介绍"网关保安"的职责，详细全面。`}))
 	}
 
-	fmt.Println("\n== 6) 灌入多轮对话逼出上下文压缩 ==")
-	// 压缩阈值：可投影消息(user/assistant) 超过 MaxHistory=20 才触发。
-	// 一轮 agent/run 产生 1 条 user + 1 条 assistant，所以要多灌几轮把窗口顶出去。
+	fmt.Println("\n== 6) 灌入多轮对话（用来逼出上下文压缩 / 上一轮未闭合修复）==")
+	// 压缩现在按 token 判断（窗口 × 0.8），不再按消息条数 ——
+	// 所以默认 128k 的窗口下，10 轮短对话**不会**触发压缩（那是正常的，短对话本来就很便宜）。
+	// 想在这一段看到压缩，起服务时把窗口调小：
+	//     MODEL_CONTEXT_WINDOW=2000 scripts/run-api.sh
+	// 想看压缩的精确行为，直接用 test/e2e 里的用例（它会自己设小窗口，秒级）。
 	for i := 1; i <= 10; i++ {
 		reply := c.call("agent/run", map[string]string{"content": fmt.Sprintf("闲聊一下，这是第%d条短消息，不需要做任何事。", i)})
 		fmt.Printf("  第 %d 轮 -> %.40s\n", i, strings.ReplaceAll(reply, "\n", " "))
 	}
-	fmt.Println("已灌入 10 轮短对话，压缩窗口已被顶出（用 cmd/probe 查 compaction 计数）")
+	fmt.Println("已灌入 10 轮短对话（是否触发压缩取决于服务端 MODEL_CONTEXT_WINDOW；用 cmd/probe 查 compaction 计数）")
 }

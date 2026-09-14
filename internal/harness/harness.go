@@ -20,7 +20,10 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -33,6 +36,7 @@ import (
 	"go_im_gateway/internal/harness/prompt"
 	"go_im_gateway/internal/harness/sandbox"
 	"go_im_gateway/internal/harness/session"
+	"go_im_gateway/internal/harness/tokenmeter"
 )
 
 // Harness 编排对象：持有记忆/审批/沙箱器官接口，对外提供一轮对话的唯一入口。
@@ -86,6 +90,13 @@ func (h *Harness) HandleApprovalCommand(ctx context.Context, userID uint, text s
 }
 
 // executeApproved 经沙箱器官真实执行挂起的动作，返回给人看的执行回执。
+//
+// 两条诚实纪律（这一版之前都缺）：
+//  1. **回执里必须写明隔离等级**。人批的是"沙箱内的动作"还是"裸跑"，是完全不同的两件事；
+//     不写清楚，审批链上流通的就是假信息 —— 那比没有沙箱更危险。
+//  2. **要求隔离时拿不到就拒绝执行（fail-closed）**，而不是"跑了再说"。
+//     审批这条链上的默认值必须往"不做"那边偏：没人能保证安全时，宁可不做。
+//
 // 没有携带可执行命令的动作只回执"未执行"——不假装执行。
 func (h *Harness) executeApproved(ctx context.Context, userID uint, p approval.PendingAction) string {
 	if strings.TrimSpace(p.Command) == "" {
@@ -95,6 +106,19 @@ func (h *Harness) executeApproved(ctx context.Context, userID uint, p approval.P
 	if exec == nil {
 		exec = sandbox.LocalExecutor{}
 	}
+	level := exec.Isolation()
+
+	// fail-closed：策略要求隔离，而当前执行器给不出隔离 → 拒绝，不执行。
+	if requireSandboxIsolation() && level == sandbox.IsolationNone {
+		metrics.Default.Inc("sandbox_refused_total")
+		msg := fmt.Sprintf("⛔ 已拒绝执行（%s）：当前沙箱是「%s」，隔离等级 none，"+
+			"而 REQUIRE_SANDBOX_ISOLATION 要求有隔离。命令未运行。\n"+
+			"要执行的话：换成有隔离的沙箱实现，或显式关掉 REQUIRE_SANDBOX_ISOLATION（并自行承担风险）。",
+			p.Action, exec.Describe())
+		fmt.Printf("[沙箱] 拒绝执行（fail-closed，无隔离）: %s\n", p.Command)
+		return msg
+	}
+
 	req := sandbox.Request{
 		Command: p.Command,
 		Args:    p.Args,
@@ -108,6 +132,10 @@ func (h *Harness) executeApproved(ctx context.Context, userID uint, p approval.P
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "审批通过，动作已真实执行（%s）。\n", p.Action)
+	fmt.Fprintf(&b, "沙箱: %s｜隔离等级: %s\n", exec.Describe(), level)
+	if level == sandbox.IsolationNone {
+		fmt.Fprintf(&b, "⚠️ 本次执行没有任何隔离（宿主机直跑），请确认这符合预期。\n")
+	}
 	fmt.Fprintf(&b, "命令: %s %s\n退出码: %d\n", p.Command, strings.Join(p.Args, " "), res.ExitCode)
 	if s := strings.TrimSpace(res.Stdout); s != "" {
 		fmt.Fprintf(&b, "标准输出: %s\n", s)
@@ -144,6 +172,19 @@ func (h *Harness) audit(ctx context.Context, userID uint, p approval.PendingActi
 	}); err != nil {
 		fmt.Printf(" [审计] 审批记录落盘失败: %v\n", err)
 	}
+}
+
+// requireSandboxIsolation 是否要求"必须有隔离"才允许执行审批通过的动作。
+//
+// 默认 false：保持开箱能跑（占位实现是无隔离的）。
+// 生产/敏感环境应该打开 —— 打开之后，沙箱给不出隔离就 fail-closed 拒绝执行，
+// 而不是"反正批都批了，跑吧"。
+func requireSandboxIsolation() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("REQUIRE_SANDBOX_ISOLATION"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 // buildSystemPrompt 用 prompt 器官把系统提示组装出来（对应 HARNESS-STUDY M2）。
@@ -217,7 +258,15 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 		return "", err
 	}
 
-	// 2. 上下文压缩（best-effort：早期对话压成摘要，替代粗暴截断；失败就跳过本次）
+	// 2. 修复上一轮留下的"开放轮次"（进程崩溃/被 kill 时 user/message 后面什么都没有）。
+	//    必须在压缩和投影之前做：否则那一轮会被当成"模型没回"，没人分得清是断了还是真没回。
+	if n, err := h.Sessions.Repair(ctx, userID); err != nil {
+		fmt.Printf(" [修复] 跳过本轮修复: %v\n", err)
+	} else if n > 0 {
+		metrics.Default.Add("turns_repaired_total", float64(n))
+	}
+
+	// 3. 上下文压缩（best-effort：早期对话压成摘要，替代粗暴截断；失败就跳过本次）
 	if err := h.Sessions.Compact(ctx, userID, agent.Summarize); err != nil {
 		fmt.Printf(" [压缩] 跳过本次压缩: %v\n", err)
 	}
@@ -247,12 +296,27 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 		return "", fmt.Errorf("推流失败: %v", err)
 	}
 
-	// 4. 流式接收：转发给前端 + 攒完整回复
+	// 4. 流式接收：转发给前端 + 攒完整回复；顺手收下模型返回的真实 token 用量
+	//
+	// **区分"正常结束"和"被切断"**：只有 io.EOF 才是正常结束。
+	// 其它错误（网络断、上游断连、服务重启）都意味着这条回复是**半截的** ——
+	// 不区分的话，半截回复会被当成"模型的完整回答"永久写进历史，
+	// 模型之后会以为自己说过那些话，然后接着半截话往下答。
 	var aiFullResponse strings.Builder
+	var usage *schema.TokenUsage
+	interrupted := false
 	for {
 		msg, err := responseStream.Recv()
 		if err != nil {
-			break // 流结束
+			if !errors.Is(err, io.EOF) {
+				interrupted = true
+				fmt.Printf(" [中断] 流被切断（非正常结束）: %v\n", err)
+				metrics.Default.Inc("turns_interrupted_total")
+			}
+			break
+		}
+		if msg.ResponseMeta != nil && msg.ResponseMeta.Usage != nil {
+			usage = msg.ResponseMeta.Usage
 		}
 		if msg.Content != "" {
 			aiFullResponse.WriteString(msg.Content)
@@ -261,13 +325,41 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 			}
 		}
 	}
+	// 记用量：这是预算判断的唯一真实依据（估算只是估算）。
+	// 落盘 + 喂给校准器：让"估算 vs 实际"的偏差被持续纠正，而不是一直拍脑袋。
+	if usage != nil && usage.PromptTokens > 0 {
+		estimated := tokenmeter.EstimateMessages(fullMessages)
+		tokenmeter.Observe(estimated, usage.PromptTokens)
+		ratio, samples := tokenmeter.Calibration()
+		payload, _ := json.Marshal(map[string]any{
+			"estimated_prompt":  estimated,
+			"actual_prompt":     usage.PromptTokens,
+			"completion":        usage.CompletionTokens,
+			"total":             usage.TotalTokens,
+			"calibration_ratio": ratio,
+			"calibration_n":     samples,
+		})
+		_ = h.Sessions.AppendEvent(ctx, userID, session.MemoryDTO{
+			Type: session.EventUsage, Role: "system", Content: string(payload),
+		})
+		metrics.Default.Add("prompt_tokens_total", float64(usage.PromptTokens))
+		metrics.Default.Add("completion_tokens_total", float64(usage.CompletionTokens))
+	}
 
-	// 5. 落盘完整回复 + post 钩子（观察，不改流程）
+	// 5. 落盘回复 + 正常收尾标记 + post 钩子（观察，不改流程）
+	//
+	// 收尾标记只在**正常结束**时写；被中断的轮次故意不写 turn/end ——
+	// 让日志如实保留"这一轮没闭合"，下一轮的 Repair 才能认出它是断的（而不是模型没回）。
 	reply := aiFullResponse.String()
 	if reply != "" {
-		if err := h.Sessions.SaveMessage(ctx, userID, schema.AssistantMessage(reply, nil)); err != nil {
+		if err := h.Sessions.SaveReply(ctx, userID, reply, interrupted); err != nil {
 			return "", err
 		}
+	}
+	if !interrupted {
+		_ = h.Sessions.AppendEvent(ctx, userID, session.MemoryDTO{
+			Type: session.EventTurnEnd, Role: "system", Content: "completed",
+		})
 	}
 	hooks.RunPost(ctx, userID, reply)
 	return reply, nil

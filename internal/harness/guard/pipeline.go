@@ -56,9 +56,9 @@ type Verdict struct {
 }
 
 // allow / deny / ask 是判定构造器（写起来短一点，读起来像策略）。
-func allow() Verdict                { return Verdict{Decision: Allow} }
-func deny(reason string) Verdict    { return Verdict{Decision: Deny, Reason: reason} }
-func ask(reason string) Verdict     { return Verdict{Decision: Ask, Reason: reason} }
+func allow() Verdict             { return Verdict{Decision: Allow} }
+func deny(reason string) Verdict { return Verdict{Decision: Deny, Reason: reason} }
+func ask(reason string) Verdict  { return Verdict{Decision: Ask, Reason: reason} }
 
 // tighten 把两个判定合并成"更严的那个"：Deny > Ask > Allow。
 //
@@ -93,11 +93,11 @@ type AskHandler func(ctx context.Context, call Call, reason string) (string, err
 //	execute      真执行：超时 + 指标包住，失败不炸对话
 //	post-execute 结果处理：脱敏/截断后再交给模型
 type Pipeline struct {
-	pre       []Check
-	guards    []Check
-	post      []PostFunc
-	ask       AskHandler
-	timeout   time.Duration
+	pre     []Check
+	guards  []Check
+	post    []PostFunc
+	ask     AskHandler
+	timeout time.Duration
 	// retries 默认 0：工具调用大多有副作用（写文件/发请求），
 	// 失败就重试等于把副作用做两遍。只有确认幂等的工具才该开重试。
 	retries int
@@ -262,7 +262,6 @@ func (g *gatedTool) execute(ctx context.Context, call Call, args string, opts ..
 	return fmt.Sprintf("⚠️ 工具 %s 执行失败：%v", call.Tool, lastErr), nil
 }
 
-
 // ---- 内置守卫 ----
 
 // approvalRequired 工具名 → 必须先人工审批的原因。
@@ -372,8 +371,8 @@ func limitArgsSize(_ context.Context, call Call) Verdict {
 // ---- 内置 post ----
 
 var secretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)\b(sk|rk)-[A-Za-z0-9]{16,}\b`),      // OpenAI/Stripe 风格
-	regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),                  // AWS Access Key
+	regexp.MustCompile(`(?i)\b(sk|rk)-[A-Za-z0-9]{16,}\b`),                                           // OpenAI/Stripe 风格
+	regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),                                                       // AWS Access Key
 	regexp.MustCompile(`(?i)\b(api[_-]?key|access[_-]?key|token)\s*[:=]\s*["']?[A-Za-z0-9_\-]{16,}`), // key=xxx
 }
 
