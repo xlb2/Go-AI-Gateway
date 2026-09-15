@@ -74,7 +74,7 @@ func main() {
 	}
 	// 子智能体器官注入"造子 agent"的构造器（避免 subagent 包反向依赖 agent 包）
 	subagent.SetRunner(func(ctx context.Context) (subagent.ChildAgent, error) {
-		return agent.BuildEinoAgent(ctx)
+		return agent.NewLoop(ctx)
 	})
 	messageDAO := dao.NewMessageDAO(db)
 	messageService := service.NewMessageService(messageDAO, rdb, mqCh)

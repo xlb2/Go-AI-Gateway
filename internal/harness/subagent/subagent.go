@@ -35,19 +35,19 @@ func withDepth(ctx context.Context, d int) context.Context {
 	return context.WithValue(ctx, depthKey, d)
 }
 
-// ChildAgent 子 agent 的最小接口（*react.Agent 满足它）。
+// ChildAgent 子 agent 的最小接口（agent 的自研循环满足它）。
 // 只声明 Stream，不绑死具体实现。
 type ChildAgent interface {
 	Stream(ctx context.Context, input []*schema.Message, opts ...agent.AgentOption) (*schema.StreamReader[*schema.Message], error)
 }
 
-// Runner 由外部注入的"造子 agent"函数（指向 agent.BuildEinoAgent）。
+// Runner 由外部注入的"造子 agent"函数（指向 agent.NewLoop）。
 type Runner func(ctx context.Context) (ChildAgent, error)
 
 // runner 全局子 agent 构造器（main 启动时注入一次）。
 var runner Runner
 
-// SetRunner 注入子 agent 构造器（main 启动时调用：subagent.SetRunner(agent.BuildEinoAgent)）。
+// SetRunner 注入子 agent 构造器（main 启动时调用：subagent.SetRunner(agent.NewLoop)）。
 func SetRunner(r Runner) {
 	runner = r
 }
@@ -67,7 +67,7 @@ func Run(ctx context.Context, prompt string) (*Result, error) {
 		return nil, fmt.Errorf("子智能体递归深度超过上限 %d", maxDepth)
 	}
 	if runner == nil {
-		return nil, fmt.Errorf("subagent runner 未设置（main 里调 subagent.SetRunner(agent.BuildEinoAgent)）")
+		return nil, fmt.Errorf("subagent runner 未设置（main 里调 subagent.SetRunner(agent.NewLoop)）")
 	}
 	child, err := runner(ctx)
 	if err != nil {

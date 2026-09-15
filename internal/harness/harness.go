@@ -3,7 +3,7 @@
 // 定位：整合层/编排层（用户明确的定位："不自己造零件，用干净的方式把现成好零件拼成系统"）。
 // 器官清单（每个器官一个独立子包，可单独替换，见 M1 的"换实现不动主体"）：
 //
-//	agent    Eino 固定内核：模型适配器 + ReAct 循环 + 工具
+//	agent    agent 循环 + 模型适配器 + 工具（循环自研，阶段 2.2）
 //	session  记忆器官：事件溯源日志 + 模型历史投影
 //	approval 审批器官：人在回路挂起状态机
 //	hooks    钩子器官：横切需求插槽（pre 拦截 / post 观察）
@@ -296,7 +296,7 @@ func (h *Harness) ensureSystemPrompt(ctx context.Context, userID uint, msg *sche
 }
 
 // RunAgentTurn 执行一轮 agent 对话（harness 主脊：领取输入→组装上下文→请求模型→执行工具→写日志）。
-// 流程：pre 钩子(可拦) → 存系统提示/用户消息 → 投影历史 → Eino react 循环(流式) → 落盘回复 → post 钩子。
+// 流程：pre 钩子(可拦) → 存系统提示/用户消息 → 投影历史 → 自研 agent 循环(流式) → 落盘回复 → post 钩子。
 // emit 逐块回调流式回复（WebSocket 直接转发）；返回完整回复文本。
 func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string, emit func(chunk string)) (out string, err error) {
 	// 埋点：每轮结束记录轮次计数 + 耗时分布；出错额外计 errors_total
@@ -357,8 +357,9 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 	fullMessages = append(fullMessages, history...)
 	fullMessages = append(fullMessages, usrMsg)
 
-	// 3. Eino react 循环（固定内核：模型→工具→模型，直到给出最终答案）
-	agentRunner, err := agent.BuildEinoAgent(ctx)
+	// 3. agent 循环（模型→工具→模型，直到给出最终答案）。
+	//    走 agent.Loop 这道缝（阶段 2.2 起唯一实现是自研循环）——替换循环时这里一行不用改。
+	agentRunner, err := agent.NewLoop(ctx)
 	if err != nil {
 		return "", fmt.Errorf("组装 agent 失败: %v", err)
 	}

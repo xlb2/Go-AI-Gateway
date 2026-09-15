@@ -1,8 +1,8 @@
-// Package agent Eino 固定内核：模型适配器缝 + ReAct 循环 + 工具。
+// Package agent agent 循环 + 模型适配器缝 + 工具。
 //
 // 定位：harness 解剖图里的"agent loop"和"LLM 适配器缝"（HARNESS-STUDY M0/M3）。
-// 按"形态抄 codex"的约定，这是固定内核：不拆、不可插拔；要换模型/换工具，改这里或配置，
-// 但编排层（harness 包）不碰它。工具调用中间消息由 MessageModifier 钩子落盘到 session 器官。
+// 自研循环（loop.go，阶段 2.2 起为唯一实现）：Eino 只提供零件（模型缝 + 工具接口 + 流式消息拼接），
+// 循环本身是我们自己的 —— step 是一等公民，为 P3-1 的 step 级 checkpoint 铺路。
 package agent
 
 import (
@@ -20,8 +20,6 @@ import (
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
-	"github.com/cloudwego/eino/compose"
-	"github.com/cloudwego/eino/flow/agent/react"
 	"github.com/cloudwego/eino/schema"
 
 	"go_im_gateway/internal/harness/approval"
@@ -256,34 +254,8 @@ var DelegateTasksTool, _ = utils.InferTool(
 	},
 )
 
-// newMemoryLogModifier 返回一个 Eino 的 MessageModifier 钩子。
-// Eino 每次调模型前都会执行它，传入 react 内部累积的全部消息(state.Messages)；
-// 用"下标差分"找出本轮新增的工具消息，按顺序落盘成 tool/call + tool/result 事件。
-// 返回的切片原样交回（只观察、不修改）。
-func newMemoryLogModifier(userID uint) react.MessageModifier {
-	lastLen := -1 // -1 = 第一轮：输入的是完整请求消息，不记录
-	return func(ctx context.Context, input []*schema.Message) []*schema.Message {
-		if lastLen == -1 {
-			lastLen = len(input)
-			return input
-		}
-		var pending []session.MemoryDTO
-		for _, msg := range input[lastLen:] {
-			switch {
-			case len(msg.ToolCalls) > 0:
-				metrics.Default.Inc("tool_calls_total")
-				pending = append(pending, memoryDTOFromToolCall(msg))
-			case msg.Role == schema.Tool:
-				pending = append(pending, memoryDTOFromToolResult(ctx, msg))
-			}
-		}
-		lastLen = len(input)
-		if len(pending) > 0 {
-			go session.WriteMemoryEvents(context.Background(), userID, pending)
-		}
-		return input
-	}
-}
+// 说明：tool/call + tool/result 的落盘以前靠 Eino 的 MessageModifier 钩子（下标差分），
+// 阶段 2.2 换成自研循环后，改由 loop.go 的 executeTools 直接落盘 —— 钩子已删除。
 
 // memoryDTOFromToolCall 把 Eino 的"带工具调用的 assistant 消息"降维成 tool/call 事件。
 func memoryDTOFromToolCall(msg *schema.Message) session.MemoryDTO {
@@ -445,44 +417,10 @@ func ToolNames(ctx context.Context) []string {
 	return names
 }
 
-// BuildEinoAgent 组装并返回一个 ReAct 风格的 Eino agent（固定内核）：
-// 读火山引擎凭证 -> 点火 chatModel -> 挂工具（记忆检索 + 防御 + 子智能体 + 溢出 + MCP）
-// + MessageModifier 钩子。
-func BuildEinoAgent(ctx context.Context) (*react.Agent, error) {
-	chatModel, err := newChatModel(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	// user_id 在 ctx 里（ws_handler 注入），MessageModifier 落盘工具事件要用
-	userID, err := getUserID(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	// 包一层重试（HARNESS-TODO 的 P1-3）：429 / 5xx / 连接抖动不再直接把整轮打挂。
-	// 预算按"轮"算，起始值从日志恢复（session.RetryAttemptsInTurn）——
-	// 这样同一轮里 agent 调多次模型时共享一个预算，而不是每次调用各自再重试 5 次。
-	chatModel = retry.Wrap(chatModel, retry.Config{
-		Policy:         retryPolicyFromEnv(),
-		InitialAttempt: retryAttemptsSoFar(ctx, userID),
-		Observer:       retryLogger(ctx, userID),
-	})
-
-	ragent, err := react.NewAgent(ctx, &react.AgentConfig{
-		Model: chatModel,
-		// MessageModifier 是 Eino 的 hook 插槽：每次调模型前都会执行，
-		// 用来把 react 内部吞掉的中间工具消息落盘成 tool/call + tool/result 事件。
-		MessageModifier: newMemoryLogModifier(userID),
-		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: AllTools(),
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("ReAct 引擎组装失败: %v", err)
-	}
-	return ragent, nil
-}
+// 说明：react 版组装函数 BuildEinoAgent 已在阶段 2.2 删除 ——
+// 循环的唯一实现是 NewOwnLoop（loop.go），重试/工具装配逻辑也搬到了那里。
+// 下面几个 helper（retryPolicyFromEnv / envInt / retryAttemptsSoFar / retryLogger）
+// 仍被 NewOwnLoop 复用，所以留在这里。
 
 // retryPolicyFromEnv 允许用环境变量调重试策略 —— 线上发现"重试太凶"（烧钱）
 // 或"退避太久"（用户等得着急）时改配置重启即可，不用改代码重编译。

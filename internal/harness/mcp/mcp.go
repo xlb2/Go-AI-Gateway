@@ -106,7 +106,7 @@ func (b *Bridge) Close() {
 	}
 }
 
-// ———— 注册表：agent.BuildEinoAgent 从这里取 MCP 工具 ————
+// ———— 注册表：agent 从这里取 MCP 工具 ————
 
 var (
 	mu      sync.RWMutex
@@ -120,7 +120,7 @@ func RegisterBridge(b *Bridge) {
 	bridges = append(bridges, b)
 }
 
-// Tools 返回所有桥接进来的 Eino 工具（供 agent.BuildEinoAgent 挂进工具列表）。
+// Tools 返回所有桥接进来的 Eino 工具（供 agent 挂进工具列表）。
 func Tools() []tool.BaseTool {
 	mu.RLock()
 	defer mu.RUnlock()
