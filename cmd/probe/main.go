@@ -42,6 +42,7 @@ func runValidate() int {
 		if err != nil {
 			continue
 		}
+		dtos := make([]session.MemoryDTO, 0, len(dataList))
 		for i, data := range dataList {
 			total++
 			var dto session.MemoryDTO
@@ -59,6 +60,16 @@ func runValidate() int {
 				bad++
 				fmt.Printf("  ❌ %s seq=%d: %v\n", key, i, err)
 			}
+			dtos = append(dtos, dto)
+		}
+		// 序列级校验：step 交替、工具配对 —— 单条 Validate 看不到"顺序"，只能整条扫。
+		for _, p := range session.ValidateLog(dtos) {
+			if strings.HasPrefix(p, "（提示）") {
+				fmt.Printf("  ℹ️  %s %s\n", key, p)
+				continue
+			}
+			bad++
+			fmt.Printf("  ❌ %s %s\n", key, p)
 		}
 	}
 

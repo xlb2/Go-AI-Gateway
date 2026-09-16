@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -80,6 +81,11 @@ const (
 	// 为什么必须有它：没有它的话，"用户说了话但没有回复"这一格
 	// 分不清是"模型没回"还是"进程死在半路"—— 这两件事的处置完全不同。
 	EventTurnEnd = "turn/end"
+	// EventStepStart / EventStepEnd 一个 step 的开始与结束（log-only，不喂模型）。
+	// 为什么要它们：step 是计量 / 中断 / 断点续跑的最小单位（见 lessons/01-agent-loop.md）。
+	// 落成日志之后，"跑到第几步、最后一步为什么结束"才是**可重建**的 —— 这是 P3-1 step 级 checkpoint 的地基。
+	EventStepStart = "step/start"
+	EventStepEnd   = "step/end"
 	// EventLLMRetry 模型调用重试（log-only，对应 HARNESS-TODO 的 P1-3）。
 	// 为什么必须进日志：重试是"这一轮为什么变慢"的唯一解释；
 	// 而且本轮的重试预算从日志恢复（RetryAttemptsInTurn），
@@ -128,8 +134,69 @@ func Validate(dto MemoryDTO) error {
 			return fmt.Errorf("不变量违反：compaction/summary 的 CompactionTo(%d) 不能小于 CompactionFrom(%d)",
 				dto.CompactionTo, dto.CompactionFrom)
 		}
+	case EventStepEnd:
+		// 没有原因的 step/end 等于什么都没说 —— 断点续跑时无法判断"为什么停"。
+		if strings.TrimSpace(dto.Content) == "" {
+			return fmt.Errorf("不变量违反：step/end 必须带结构化的结束原因（completed/max-tokens/aborted/error/…）")
+		}
 	}
 	return nil
+}
+
+// ValidateLog 全量**序列**校验（单条 Validate 只看一条，看不到"顺序"，所以需要它）。
+//
+// 为什么必须有：`step/start` 与 `step/end` 必须交替、`tool/result` 必须配到 `tool/call` ——
+// 这些只有把整条日志按序扫一遍才看得出来。写入侧只能拦"单条结构非法"，
+// 而"写入丢失 / 顺序错乱"这类问题只能在体检时抓（真实数据里已经出现过 step/start≠step/end）。
+//
+// 末尾悬空（未闭合的 step / tool-call）是**崩溃的正常现象**，Repair 会收尾 —— 只作"提示"返回，
+// 前缀是 `（提示）`，调用方据此把它和真正的错位区分开。
+func ValidateLog(dtos []MemoryDTO) []string {
+	var problems []string
+	stepOpen := false
+	openStepSeq := -1
+	openCalls := map[string]int{} // callId -> tool/call 的 seq
+
+	for i, dto := range dtos {
+		typ := dto.Type
+		if typ == "" {
+			typ = inferEventType(schema.RoleType(dto.Role))
+		}
+		switch typ {
+		case EventStepStart:
+			if stepOpen {
+				problems = append(problems, fmt.Sprintf(
+					"seq=%d: step/start 重复 —— 上一个 step（起始 seq=%d）还没闭合", i, openStepSeq))
+			}
+			stepOpen = true
+			openStepSeq = i
+		case EventStepEnd:
+			if !stepOpen {
+				problems = append(problems, fmt.Sprintf(
+					"seq=%d: step/end 找不到配对的 step/start（写入丢失或顺序被破坏）", i))
+			}
+			stepOpen = false
+		case EventToolCall:
+			for _, tc := range dto.ToolCalls {
+				openCalls[tc.ID] = i
+			}
+		case EventToolResult:
+			if _, ok := openCalls[dto.ToolCallID]; !ok {
+				problems = append(problems, fmt.Sprintf(
+					"seq=%d: tool/result(%s) 找不到配对的 tool/call", i, dto.ToolCallID))
+			} else {
+				delete(openCalls, dto.ToolCallID)
+			}
+		}
+	}
+
+	if stepOpen {
+		problems = append(problems, fmt.Sprintf("（提示）末尾有一个未闭合的 step（起始 seq=%d）—— 正常，Repair 会收尾", openStepSeq))
+	}
+	for id, seq := range openCalls {
+		problems = append(problems, fmt.Sprintf("（提示）tool/call(%s)（seq=%d）未落结果 —— 正常，Repair 会补", id, seq))
+	}
+	return problems
 }
 
 // prepareForWrite 写入前的统一把关：盖版本号 + 走不变量校验。
@@ -185,8 +252,8 @@ type MemoryDTO struct {
 	// 为什么要有：结构一变（FoldUpto / Interrupted 都是后加的），旧日志读进新结构时
 	// json.Unmarshal **不会报错**，新字段静默变成零值 —— 表现是"旧数据莫名失效"却没有任何信号。
 	// 0 = 加版本号之前的日志，按 v1 对待（兼容，绝不能因为老数据没版本号就废掉它）。
-	V              int            `json:"v,omitempty"`
-	Time           time.Time      `json:"time"`
+	V    int       `json:"v,omitempty"`
+	Time time.Time `json:"time"`
 }
 
 // Store 记忆器官接口：只追加日志 + 投影模型历史 + 归档检索 + 上下文压缩。
@@ -203,6 +270,8 @@ type Store interface {
 	Repair(ctx context.Context, userID uint) (int, error)
 	// AppendEvent 追加一条自定义事件（审计/检查点这类 log-only 事件）。
 	AppendEvent(ctx context.Context, userID uint, dto MemoryDTO) error
+
+	ResumePoint(ctx context.Context, userID uint) (closedSteps int, openTurn bool, err error)
 	// HasEvent 该类型的事件是否已写过（用于"系统提示只写一次"这类去重）。
 	HasEvent(ctx context.Context, userID uint, eventType string) (bool, error)
 	// RetryAttemptsInTurn 本轮（最近一条用户消息之后）已经用掉的重试次数。
@@ -355,8 +424,9 @@ func (RedisStore) SearchArchival(ctx context.Context, userID uint, query string,
 		if typ == "" {
 			typ = inferEventType(schema.RoleType(dto.Role))
 		}
-		if typ == EventSystemPrompt || typ == EventToolCall || typ == EventToolResult {
-			continue // log-only 或工具流水事件：检索的也是"喂过模型的记忆"，不含日志噪声
+		if typ == EventSystemPrompt || typ == EventToolCall || typ == EventToolResult ||
+			typ == EventStepStart || typ == EventStepEnd {
+			continue // log-only 或工具/step 事件：检索的也是"喂过模型的记忆"，不含日志噪声
 		}
 		msgTokens := tokenize(dto.Content)
 		score := 0
@@ -424,23 +494,34 @@ func (RedisStore) SaveReply(ctx context.Context, userID uint, content string, in
 	})
 }
 
-// Repair 检出"未闭合的轮次"并补一条**合成**的收尾事件，返回修了几轮（0 = 无需修复）。
+// Repair 检出"未闭合的轮次 / step / 工具调用"并补**合成**的收尾事件，返回修了几轮（0 = 无需修复）。
 //
 // 为什么需要：RunAgentTurn 跑到一半进程被杀/崩溃时，日志里 user/message 后面什么都没有。
 // 下一轮投影时它只是被当成"模型没回"，**没人分得清那轮是断了还是真没回** ——
 // 这两件事的处置完全不同（一个该重试，一个该换问法）。
 //
 // 对齐 dsh（session-persistence/coordinator.ts）：遇到没有 turn/end 的开放轮次，
-// 合成一条 turn/end{interrupted}。**只追加、绝不截断或改写历史**——
+// 合成一条 turn/end{interrupted}。**只追加、绝不截断或改写历史** ——
 // 这也是整个记忆器官从头到尾守的那条纪律。
+//
+// P3-1 扩展（3.2）—— 除了轮次，还补两类"崩溃留下的悬空"：
+//   - **开放 step**：`step/start` 之后没有 `step/end` → 补一条 step/end{interrupted}，
+//     否则"跑到第几步"无法重建，断点续跑无从谈起。
+//   - **悬空 tool/call**：派了工具（`tool/call`）却没落结果 → 补一条"结果未知"的 `tool/result`，
+//     否则投影（pair-or-drop）会看到悬空的工具调用。**关键：合成结果而不是重放工具** ——
+//     工具可能已经产生了副作用，重放会让副作用做两遍（详见 loop.go 的幂等前提）。
 func (RedisStore) Repair(ctx context.Context, userID uint) (int, error) {
 	dtos, _, err := RedisStore{}.loadActiveLog(ctx, userID)
 	if err != nil {
 		return 0, err
 	}
 
-	open := false
-	unclosed := 0
+	openTurn := false
+	unclosedTurns := 0
+	stepOpen := false
+	unclosedSteps := 0
+	openCalls := map[string]string{} // callId -> 工具名（合成结果时带上）
+
 	for _, dto := range dtos {
 		typ := dto.Type
 		if typ == "" {
@@ -448,10 +529,10 @@ func (RedisStore) Repair(ctx context.Context, userID uint) (int, error) {
 		}
 		switch typ {
 		case EventUserMessage:
-			if open {
-				unclosed++ // 上一条用户消息开的轮次，一直没闭合
+			if openTurn {
+				unclosedTurns++ // 上一条用户消息开的轮次，一直没闭合
 			}
-			open = true
+			openTurn = true
 		case EventAssistantMessage:
 			// 被中断的回复**不算闭合** —— 那一轮没走完，用户的问题没被答完。
 			// 这条判断是必须的：被中断的轮次同样会留下一条 assistant/message（半截的），
@@ -459,30 +540,106 @@ func (RedisStore) Repair(ctx context.Context, userID uint) (int, error) {
 			if dto.Interrupted {
 				continue
 			}
-			open = false
+			openTurn = false
 		case EventTurnEnd:
-			open = false
+			openTurn = false
+		case EventStepStart:
+			// 只记"当前有没有开着的 step"，**不**把"连续两个 start"当成两个未闭合：
+			// 历史数据里父/子 agent 的 step 交错会造成这种形状，按个数补会越补越多（真实踩过）。
+			stepOpen = true
+		case EventStepEnd:
+			stepOpen = false
+		case EventToolCall:
+			for _, tc := range dto.ToolCalls {
+				openCalls[tc.ID] = tc.Name
+			}
+		case EventToolResult:
+			delete(openCalls, dto.ToolCallID)
 		}
 	}
-	if open {
-		unclosed++
+	if stepOpen {
+		unclosedSteps = 1
 	}
-	if unclosed == 0 {
+	if openTurn {
+		unclosedTurns++
+	}
+
+	if unclosedSteps == 0 && len(openCalls) == 0 && unclosedTurns == 0 {
 		return 0, nil
 	}
 
-	// 只补一条收尾事件，内容里写清有几轮没闭合。
-	// 不在中间插：日志只追加，插进去等于改写历史。
-	if err := writeMemoryEvent(ctx, userID, MemoryDTO{
-		Type:    EventTurnEnd,
-		Role:    "system",
-		Content: fmt.Sprintf("interrupted：检测到 %d 个未闭合的轮次（进程中断/崩溃/回复被切断），已合成收尾；原始事件一条未改。", unclosed),
-		Time:    time.Now(),
-	}); err != nil {
-		return 0, err
+	// 只追加合成事件，绝不改写历史。顺序与正常写入一致：step/end → tool/result → turn/end。
+	if unclosedSteps > 0 {
+		if err := writeMemoryEvent(ctx, userID, MemoryDTO{
+			Type: EventStepEnd, Role: "system",
+			Content: fmt.Sprintf("interrupted：检测到 %d 个未闭合的 step（进程中断/崩溃），已合成收尾。", unclosedSteps),
+			Time:    time.Now(),
+		}); err != nil {
+			return 0, err
+		}
 	}
-	fmt.Printf(" [修复] UserID %d 补了 1 条 turn/end（%d 轮未闭合）\n", userID, unclosed)
-	return unclosed, nil
+	ids := make([]string, 0, len(openCalls))
+	for id := range openCalls {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids) // 顺序确定，便于测试与排查
+	for _, id := range ids {
+		if err := writeMemoryEvent(ctx, userID, MemoryDTO{
+			Type: EventToolResult, Role: "tool", ToolCallID: id, ToolName: openCalls[id],
+			Content: "（进程中断：该工具调用已派发但结果未知；未重放，以免副作用做两遍）",
+			Time:    time.Now(),
+		}); err != nil {
+			return 0, err
+		}
+	}
+	if unclosedTurns > 0 {
+		if err := writeMemoryEvent(ctx, userID, MemoryDTO{
+			Type:    EventTurnEnd,
+			Role:    "system",
+			Content: fmt.Sprintf("interrupted：检测到 %d 个未闭合的轮次（进程中断/崩溃/回复被切断），已合成收尾；原始事件一条未改。", unclosedTurns),
+			Time:    time.Now(),
+		}); err != nil {
+			return 0, err
+		}
+	}
+	if unclosedSteps > 0 || len(openCalls) > 0 {
+		fmt.Printf(" [修复] UserID %d 补了 %d 个 step/end + %d 条 tool/result（%d 轮未闭合）\n",
+			userID, unclosedSteps, len(openCalls), unclosedTurns)
+	} else {
+		fmt.Printf(" [修复] UserID %d 补了 1 条 turn/end（%d 轮未闭合）\n", userID, unclosedTurns)
+	}
+	return unclosedTurns, nil
+}
+
+// ResumePoint 报告"续跑到哪"：已闭合的 step 数 + 末尾是否有未闭合轮次（只读，供断点续跑判断）。
+// 判据与 Repair 一致：被中断的 assistant 回复**不算**闭合。
+func (RedisStore) ResumePoint(ctx context.Context, userID uint) (int, bool, error) {
+	dtos, _, err := RedisStore{}.loadActiveLog(ctx, userID)
+	if err != nil {
+		return 0, false, err
+	}
+	closedSteps := 0
+	openTurn := false
+	for _, dto := range dtos {
+		typ := dto.Type
+		if typ == "" {
+			typ = inferEventType(schema.RoleType(dto.Role))
+		}
+		switch typ {
+		case EventStepEnd:
+			closedSteps++
+		case EventUserMessage:
+			openTurn = true
+		case EventTurnEnd:
+			openTurn = false
+		case EventAssistantMessage:
+			if dto.Interrupted {
+				continue
+			}
+			openTurn = false
+		}
+	}
+	return closedSteps, openTurn, nil
 }
 
 // AppendEvent 追加一条自定义事件（审计/检查点这类 log-only 事件）。
@@ -835,8 +992,8 @@ func ProjectMessagesFrom(dtos []MemoryDTO, baseSeq int) []*schema.Message {
 				Role:    schema.User,
 				Content: "【早期对话摘要】" + dto.Content,
 			})
-		case EventSystemPrompt, EventAudit, EventCheckpoint, EventUsage, EventTurnEnd, EventCorrupt:
-			continue // log-only：只存档/审计/计量/收尾标记用，永远不喂模型
+		case EventSystemPrompt, EventAudit, EventCheckpoint, EventUsage, EventTurnEnd, EventStepStart, EventStepEnd, EventCorrupt:
+			continue // log-only：只存档/审计/计量/收尾/step 边界用，永远不喂模型
 		case EventToolCall:
 			flushPair()
 			pending = &dto

@@ -357,6 +357,15 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 	fullMessages = append(fullMessages, history...)
 	fullMessages = append(fullMessages, usrMsg)
 
+	// 3. 跑循环 + 落盘（与"续跑"共用同一段逻辑）
+	return h.runLoop(ctx, userID, fullMessages, emit)
+}
+
+// runLoop 跑一遍 agent 循环并把这次生成落盘（`RunAgentTurn` 与 `ResumeTurn` 共用）。
+//
+// 为什么抽出来：正常一轮和"续跑中断的轮次"除了喂进去的消息不同，后面（建循环 → 收流 → 记用量 →
+// 落回复 → 收尾）**必须完全一致** —— 否则续跑会走出一套不一样的行为，bug 藏不住。
+func (h *Harness) runLoop(ctx context.Context, userID uint, fullMessages []*schema.Message, emit func(chunk string)) (string, error) {
 	// 3. agent 循环（模型→工具→模型，直到给出最终答案）。
 	//    走 agent.Loop 这道缝（阶段 2.2 起唯一实现是自研循环）——替换循环时这里一行不用改。
 	agentRunner, err := agent.NewLoop(ctx)
@@ -375,7 +384,16 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 	// 不区分的话，半截回复会被当成"模型的完整回答"永久写进历史，
 	// 模型之后会以为自己说过那些话，然后接着半截话往下答。
 	var aiFullResponse strings.Builder
-	var usage *schema.TokenUsage
+	// 用量要**聚合**，不是覆盖：一轮里可能跑多个 step，每个 step 都会回一次 usage。
+	//   firstPrompt     = 第一次模型调用的 prompt 大小（内容 == fullMessages，**校准必须配它**）
+	//   lastPrompt      = 最后一次（== 最终上下文有多大，用于"上下文有多满"）
+	//   promptTotal     = 各 step 累加（== 真实 prompt 花费：每一步都会把整个上下文重发一遍）
+	//   completionTotal = 各 step 累加（每一段生成都是真花的钱）
+	// 旧实现是 `usage = ...` 覆盖 —— 多步对话只记到最后一步，token 花费被系统性低估。
+	var (
+		firstPrompt, lastPrompt, promptTotal, completionTotal int
+		sawUsage                                             bool
+	)
 	interrupted := false
 	for {
 		msg, err := responseStream.Recv()
@@ -388,7 +406,14 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 			break
 		}
 		if msg.ResponseMeta != nil && msg.ResponseMeta.Usage != nil {
-			usage = msg.ResponseMeta.Usage
+			u := msg.ResponseMeta.Usage
+			if !sawUsage {
+				firstPrompt = u.PromptTokens
+				sawUsage = true
+			}
+			lastPrompt = u.PromptTokens
+			promptTotal += u.PromptTokens
+			completionTotal += u.CompletionTokens
 		}
 		if msg.Content != "" {
 			aiFullResponse.WriteString(msg.Content)
@@ -398,24 +423,26 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 		}
 	}
 	// 记用量：这是预算判断的唯一真实依据（估算只是估算）。
-	// 落盘 + 喂给校准器：让"估算 vs 实际"的偏差被持续纠正，而不是一直拍脑袋。
-	if usage != nil && usage.PromptTokens > 0 {
+	// 校准必须是"同一份内容"的估算 vs 实际 —— 所以配 firstPrompt（首步的输入正是 fullMessages），
+	// 而不是配 lastPrompt（那是累加了历史之后更大的一份，拿它校准会让系数一路偏大）。
+	if sawUsage && firstPrompt > 0 {
 		estimated := tokenmeter.EstimateMessages(fullMessages)
-		tokenmeter.Observe(estimated, usage.PromptTokens)
+		tokenmeter.Observe(estimated, firstPrompt)
 		ratio, samples := tokenmeter.Calibration()
 		payload, _ := json.Marshal(map[string]any{
-			"estimated_prompt":  estimated,
-			"actual_prompt":     usage.PromptTokens,
-			"completion":        usage.CompletionTokens,
-			"total":             usage.TotalTokens,
-			"calibration_ratio": ratio,
-			"calibration_n":     samples,
+			"estimated_prompt":    estimated,
+			"actual_first_prompt": firstPrompt,
+			"actual_last_prompt":  lastPrompt,
+			"prompt_total":        promptTotal,
+			"completion_total":    completionTotal,
+			"calibration_ratio":   ratio,
+			"calibration_n":       samples,
 		})
 		_ = h.Sessions.AppendEvent(ctx, userID, session.MemoryDTO{
 			Type: session.EventUsage, Role: "system", Content: string(payload),
 		})
-		metrics.Default.Add("prompt_tokens_total", float64(usage.PromptTokens))
-		metrics.Default.Add("completion_tokens_total", float64(usage.CompletionTokens))
+		metrics.Default.Add("prompt_tokens_total", float64(promptTotal))
+		metrics.Default.Add("completion_tokens_total", float64(completionTotal))
 	}
 
 	// 5. 落盘回复 + 正常收尾标记 + post 钩子（观察，不改流程）
@@ -435,4 +462,42 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 	}
 	hooks.RunPost(ctx, userID, reply)
 	return reply, nil
+}
+
+// ResumeTurn 接着跑上一轮被崩溃打断的对话（P3-1 的落点）。
+//
+// 与 RunAgentTurn 的唯一区别：**不新增用户消息** —— 直接拿日志投影出的历史接着跑。
+// 为什么这是"续跑"而不是"重跑"：历史里已经包含已完成的工具调用与结果（事件溯源的投影），
+// 模型会从"最后一个闭合 step 之后"继续，**已完成的工具副作用不会被重放**。
+//
+// 返回 resumed=false 表示没有可续跑的开放轮次（此时什么都不做）。
+func (h *Harness) ResumeTurn(ctx context.Context, userID uint, emit func(chunk string)) (string, bool, error) {
+	if _, open, err := h.Sessions.ResumePoint(ctx, userID); err != nil {
+		return "", false, err
+	} else if !open {
+		return "", false, nil
+	}
+
+	// 先把崩溃留下的悬空补掉（开放 step / 悬空 tool-call / 开放轮次），让投影干净。
+	if _, err := h.Sessions.Repair(ctx, userID); err != nil {
+		fmt.Printf(" [续跑] Repair 失败（继续尝试）: %v\n", err)
+	}
+	if err := h.Sessions.Compact(ctx, userID, agent.Summarize); err != nil {
+		fmt.Printf(" [压缩] 跳过本次压缩: %v\n", err)
+	}
+
+	sysMsg := schema.SystemMessage(h.buildSystemPrompt(ctx))
+	if err := h.ensureSystemPrompt(ctx, userID, sysMsg); err != nil {
+		return "", false, err
+	}
+	history, err := h.Sessions.GetHistory(ctx, userID)
+	if err != nil {
+		return "", false, fmt.Errorf("读取记忆失败: %v", err)
+	}
+	fullMessages := make([]*schema.Message, 0, len(history)+1)
+	fullMessages = append(fullMessages, sysMsg)
+	fullMessages = append(fullMessages, history...)
+
+	reply, err := h.runLoop(ctx, userID, fullMessages, emit)
+	return reply, true, err
 }

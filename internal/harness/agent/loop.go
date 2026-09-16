@@ -31,10 +31,27 @@ import (
 
 	"go_im_gateway/internal/harness/retry"
 	"go_im_gateway/internal/harness/session"
+	"go_im_gateway/internal/harness/subagent"
 )
 
 // defaultMaxSteps 一轮最多跑多少步（防止模型/工具互相喂结果导致无限循环）。
 const defaultMaxSteps = 10
+
+// StepEndReason 一个 step 为什么结束 —— **结构化**，写进 log-only 的 `step/end` 事件。
+//
+// 为什么必须结构化（对应讲义 01 的 Q3）：一个 `bool` 只能表达"有没有被截断"，
+// 表达不了"**为什么**停"；而"重试 / 恢复 / 续跑"的决策恰恰需要知道原因 ——
+// token 上限该压缩后继续，用户取消绝不该自动重试，审批挂起要等批准。
+type StepEndReason string
+
+const (
+	StepHandoff   StepEndReason = "handoff"    // 有工具调用，交棒给下一个 step
+	StepCompleted StepEndReason = "completed"  // 模型不再要工具，这一轮说完
+	StepMaxTokens StepEndReason = "max-tokens" // 输出被 token 上限截断
+	StepAborted   StepEndReason = "aborted"    // 上下文被取消（用户 / 上层中止）
+	StepError     StepEndReason = "error"      // 模型调用或流本身出错
+	StepMaxSteps  StepEndReason = "max-steps"  // 超过步数上限（预留，暂未落盘）
+)
 
 // ownLoop 就是"推倒黑盒"之后的循环。
 type ownLoop struct {
@@ -136,32 +153,52 @@ func (l *ownLoop) bindTools(ctx context.Context) (model.BaseChatModel, error) {
 }
 
 // run 是循环本体（在一个 goroutine 里跑），逐步推进直到退出或失败。
+//
+// P3-1：每一步都落一对 `step/start` / `step/end`（log-only），step/end 带**结构化原因**。
+// 这样"跑到第几步、最后一步为什么结束"可从日志重建 —— 断点续跑的地基。
 func (l *ownLoop) run(ctx context.Context, input []*schema.Message, m model.BaseChatModel, reader *schema.StreamReader[*schema.Message], sw *schema.StreamWriter[*schema.Message]) {
 	userID, _ := getUserID(ctx) // best-effort：写事件用，取不到就写不了（不影响对话）
+	if subagent.IsNested(ctx) {
+		// 子 agent 的痕迹不写进父会话日志：既是隔离（中间过程不该回流），
+		// 也避免父子两股 step 事件交错、把父日志的 step 序列搞乱。
+		userID = 0
+	}
 	messages := append([]*schema.Message(nil), input...)
 
-	for step := 0; step < l.maxSteps; step++ {
+	for step := 1; step <= l.maxSteps; step++ {
+		l.logStepEvent(ctx, userID, session.EventStepStart, "")
+
 		chunks, err := drain(reader, sw)
 		if err != nil {
+			l.logStepEvent(ctx, userID, session.EventStepEnd, string(reasonForError(ctx)))
 			sw.Send(nil, err) // 契约 2：中断原样透传（调用方据此标 interrupted）
 			return
 		}
 
 		full, err := schema.ConcatMessages(chunks) // 契约 5：流式分片拼成完整消息（含 tool_call 合并）
 		if err != nil {
+			l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepError))
 			sw.Send(nil, fmt.Errorf("拼接模型回复失败: %w", err))
 			return
 		}
 		messages = append(messages, full)
 
+		if isTruncated(full) {
+			l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepMaxTokens))
+			return // 被 token 上限截断：这一轮到此为止
+		}
 		if len(full.ToolCalls) == 0 {
+			l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepCompleted))
 			return // 退出：模型不再要工具，这一轮说完
 		}
 
 		messages = append(messages, l.executeTools(ctx, userID, full.ToolCalls)...)
+		l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepHandoff))
 
 		next, err := m.Stream(ctx, messages) // 交棒：把工具结果喂回去再调一次模型
 		if err != nil {
+			// 失败发生在**下一个 step 的模型调用**上 —— 上一个 step 已闭合，
+			// 所以断点续跑会从"已闭合的 handoff step"之后重试这次模型调用，不重放工具副作用。
 			sw.Send(nil, err)
 			return
 		}
@@ -169,6 +206,29 @@ func (l *ownLoop) run(ctx context.Context, input []*schema.Message, m model.Base
 	}
 
 	sw.Send(nil, fmt.Errorf("ownLoop：超过最大步数 %d，已停止", l.maxSteps))
+}
+
+// logStepEvent 把 step 边界写进日志（log-only，不喂模型）。user_id 取不到就跳过（best-effort）。
+func (l *ownLoop) logStepEvent(ctx context.Context, userID uint, kind, content string) {
+	if userID == 0 {
+		return
+	}
+	session.WriteMemoryEvents(ctx, userID, []session.MemoryDTO{{
+		Type: kind, Role: "system", Content: content,
+	}})
+}
+
+// isTruncated 这次模型输出是不是被 token 上限截断了（OpenAI 协议：finish_reason == "length"）。
+func isTruncated(msg *schema.Message) bool {
+	return msg != nil && msg.ResponseMeta != nil && msg.ResponseMeta.FinishReason == "length"
+}
+
+// reasonForError 把"流读取出错"归类：上下文已取消 = aborted，其余 = error。
+func reasonForError(ctx context.Context) StepEndReason {
+	if ctx.Err() != nil {
+		return StepAborted
+	}
+	return StepError
 }
 
 // drain 读干一次模型流：把每个 chunk 原样转发给调用方（文本→emit、usage→记账，契约 3），
@@ -194,21 +254,25 @@ func drain(reader *schema.StreamReader[*schema.Message], sw *schema.StreamWriter
 
 // executeTools 执行这一步的全部工具调用，并落 tool/call + tool/result 事件（契约 4）。
 // 事件顺序：先 tool/call（一条 DTO 带全部调用），再按执行顺序逐条 tool/result。
-// 不变量校验（session.prepareForWrite）在此把关：tool/result 缺 ToolCallID 会被拒写。
+//
+// **幂等前提（P3-1）**：`tool/call` 必须在工具**执行之前**落盘。否则进程在
+// "工具已跑、结果没落"的窗口里挂掉，日志里没有任何痕迹，断点续跑只能重放这个工具（副作用做两遍）。
+// 先落 call 之后，resume 见到"有 call 无 result"就能判定"已派发、结果未知"，
+// 交给 Repair 合成一条结果，**绝不盲目重放**。
 func (l *ownLoop) executeTools(ctx context.Context, userID uint, calls []schema.ToolCall) []*schema.Message {
 	assistant := &schema.Message{Role: schema.Assistant, ToolCalls: calls}
-	pending := []session.MemoryDTO{memoryDTOFromToolCall(assistant)}
+	if userID != 0 {
+		session.WriteMemoryEvents(ctx, userID, []session.MemoryDTO{memoryDTOFromToolCall(assistant)})
+	}
 
 	out := make([]*schema.Message, 0, len(calls))
 	for _, tc := range calls {
 		msg := schema.ToolMessage(l.runOne(ctx, tc), tc.ID)
 		msg.ToolName = tc.Function.Name
 		out = append(out, msg)
-		pending = append(pending, memoryDTOFromToolResult(ctx, msg))
-	}
-
-	if userID != 0 {
-		session.WriteMemoryEvents(ctx, userID, pending)
+		if userID != 0 {
+			session.WriteMemoryEvents(ctx, userID, []session.MemoryDTO{memoryDTOFromToolResult(ctx, msg)})
+		}
 	}
 	return out
 }

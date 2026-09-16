@@ -27,11 +27,13 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"go_im_gateway/internal/harness"
+	"go_im_gateway/internal/harness/agent"
 	"go_im_gateway/internal/harness/approval"
 	"go_im_gateway/internal/harness/metrics"
 	"go_im_gateway/internal/harness/sandbox"
 	"go_im_gateway/internal/harness/session"
 	"go_im_gateway/internal/harness/spill"
+	"go_im_gateway/internal/harness/subagent"
 	"go_im_gateway/internal/harness/tokenmeter"
 	"go_im_gateway/test/fakemodel"
 
@@ -90,6 +92,11 @@ func newEnv(t *testing.T, uid uint) *env {
 	t.Setenv("VOLC_BASE_URL", srv.URL+"/api/v3")
 
 	e := &env{t: t, fake: fake, srv: srv, uid: uid, redis: testRDB}
+	// 接上子 agent 构造器（正常由 cmd/api 注入）。不接的话 `delegate_task` 只会返回
+	// "runner 未设置"，子 agent 根本不跑 —— 那样"父子 step 不互相污染"这条就测不到。
+	subagent.SetRunner(func(ctx context.Context) (subagent.ChildAgent, error) {
+		return agent.NewLoop(ctx)
+	})
 	e.reset()
 	// 测试不该在共享 Redis 里留垃圾（cmd/probe 扫 agent:* 时会被这些残留刷屏）
 	t.Cleanup(e.cleanup)
@@ -325,6 +332,21 @@ func TestToolCallResultsArePaired(t *testing.T) {
 	if c[session.EventToolCall] != c[session.EventToolResult] {
 		t.Fatalf("tool/call 与 tool/result 数量不等（配对不变量被破坏）：call=%d result=%d",
 			c[session.EventToolCall], c[session.EventToolResult])
+	}
+
+	// P3-1：step 边界必须闭合。这次对话是"1 次工具调用 → 2 个 step"：
+	// 第 1 步 handoff（调了工具、交棒），第 2 步 completed（模型不再要工具）。
+	if c[session.EventStepStart] != 2 || c[session.EventStepEnd] != 2 {
+		t.Fatalf("期望 2 组闭合 step，实际 start=%d end=%d", c[session.EventStepStart], c[session.EventStepEnd])
+	}
+	var lastReason string
+	for _, dto := range e.log() {
+		if dto.Type == session.EventStepEnd {
+			lastReason = dto.Content
+		}
+	}
+	if lastReason != "completed" {
+		t.Fatalf("最后一步的结束原因应为结构化的 completed，实际 %q", lastReason)
 	}
 
 	// 每条 tool/result 都必须带 callId，且能在 tool/call 里找到配对
@@ -671,6 +693,195 @@ func TestRepairClosesOpenTurn(t *testing.T) {
 	c := e.countTypes()
 	if c[session.EventUserMessage] != 1 {
 		t.Fatalf("修复动到了历史：用户消息应该还是 1 条，实际 %d 条", c[session.EventUserMessage])
+	}
+}
+
+// P3-1（3.2）：崩溃现场除了"开放轮次"，还会留下"开放 step"和"悬空工具调用"，
+// Repair 必须一起补掉 —— 否则 step 进度不可重建、投影像看到悬空的工具调用。
+func TestRepairClosesOpenStepAndDanglingToolCall(t *testing.T) {
+	e := newEnv(t, 9031)
+	e.h = e.newHarness(&recordingExecutor{})
+	store := session.RedisStore{}
+
+	// 制造崩溃现场：开了轮次 + 开了 step + 派了工具调用，然后就死了。
+	// 注意 tool/call 里带了 callId —— 这是它和结果配对的唯一凭据。
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("造数据失败: %v", err)
+		}
+	}
+	must(store.AppendEvent(e.ctx(), e.uid, session.MemoryDTO{
+		Type: session.EventUserMessage, Role: "user", Content: "崩溃前那句",
+	}))
+	must(store.AppendEvent(e.ctx(), e.uid, session.MemoryDTO{
+		Type: session.EventStepStart, Role: "system",
+	}))
+	must(store.AppendEvent(e.ctx(), e.uid, session.MemoryDTO{
+		Type: session.EventToolCall, Role: "assistant",
+		ToolCalls: []session.ToolCallData{{ID: "call-x", Name: "echo", Arguments: "{}"}},
+	}))
+
+	n, err := e.h.Sessions.Repair(e.ctx(), e.uid)
+	if err != nil {
+		t.Fatalf("Repair 失败: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("应该识别出 1 个未闭合轮次，实际 %d", n)
+	}
+
+	var sawStepEnd, sawCallResult, sawTurnEnd bool
+	for _, dto := range e.log() {
+		switch dto.Type {
+		case session.EventStepEnd:
+			sawStepEnd = true
+		case session.EventToolResult:
+			if dto.ToolCallID == "call-x" {
+				sawCallResult = true
+			}
+		case session.EventTurnEnd:
+			sawTurnEnd = true
+		}
+	}
+	if !sawStepEnd {
+		t.Fatal("没补出 step/end —— 开放 step 会让\"跑到第几步\"不可重建")
+	}
+	if !sawCallResult {
+		t.Fatal("没补出悬空 tool/call 的结果 —— 投影会看到悬空的工具调用")
+	}
+	if !sawTurnEnd {
+		t.Fatal("没补出 turn/end")
+	}
+
+	// 只追加：原始事件一条没改
+	if c := e.countTypes(); c[session.EventToolCall] != 1 || c[session.EventUserMessage] != 1 {
+		t.Fatalf("修复动到了历史：%v", c)
+	}
+
+	// 幂等：修完就认为自己干净了
+	if n2, _ := e.h.Sessions.Repair(e.ctx(), e.uid); n2 != 0 {
+		t.Fatalf("Repair 不幂等：修完还说有 %d 轮未闭合", n2)
+	}
+}
+
+// P3-1（3.3a）：ResumePoint 是"续跑到哪"的观察口 —— 闭合了几个 step、末尾轮次是否还开着。
+func TestResumePointReportsLastClosedStep(t *testing.T) {
+	e := newEnv(t, 9032)
+	e.h = e.newHarness(&recordingExecutor{})
+	store := session.RedisStore{}
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("造数据: %v", err)
+		}
+	}
+
+	must(store.AppendEvent(e.ctx(), e.uid, session.MemoryDTO{Type: session.EventUserMessage, Role: "user", Content: "hi"}))
+	must(store.AppendEvent(e.ctx(), e.uid, session.MemoryDTO{Type: session.EventStepStart, Role: "system"}))
+	must(store.AppendEvent(e.ctx(), e.uid, session.MemoryDTO{Type: session.EventStepEnd, Role: "system", Content: "completed"}))
+	must(store.AppendEvent(e.ctx(), e.uid, session.MemoryDTO{Type: session.EventStepStart, Role: "system"}))
+
+	closed, open, err := store.ResumePoint(e.ctx(), e.uid)
+	if err != nil {
+		t.Fatalf("ResumePoint 失败: %v", err)
+	}
+	if closed != 1 {
+		t.Fatalf("已闭合 step 应为 1，实际 %d", closed)
+	}
+	if !open {
+		t.Fatal("末尾没有 turn/end，openTurn 应为 true")
+	}
+}
+
+// P3-1（3.3b）：崩溃后"续跑"必须从日志接着跑，**不重放已派发的工具**。
+func TestResumeTurnContinuesWithoutReplayingTool(t *testing.T) {
+	e := newEnv(t, 9033)
+	e.h = e.newHarness(&recordingExecutor{})
+	store := session.RedisStore{}
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("造数据: %v", err)
+		}
+	}
+
+	// 崩溃现场：用户问了话、模型派了 search_memory_archive（tool/call 已落盘，因为它是**执行前**落盘），
+	// 但工具结果还没落 —— 进程死了。
+	must(store.AppendEvent(e.ctx(), e.uid, session.MemoryDTO{
+		Type: session.EventUserMessage, Role: "user", Content: "帮我查一下历史",
+	}))
+	must(store.AppendEvent(e.ctx(), e.uid, session.MemoryDTO{
+		Type: session.EventStepStart, Role: "system",
+	}))
+	must(store.AppendEvent(e.ctx(), e.uid, session.MemoryDTO{
+		Type: session.EventToolCall, Role: "assistant",
+		ToolCalls: []session.ToolCallData{{ID: "call-r", Name: "search_memory_archive", Arguments: `{"query":"历史"}`}},
+	}))
+
+	before := e.countTypes()[session.EventToolCall] // = 1
+
+	reply, resumed, err := e.h.ResumeTurn(e.ctx(), e.uid, nil)
+	if err != nil {
+		t.Fatalf("ResumeTurn 失败: %v", err)
+	}
+	if !resumed {
+		t.Fatal("应该识别出可续跑的开放轮次")
+	}
+	if reply == "" {
+		t.Fatal("续跑应产出回复")
+	}
+
+	// 关键断言：续跑**没有重放工具**（tool/call 事件数不增加）。
+	// 若 ResumeTurn 是"拿原输入重跑一轮"，模型会再调一次工具 → 这里就会 > 1。
+	after := e.countTypes()
+	if after[session.EventToolCall] != before {
+		t.Fatalf("续跑重放了工具调用（副作用会做两遍）：before=%d after=%d",
+			before, after[session.EventToolCall])
+	}
+
+	// 续跑要正常收尾，且不再留开放轮次
+	if after[session.EventTurnEnd] == 0 {
+		t.Fatal("续跑没落 turn/end")
+	}
+	if _, open, _ := store.ResumePoint(e.ctx(), e.uid); open {
+		t.Fatal("续跑之后不该还有开放轮次")
+	}
+}
+
+// P3-1 回归：子 agent 的 step 事件**不该写进父会话日志**。
+//
+// 真实数据里踩过：`delegate_task` 的子 agent 与父 agent 同 userID 写同一份日志，
+// 两边 step/start、step/end 交错 → 父日志的 Repair 误判"开放 step"、反复补事件（越补越多）。
+func TestNestedAgentDoesNotPolluteParentStepLog(t *testing.T) {
+	e := newEnv(t, 9034)
+	e.h = e.newHarness(&recordingExecutor{})
+
+	// 父 agent 调一次 delegate_task；子 agent 拿到任务文本后只回一句话。
+	e.fake.SetScenario(fakemodel.Scenario{
+		Default: fakemodel.Reply{Text: "子任务完成。"},
+		Rules: []fakemodel.Rule{{
+			Match: "派个活",
+			Reply: fakemodel.Reply{ToolCalls: []fakemodel.ToolCall{
+				{Name: "delegate_task", Arguments: `{"task":"随便做点事"}`},
+			}},
+		}},
+	})
+
+	e.run("帮我派个活")
+
+	c := e.countTypes()
+	if c[session.EventToolCall] == 0 {
+		t.Fatalf("没触发 delegate_task（场景没命中？事件分布=%v）", c)
+	}
+	if c[session.EventStepStart] != c[session.EventStepEnd] {
+		t.Fatalf("step 必须成对：start=%d end=%d —— 子 agent 的 step 漏进父日志了",
+			c[session.EventStepStart], c[session.EventStepEnd])
+	}
+	for _, p := range session.ValidateLog(e.log()) {
+		if strings.HasPrefix(p, "（提示）") {
+			continue // 末尾悬空是崩溃的正常现象
+		}
+		t.Fatalf("父日志序列被写脏：%s", p)
 	}
 }
 

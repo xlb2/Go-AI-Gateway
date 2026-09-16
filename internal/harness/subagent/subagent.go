@@ -35,6 +35,14 @@ func withDepth(ctx context.Context, d int) context.Context {
 	return context.WithValue(ctx, depthKey, d)
 }
 
+// IsNested 当前是否跑在子 agent 里（递归深度 > 0）。
+//
+// 用途：子 agent 的执行痕迹**不该写进父会话日志**。两个理由：
+//  1. 隔离 —— 子 agent 的中间过程本来就不该回流到父上下文（它的结果由工具结果带回来）；
+//  2. 不破坏父日志的不变量 —— 父/子各自写 step/start、step/end，交错后就不再交替，
+//     父会话的 Repair 会误判"开放 step"并反复补事件（真实数据里踩过，见 HARNESS-LOOP-REVIEW.md）。
+func IsNested(ctx context.Context) bool { return depthFrom(ctx) > 0 }
+
 // ChildAgent 子 agent 的最小接口（agent 的自研循环满足它）。
 // 只声明 Stream，不绑死具体实现。
 type ChildAgent interface {

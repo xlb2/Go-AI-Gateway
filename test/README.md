@@ -79,7 +79,7 @@ scripts/reset-state.sh 3      # 只清 UserID 3
 |---|---|
 | `TestTurnAndLogInvariants` | 一轮对话落 `user/message` + `assistant/message`；`system/prompt` 只写 1 次 |
 | `TestSystemPromptWrittenOnlyOnce` | 3 轮之后 `system/prompt` 仍是 1 条（每轮重写会白涨日志） |
-| `TestToolCallResultsArePaired` | `tool/call` 与 `tool/result` 数量恒等，且每条 result 都能找到配对的 call |
+| `TestToolCallResultsArePaired` | `tool/call` 与 `tool/result` 数量恒等，且每条 result 都能找到配对的 call；**step 边界闭合**（`step/start` == `step/end`，最后一步原因 = 结构化 `completed`） |
 | `TestApprovalSuspendsThenReallyExecutes` | 挂起时**必须带可执行命令**；批准前不许执行；批准后恰好执行 1 次；落审计；重复批准不重复执行 |
 | `TestRejectDoesNotExecute` | 拒绝不执行，但仍留审计 |
 | `TestApprovalReceiptReportsIsolation` | 审批回执必须写明**隔离等级与执行方式**（人得知道批的是沙箱内还是裸跑） |
@@ -90,6 +90,10 @@ scripts/reset-state.sh 3      # 只清 UserID 3
 | `TestHugeSingleMessageFallsBackToHardTrim` | 单条就撑爆窗口时交给硬裁兜底，不硬造空摘要 |
 | `TestUsageIsRecordedAndCalibrates` | 真实 usage 落盘成 `usage/report`，并喂给估算校准器 |
 | `TestRepairClosesOpenTurn` | 崩溃留下的开放轮次要被认出并补**合成**收尾；幂等；不动历史 |
+| `TestRepairClosesOpenStepAndDanglingToolCall` | 崩溃留下的**开放 step** 与**悬空 tool/call** 也要补掉（合成 step/end + "结果未知"的 result），幂等且不改历史 |
+| `TestResumePointReportsLastClosedStep` | `ResumePoint` 能报告"续跑到哪"（闭合 step 数 + 末尾是否还有开放轮次） |
+| `TestResumeTurnContinuesWithoutReplayingTool` | 崩溃后 `ResumeTurn` 从**投影历史**接着跑：**不重放已派发的工具**（`tool/call` 数不增），且正常收尾、不留开放轮次 |
+| `TestNestedAgentDoesNotPolluteParentStepLog` | 子 agent 的 step 事件**不写进父会话日志**：父日志 step 成对、序列校验干净（防止交错日志骗 `Repair` 反复补事件） |
 | `TestInterruptedStreamIsMarked` | 流被切断的回复标 `interrupted`（不写 `completed` 收尾）、投影里带说明、下一轮 Repair 能补上 |
 | `TestLLMRetryRecoversFromRateLimit` | 429 两次后重试成功；留下 2 条 `llm/retry` 且写明原因；这一轮仍正常收尾 |
 | `TestNonRetryableErrorFailsFast` | 400 参数错**立刻失败**，一条 `llm/retry` 都不许留 |
