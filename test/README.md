@@ -1,7 +1,31 @@
 # test/ — 假模型与端到端测试
 
+## 验证状态的读法（2026-09-17）
+
+本文记录测试意图。最新验证：2026-09-17 15:24 用户在 WSL 对本轮未提交工作区执行压缩定向回归与 `scripts/test-fast.sh -v`，完整回归 72 个顶层用例通过、0 失败、0 跳过，e2e 包耗时 0.814s（假模型 + 真 Redis）。本地静态检查也通过；这不代表真模型摘要质量已经验证。
+
+- 测试须由用户在 WSL 执行 `scripts/test-fast.sh -v`；Windows 本地按工作区约定只做 `go vet ./...`，不运行 `go test`。
+- 验证记录包含日期、代码版本及未提交变更、环境、命令、实际通过/失败/跳过范围。必需 Redis 用例被跳过时只能记“部分验证”，不能称为全绿。
+- 假模型检验运行机制；真模型任务集检验信息质量与实际任务完成。两者不能互相替代。
+- 新增真模型验收：`sh scripts/test-real.sh compact`，先用 `MODEL_CONTEXT_WINDOW=4000 sh scripts/run-api.sh` 启动服务。独立账号、随机早期/近期编号、只读 Redis 证据和严格 JSON 答案断言；最多填充 12 轮，无压缩或事实缺失报失败。账号与日志保留，方便复盘。当前仅静态检查通过，待用户运行；上面的 72 用例记录不覆盖该新命令。
+- 当前缺口见工作区 [`HARNESS-TODO.md`](../../HARNESS-TODO.md) 的 R 系列；以下计划尚未实现或执行。
+
+最新补充（2026-09-17）：用户运行 `sh scripts/test-real.sh compact` 单样例 PASS，覆盖上文“待用户运行”状态。日志 `agent:V2:history:4`，第 3 轮填充后早期事实已被摘要覆盖；回答的 `ARCH-2319a387` 与 `RECENT-91acc868` 均匹配。仅证明当前服务的本次样例通过，不代表通用摘要质量；详见工作区 TODO。
+
+| 计划验收 | 防止的错误 | 状态 |
+|---|---|---|
+| R-1 压缩后近期原文、工具配对与重建一致 | 只检查变小，漏掉未摘要尾部丢失 | `e2e/compaction_test.go` 已于 2026-09-17 在用户 WSL 回归通过 |
+| R-2 写调用事件失败时工具零执行 | 把调用写入函数当成写入成功 | `TestToolPersistenceBarrier` 和 `TestToolPersistenceFailureStopsModelHandoff` 已于 2026-09-17 用户 WSL 定向运行通过；同期完整回归 74 个顶层用例通过、0 失败、0 跳过，e2e 包 0.848s。写入故障为注入模拟，真实 Redis 断连未演练 |
+| R-3 中断跨层传播、取消收敛与预算上限 | 子任务半截结果伪装成功、满缓冲泄漏、超额调用 | `TestOwnLoop_TruncationIsError`、`TestOwnLoop_MaxStepsDoesNotRequestNextModel`、`subagent.TestChildStreamOutcome`、`TestInterruptedStreamIsMarked` 于 2026-09-17 15:51 用户 WSL 定向通过；同期完整回归 77 个顶层用例通过、0 失败、0 跳过，e2e 包 0.802s。取消收敛/重试预算仍缺测试 |
+| R-4 并发批准与恢复再次中断 | 顺序去重冒充并发安全、未知结果重复副作用 | 待补并发和故障测试 |
+| R-5 MCP 原调用批准执行 | 连接发现通过冒充执行闭环 | 待补端到端 |
+
 > 目的：把"依赖真模型的验证"从 **10 分钟**降到 **秒级**（`HARNESS-TODO.md` 的 P0-1）。
 > 一句话：**不 mock LLM 就没法回归；不敢回归就没法改；改不动就永远是玩具。**
+
+取消收敛验证（2026-09-17，用户 WSL）：`TestOwnLoop_CancelSilentUpstream` 检查静默生产者遵守 context 时读取取消；`TestOwnLoop_CancelFullOutput` 检查不消费输出、缓冲已满时取消仍能停止生产者并返回取消错误。连同 `TestOwnLoop_ContextCancelStops`，定向 3 个用例通过；同期完整回归 79 个顶层用例通过、0 失败、0 跳过，无超时，e2e 包 0.893s。静态检查也通过。
+
+重试预算验证（2026-09-17，用户 WSL）：`retry.TestRetryBudgetSharedAcrossCalls` 守护跨 Stream/Generate 的共享额度、恢复初始值和累计编号；`retry.TestRetryCancelDuringBackoff` 守护退避取消不追加请求，并保留上游错误与取消原因。定向 2 个及完整回归 81 个顶层用例通过，无失败或跳过，e2e 包 0.820s；静态检查也通过。
 
 ## 目录
 
@@ -18,6 +42,8 @@ test/
 可执行入口在 `cmd/fakemodel`（Go 不允许 import `package main`，所以库和入口分开）。
 
 ## 怎么用
+
+日常执行 `scripts/test-fast.sh`：成功只显示顶层用例通过/跳过数，跳过用例单独列出；失败保留完整输出和原退出码。需要排障时加 `-v` 查看完整日志。定向测试仍可用 `scripts/test-fast.sh -run RetryBudget`，无需默认加 `-v`。简洁输出改动尚待 WSL 实际运行。
 
 ### 1. 秒级回归（最常用）
 
@@ -64,9 +90,12 @@ scripts/reset-state.sh 3      # 只清 UserID 3
 
 **纯函数（不需要 Redis / 模型，永远跑）**
 
+另有 `internal/harness/agent/loop_test.go` 的假模型循环测试（文本、工具回灌、建流错误、取消、断流），以及 `guard/pipeline_test.go` 的工具策略测试（外部 Ask、内置执行、无审批处理器拒绝）。这里只确认代码存在，当前执行结果待 WSL 验证。
+
 | 用例 | 守住的不变量 |
 |---|---|
 | `TestProjectMessagesPairOrDrop` | 悬空的 `tool/result` 不进投影（pair-or-drop） |
+| `TestCompactionProjectionPreservesTailWithLegacyCheckpoint` | 摘要先于近期原文；旧 checkpoint 不能遮蔽未摘要尾部，全量与偏移投影一致 |
 | `TestProjectMessagesHonoursBaseSeq` | 折叠后数组下标 ≠ seq，遮蔽区间必须加偏移 |
 | `tokenmeter` 包的 6 个用例 | 中英文分档估算、工具参数也算进成本、预算自相矛盾会被修正、校准系数会移动且被夹住、裁剪不会把工具配对从中间切断 |
 | `retry` 包的 6 个用例 | 退避指数增长并夹上限、抖动留在 ±jitter 内、只重试"再试可能好"的错误（429/5xx/连接/超时）、参数错与鉴权错坚决不重试、混合消息以"不重试"优先、状态码解析 |
@@ -78,6 +107,8 @@ scripts/reset-state.sh 3      # 只清 UserID 3
 | 用例 | 守住的不变量 |
 |---|---|
 | `TestTurnAndLogInvariants` | 一轮对话落 `user/message` + `assistant/message`；`system/prompt` 只写 1 次 |
+| `TestCompactionPreservesRecentTurnsAndRebuildsFold` | 摘要输入含早期工具事实；近期整轮原文与配对保留；原日志不改；删除指针、旧缓存与二次压缩后历史正确 |
+| `TestCompactionSummaryFailureLeavesLogUnchanged` | 摘要器失败可辨，原日志和折叠水位不变 |
 | `TestSystemPromptWrittenOnlyOnce` | 3 轮之后 `system/prompt` 仍是 1 条（每轮重写会白涨日志） |
 | `TestToolCallResultsArePaired` | `tool/call` 与 `tool/result` 数量恒等，且每条 result 都能找到配对的 call；**step 边界闭合**（`step/start` == `step/end`，最后一步原因 = 结构化 `completed`） |
 | `TestApprovalSuspendsThenReallyExecutes` | 挂起时**必须带可执行命令**；批准前不许执行；批准后恰好执行 1 次；落审计；重复批准不重复执行 |
@@ -146,4 +177,4 @@ scripts/reset-state.sh 3      # 只清 UserID 3
 - **断言"模型收到了什么"**：`Server.Requests()` 已经在记录了（`RequestInfo`），
   目前还没写用例去断言 —— codex 的 `saw_function_call` / `function_call_output_text` 就是这个思路。
 - **快照测试**：把一轮完整的事件序列签成 golden 文件，改动后 diff（codex 用 `insta`）。
-- **`MaxHistory` 换成 token 预算**之后，在这里加"20 条短消息不压缩 / 5 条长文触发压缩"的用例。
+- 短消息不压缩与长消息触发压缩用例已经存在；接下来补“压缩后信息保真”的 R-1 验收。

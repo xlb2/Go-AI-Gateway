@@ -8,7 +8,9 @@ package subagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 
@@ -62,7 +64,7 @@ func SetRunner(r Runner) {
 
 // Result 子任务结果。
 type Result struct {
-	// Output 子 agent 的完整回复
+	// Output 已收到的回复；Err 非 nil 时只是部分结果，不能当作成功。
 	Output string
 	// Err 子任务失败原因（并行时单个任务失败不阻塞其他任务）
 	Err error
@@ -79,18 +81,22 @@ func Run(ctx context.Context, prompt string) (*Result, error) {
 	}
 	child, err := runner(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("子 agent 构造失败: %v", err)
+		return nil, fmt.Errorf("子 agent 构造失败: %w", err)
 	}
 	// 子 agent 内部再派活时深度 +1（它的工具 ctx 会带上这个值）
 	stream, err := child.Stream(withDepth(ctx, depthFrom(ctx)+1), []*schema.Message{schema.UserMessage(prompt)})
 	if err != nil {
-		return nil, fmt.Errorf("子 agent 推流失败: %v", err)
+		return nil, fmt.Errorf("子 agent 推流失败: %w", err)
 	}
+	defer stream.Close()
 	var out strings.Builder
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
-			break // 流结束
+			if !errors.Is(err, io.EOF) {
+				return &Result{Output: out.String(), Err: err}, err
+			}
+			break
 		}
 		if msg.Content != "" {
 			out.WriteString(msg.Content)
@@ -123,11 +129,11 @@ func RunParallel(ctx context.Context, tasks []string, maxConcurrent int) []Resul
 			defer wg.Done()
 			for idx := range taskCh {
 				// 每个任务写不同的 results[idx]，索引不重复，无数据竞争
-				if r, err := Run(ctx, tasks[idx]); err != nil {
-					results[idx] = Result{Err: err}
-				} else {
+				r, err := Run(ctx, tasks[idx])
+				if r != nil {
 					results[idx] = *r
 				}
+				results[idx].Err = err
 			}
 		}()
 	}

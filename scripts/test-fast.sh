@@ -16,7 +16,30 @@ set -euo pipefail
 # 纯函数单测散在各器官包里（比如 internal/harness/tokenmeter），
 # 只跑 ./test/... 会把它们静默漏掉：看着全绿，其实没测。
 #
-# awk 过滤掉"这个包没有测试文件"的噪声行：一次跑 30 个包会有 28 行
-# `?  ... [no test files]`，把真正的 ok/FAIL 淹掉，而看结果的人只需要一眼看到绿还是红。
-# 用 awk 而不是 grep -v：被过滤干净时 grep 会返回 1（没匹配），awk 永远返回 0。
-go test ./... -count=1 "$@" | awk '!/^\?/'
+# 显式 -v 保留排障日志；默认捕获详细输出，以便统计跳过且失败时不丢证据。
+for arg in "$@"; do
+    case "$arg" in
+        -v|-v=true|-test.v|-test.v=true|-json|-json=true)
+            go test ./... -count=1 "$@"
+            exit 0
+            ;;
+    esac
+done
+
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT
+if go test ./... -count=1 "$@" -v >"$log" 2>&1; then
+    awk '
+        /^--- PASS:/ { passed++ }
+        /^--- SKIP:/ { skipped++ }
+        /^[[:space:]]*--- SKIP:/ { print }
+        END {
+            printf "PASS: %d top-level tests passed, %d skipped\n", passed, skipped
+            if (passed == 0) print "WARNING: no top-level tests passed; check the filter."
+        }
+    ' "$log"
+else
+    status=$?
+    cat "$log"
+    exit "$status"
+fi

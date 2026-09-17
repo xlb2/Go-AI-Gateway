@@ -4,6 +4,9 @@
 #
 #   scripts/test-real.sh          # 全部 6 段（慢，几分钟，要真 key）
 #   scripts/test-real.sh pump     # 只跑第 6 段（灌对话逼压缩），改压缩逻辑后的快速回归
+#   scripts/test-real.sh compact  # 独立账号、随机事实、真实压缩证据与答案断言
+# compact 前用 MODEL_CONTEXT_WINDOW=4000 sh scripts/run-api.sh 启动服务。
+# 每次创建一个验收账号并保留其日志；最多填充 12 轮，失败退出非零。
 #
 # 前置：
 #   1) docker 容器 im_redis / im_rabbitmq / im_mysql 在跑

@@ -100,6 +100,13 @@ func main() {
 	if len(os.Args) > 1 {
 		only = os.Args[1]
 	}
+	if only == "compact" {
+		if err := verifyCompaction(); err != nil {
+			fmt.Fprintln(os.Stderr, "FAIL:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	pumpOnly := only == "pump"
 
 	c := dial()

@@ -1,5 +1,7 @@
 # Go-AI-Gateway
 
+> **能力边界（2026-09-17）**：已有自研循环、事件日志、审批与恢复基础。压缩保真、主会话执行前写入确认、失败与取消传播、共享重试预算已改进；用户 WSL 快速回归 81 个顶层用例通过、0 跳过，压缩事实保留单样例通过。日志续答不保证副作用恰好一次；并发审批、子任务日志归属与 MCP 审批后的原工具执行链仍待补齐，验证范围见 `test/README.md`。
+
 > **给每一家大模型，装上"手脚、记忆和安全阀"。**
 
 一个由 Go + Eino 打造的 **AI Agent 运行时（Harness）网关**。大多数框架只给你"模型 API"，我们给你的是**一个真正能干活的 Agent**——它会想、会调工具、记得跟你聊过什么、危险动作先问你批不批。
@@ -100,11 +102,11 @@
 docker compose up -d
 
 # 2. 起本地假模型（OpenAI 兼容替身，不需要真实 key）
-go run ./cmd/fakemodel
+scripts/fake-model.sh
 
 # 3. 另开终端，把模型指向假模型后启动网关
 #    .env 里改成：VOLC_BASE_URL=http://127.0.0.1:9099/api/v3
-go run ./cmd/api
+scripts/run-api.sh
 ```
 
 业务代码**一行不用改** —— 这正是把模型适配做成一条"缝"换来的好处。
@@ -137,7 +139,7 @@ $t = (Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/v1/user/log
 | `scripts/fake-model.sh` | 起假模型（让整个服务跑在确定性场景上） | — |
 | `scripts/test-real.sh [pump]` | 真模型端到端 6 段冒烟（`pump` 只跑"灌对话逼压缩"） | 几分钟 |
 | `scripts/reset-state.sh [uid]` | 重置 `agent:*` 键与审批审计产物，从干净状态开始 | — |
-| `go run ./cmd/probe validate` | 体检存量日志：不变量违规 + 格式版本（只读） | 秒级 |
+| `scripts/build.sh` 后执行 `./bin/gwprobe validate`（Windows 产物带 `.exe`，以脚本输出为准） | 体检存量日志：不变量违规 + 格式版本（只读） | 秒级 |
 
 测试覆盖的不变量（`test/e2e` 26 个 + `sandbox` 14 个、`tokenmeter` / `retry` 各 6 个、`metrics` 4 个纯函数用例）：
 
@@ -302,14 +304,13 @@ docker run --rm --read-only alpine:3.20 touch /x || echo "✅ 根文件系统只
 
 ## Roadmap
 
-> 未完成前不会出现在"核心能力"里，绝不透支信用。
-> 完整清单（每条带优先级 / 为什么 / 对比 dsh+codex / 如何做 / 验收）见 `HARNESS-TODO.md`。
+> 功能实现与已验证范围分别记录。工作区完整清单见仓库外的 `../HARNESS-TODO.md`（它不随仓库分发），测试范围见 `test/README.md`。
 
-- **Step-level Checkpoint** —— 现在是轮次级日志，还缺"每跑完一个 step 存快照 + resume"（开放轮次修复已经能认出中断的轮次，是它的前置）。
+- **可靠性** —— step 事件、Repair 与日志续答已有基础实现；优先补压缩保真、持久化确认、结束原因传播、审批并发与未知结果处置。
 - **策略配置化 / 审批升级链** —— guard 规则与 hooks 现在都是编译期注册，加一条策略要改代码重启；命令种类够多之后再做"批准即落规则"的升级链。
-- **MCP 真连一次** —— 代码在、从未真连过。
+- **MCP 执行闭环** —— 连接与工具发现已有历史验证；批准后执行原调用仍未闭环。
 - **Web Console** —— 版本化双向协议驱动 agent，审批/进度可视化（app-server 协议已具备）。
-- **Observability 深化** —— 直方图指标（现在只有总量，看不到 P50/P99）+ 多模型路由。
+- **真实任务评测** —— 已有耗时直方图；后续围绕确定的用途记录任务质量、成本、耗时与人工接管，用途尚未定案。
 
 ---
 

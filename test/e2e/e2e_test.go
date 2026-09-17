@@ -519,6 +519,11 @@ func TestLongMessagesTriggerCompaction(t *testing.T) {
 		t.Fatal("压缩后应该推进折叠水位（session/checkpoint）")
 	}
 
+	// RunAgentTurn 在追加当前轮之前压缩；检查压后预算前再压一次，
+	// 避免把刚追加的新轮次也算作“压完仍超限”。
+	if err := e.h.Sessions.Compact(e.ctx(), e.uid, agent.Summarize); err != nil {
+		t.Fatalf("最终压缩失败: %v", err)
+	}
 	// 压缩要真的把窗口收回来，而不是"记了一笔摘要，历史照样全喂"
 	hist, err := e.h.Sessions.GetHistory(e.ctx(), e.uid)
 	if err != nil {
@@ -891,14 +896,17 @@ func TestInterruptedStreamIsMarked(t *testing.T) {
 	e.h = e.newHarness(&recordingExecutor{})
 
 	// 场景规则：包含"掐断"就让假模型发一片内容后把流弄坏
-	e.run("掐断")
+	partial, runErr := e.h.RunAgentTurn(e.ctx(), e.uid, "掐断", nil)
+	if runErr == nil || partial == "" {
+		t.Fatalf("中断必须返回部分回复及错误: reply=%q err=%v", partial, runErr)
+	}
 
 	marked := false
 	for _, dto := range e.log() {
 		if dto.Type == session.EventAssistantMessage && dto.Interrupted {
 			marked = true
 		}
-		if dto.Type == session.EventTurnEnd && dto.Content == "completed" {
+		if dto.Type == session.EventTurnEnd && strings.Contains(dto.Content, "completed") {
 			t.Fatal("被中断的轮次写了 completed 收尾 —— 等于假装这轮正常结束了，Repair 就再也认不出它")
 		}
 	}

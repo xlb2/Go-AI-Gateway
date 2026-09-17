@@ -370,12 +370,13 @@ func (h *Harness) runLoop(ctx context.Context, userID uint, fullMessages []*sche
 	//    走 agent.Loop 这道缝（阶段 2.2 起唯一实现是自研循环）——替换循环时这里一行不用改。
 	agentRunner, err := agent.NewLoop(ctx)
 	if err != nil {
-		return "", fmt.Errorf("组装 agent 失败: %v", err)
+		return "", fmt.Errorf("组装 agent 失败: %w", err)
 	}
 	responseStream, err := agentRunner.Stream(ctx, fullMessages)
 	if err != nil {
-		return "", fmt.Errorf("推流失败: %v", err)
+		return "", fmt.Errorf("推流失败: %w", err)
 	}
+	defer responseStream.Close()
 
 	// 4. 流式接收：转发给前端 + 攒完整回复；顺手收下模型返回的真实 token 用量
 	//
@@ -392,13 +393,15 @@ func (h *Harness) runLoop(ctx context.Context, userID uint, fullMessages []*sche
 	// 旧实现是 `usage = ...` 覆盖 —— 多步对话只记到最后一步，token 花费被系统性低估。
 	var (
 		firstPrompt, lastPrompt, promptTotal, completionTotal int
-		sawUsage                                             bool
+		sawUsage                                              bool
 	)
 	interrupted := false
+	var streamErr error
 	for {
 		msg, err := responseStream.Recv()
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
+				streamErr = err
 				interrupted = true
 				fmt.Printf(" [中断] 流被切断（非正常结束）: %v\n", err)
 				metrics.Default.Inc("turns_interrupted_total")
@@ -452,16 +455,17 @@ func (h *Harness) runLoop(ctx context.Context, userID uint, fullMessages []*sche
 	reply := aiFullResponse.String()
 	if reply != "" {
 		if err := h.Sessions.SaveReply(ctx, userID, reply, interrupted); err != nil {
-			return "", err
+			return reply, errors.Join(streamErr, err)
 		}
 	}
 	if !interrupted {
 		_ = h.Sessions.AppendEvent(ctx, userID, session.MemoryDTO{
-			Type: session.EventTurnEnd, Role: "system", Content: "completed",
+			Type: session.EventTurnEnd, Role: "system",
+			Content: session.TurnEndContent(session.TurnCompleted, ""),
 		})
 	}
 	hooks.RunPost(ctx, userID, reply)
-	return reply, nil
+	return reply, streamErr
 }
 
 // ResumeTurn 接着跑上一轮被崩溃打断的对话（P3-1 的落点）。

@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/eino/components/model"
@@ -97,6 +98,7 @@ type Config struct {
 }
 
 // Wrap 把一个 ChatModel 包成"带重试"的模型。
+// 包装器实例拥有共享重试预算；每个新轮次应创建新实例，不跨独立轮次复用。
 //
 // 用嵌入而不是重写接口：BindTools 之类的其余方法原样透传，
 // 以后 Eino 给 ChatModel 加方法也不用改这里。
@@ -107,32 +109,34 @@ func Wrap(inner model.ChatModel, cfg Config) model.ChatModel {
 	if cfg.Policy.MaxAttempts <= 0 {
 		cfg.Policy = DefaultPolicy()
 	}
-	return &retrying{ChatModel: inner, cfg: cfg}
+	return &retrying{ChatModel: inner, cfg: cfg, used: max(0, cfg.InitialAttempt)}
 }
 
 type retrying struct {
 	// 匿名字段（嵌入）：没被覆写的方法（BindTools 等）自动透传，
 	// 以后 Eino 给 ChatModel 加方法也不用改这里。
 	model.ChatModel
-	cfg Config
+	cfg  Config
+	mu   sync.Mutex
+	used int
 }
 
 // Generate 全有或全无的一次调用，可以整体重试。
 func (r *retrying) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
 	var lastErr error
-	for attempt := 0; ; attempt++ {
+	for {
 		out, err := r.ChatModel.Generate(ctx, input, opts...)
 		if err == nil {
 			return out, nil
 		}
 		lastErr = err
-		if !r.shouldRetry(ctx, err, attempt) {
+		number, ok := r.reserveRetry(ctx, err)
+		if !ok {
 			return nil, err
 		}
-		if err := r.pause(ctx, attempt+1, err); err != nil {
-			// 调用方取消了：把**原始错误**返回，而不是 ctx 的错误 ——
-			// 排查的人需要知道"是上游 503 之后用户关掉了页面"，不是只看到 context canceled。
-			return nil, lastErr
+		if err := r.pause(ctx, number, err); err != nil {
+			// 保留上游故障与取消原因，调用方仍可用 errors.Is 判断取消。
+			return nil, errors.Join(lastErr, err)
 		}
 	}
 }
@@ -143,34 +147,38 @@ func (r *retrying) Generate(ctx context.Context, input []*schema.Message, opts .
 // 那时用户可能已经看到半截回复，重试会造成重复输出。流中途断掉由 P1-2 的中断语义处理。
 func (r *retrying) Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
 	var lastErr error
-	for attempt := 0; ; attempt++ {
+	for {
 		sr, err := r.ChatModel.Stream(ctx, input, opts...)
 		if err == nil {
 			return sr, nil
 		}
 		lastErr = err
-		if !r.shouldRetry(ctx, err, attempt) {
+		number, ok := r.reserveRetry(ctx, err)
+		if !ok {
 			return nil, err
 		}
-		if err := r.pause(ctx, attempt+1, err); err != nil {
-			return nil, lastErr
+		if err := r.pause(ctx, number, err); err != nil {
+			return nil, errors.Join(lastErr, err)
 		}
 	}
 }
 
-// shouldRetry 是否还要再试一次。attempt 是"已经重试过的次数"。
-func (r *retrying) shouldRetry(ctx context.Context, err error, attempt int) bool {
-	// 预算按"本轮已用掉的重试数 + 本次已重试数"算：同一轮里 agent 会调模型很多次
+// reserveRetry 在整个包装器实例上预留一次重试；退避期间取消也不退还额度。
+func (r *retrying) reserveRetry(ctx context.Context, err error) (int, bool) {
+	// used 从恢复值初始化并持续累加：同一轮里 agent 会调模型很多次
 	// （每次工具调用之后都要调一次），预算是整轮的，不是每次调用的 —— 否则
 	// 一个坏上游能让你重试 5 次 × N 次模型调用。
-	if r.cfg.InitialAttempt+attempt >= r.cfg.Policy.MaxAttempts {
-		return false
-	}
 	// 调用方已经取消 / 超时：再退避下去只是占着资源不放。
-	if ctx.Err() != nil {
-		return false
+	if ctx.Err() != nil || !IsRetryable(err) {
+		return 0, false
 	}
-	return IsRetryable(err)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.used >= r.cfg.Policy.MaxAttempts {
+		return 0, false
+	}
+	r.used++
+	return r.used, true
 }
 
 // pause 退避等待；期间若 ctx 被取消则返回错误。
