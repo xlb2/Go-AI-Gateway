@@ -1,9 +1,9 @@
 // cmd/resume —— 续跑演示：把一个"被崩溃打断的轮次"接着跑完（P3-1 的落点）。
 //
 // 用法：
-//  1) 起服务（真模型）：scripts/run-api.sh
-//  2) 让它跑一轮，中途 kill -9 掉（留下"开放轮次"）
-//  3) bin/gwresume.exe <userID>   ← 本工具：检出开放轮次 → Repair → 从投影历史续跑
+//  1. 起服务（真模型）：scripts/run-api.sh
+//  2. 让它跑一轮，中途 kill -9 掉（留下"开放轮次"）
+//  3. bin/gwresume.exe <userID>   ← 本工具：检出开放轮次 → Repair → 从投影历史续跑
 //
 // 关键：它**不新增用户消息** —— 这正是"续跑"与"把话重发一遍"的区别。
 // 已完成的工具调用与结果从日志投影出来喂给模型，所以已发生的副作用不会被重放。
@@ -19,12 +19,11 @@ import (
 
 	"go_im_gateway/internal/config"
 	"go_im_gateway/internal/harness"
-	"go_im_gateway/internal/harness/agent"
 	"go_im_gateway/internal/harness/approval"
 	"go_im_gateway/internal/harness/hooks"
+	"go_im_gateway/internal/harness/mcp"
 	"go_im_gateway/internal/harness/session"
 	"go_im_gateway/internal/harness/spill"
-	"go_im_gateway/internal/harness/subagent"
 )
 
 func main() {
@@ -51,14 +50,15 @@ func main() {
 	approval.Init(rdb)
 	spill.Init(rdb)
 	hooks.RegisterDefaultHooks()
-	// 子 agent 构造器（和 cmd/api 一样必须注入）：续跑时模型可能又要派活，
-	// 不注入的话 delegate_* 会直接失败（这个坑第一次演示就踩到了）。
-	subagent.SetRunner(func(ctx context.Context) (subagent.ChildAgent, error) {
-		return agent.NewLoop(ctx)
-	})
-
-	h := harness.New()
 	ctx := context.WithValue(context.Background(), "user_id", userID)
+	if err := mcp.ConnectFromEnv(ctx); err != nil {
+		fmt.Printf("MCP 连接失败（忽略，继续续跑）: %v\n", err)
+	}
+	h, err := harness.NewFromEnv(ctx)
+	if err != nil {
+		fmt.Println("Harness 装配失败:", err)
+		os.Exit(1)
+	}
 
 	closed, open, err := h.Sessions.ResumePoint(ctx, userID)
 	if err != nil {

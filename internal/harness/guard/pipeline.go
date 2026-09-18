@@ -93,11 +93,12 @@ type AskHandler func(ctx context.Context, call Call, reason string) (string, err
 //	execute      真执行：超时 + 指标包住，失败不炸对话
 //	post-execute 结果处理：脱敏/截断后再交给模型
 type Pipeline struct {
-	pre     []Check
-	guards  []Check
-	post    []PostFunc
-	ask     AskHandler
-	timeout time.Duration
+	pre         []Check
+	guards      []Check
+	post        []PostFunc
+	ask         AskHandler
+	timeout     time.Duration
+	toolTimeout func(string) time.Duration
 	// retries 默认 0：工具调用大多有副作用（写文件/发请求），
 	// 失败就重试等于把副作用做两遍。只有确认幂等的工具才该开重试。
 	retries int
@@ -106,9 +107,10 @@ type Pipeline struct {
 // NewPipeline 构造一条带内置守卫的流水线。
 func NewPipeline(ask AskHandler) *Pipeline {
 	p := &Pipeline{
-		ask:     ask,
-		timeout: defaultToolTimeout,
-		retries: 0,
+		ask:         ask,
+		timeout:     defaultToolTimeout,
+		toolTimeout: toolTimeoutFor,
+		retries:     0,
 	}
 	p.Guard(guardApprovalRequired) // 安全不变量：登记过的工具必须走审批
 	p.Guard(guardExternalTools)    // 安全不变量：外部（MCP）工具必须走审批
@@ -236,8 +238,10 @@ func (g *gatedTool) execute(ctx context.Context, call Call, args string, opts ..
 	if timeout <= 0 {
 		timeout = defaultToolTimeout
 	}
-	if d := toolTimeoutFor(call.Tool); d > 0 {
-		timeout = d
+	if p.toolTimeout != nil {
+		if d := p.toolTimeout(call.Tool); d > 0 {
+			timeout = d
+		}
 	}
 	var lastErr error
 	for attempt := 0; attempt <= p.retries; attempt++ {
@@ -324,6 +328,14 @@ func TrustExternalServer(server string) {
 // guardExternalTools 外部（MCP）工具默认必须人工审批：
 // 它们的实现不在本项目里，不能默认当成自己人。
 func guardExternalTools(_ context.Context, call Call) Verdict {
+	return checkExternalTool(call, func(server string) bool {
+		trustedMu.RLock()
+		defer trustedMu.RUnlock()
+		return trustedExternalServers[server]
+	})
+}
+
+func checkExternalTool(call Call, isTrusted func(string) bool) Verdict {
 	if len(call.Tool) <= len(externalToolPrefix) || call.Tool[:len(externalToolPrefix)] != externalToolPrefix {
 		return allow()
 	}
@@ -335,10 +347,7 @@ func guardExternalTools(_ context.Context, call Call) Verdict {
 			break
 		}
 	}
-	trustedMu.RLock()
-	trusted := trustedExternalServers[server]
-	trustedMu.RUnlock()
-	if trusted {
+	if isTrusted(server) {
 		return allow()
 	}
 	return ask(fmt.Sprintf("外部 MCP 工具（server=%s）默认需人工审批", server))

@@ -1,6 +1,48 @@
 # test/ — 假模型与端到端测试
 
+2026-09-18 用户验收：Runtime 定向 4、全量 97 顶层用例通过，0 跳过；test-real.sh 六段跑完，显示子任务响应、显式 spill 存取、防御两步审批执行（审计追加 68 字节、退出码 0）和 10 轮响应。第 5 段不能单凭定位符回复证明自动 spill，第 6 段不证明压缩/Repair；未提供重建启动日志，服务构建版本未独立核实。上述为用户终端证据，不扩大成所有机制的验收。
+
+统一装配最新结果：用户重跑 `scripts/test-fast.sh -run Runtime`（4 个）与完整回归（97 个顶层用例）全部通过，0 跳过；覆盖下方断言修正后的待验状态。API 重建后的真模型验收仍待执行。
+
+统一装配纠错：用户 17:58 定向/全量均在 TestRuntimeDefaultAssembly 的最终文本断言失败，其他三个 Runtime 用例通过。已按现有假模型 afterToolResult 行为补上“（据工具结果）”前缀，仍做精确比较；后面的父事件、请求数和工具清单检查在此次失败中尚未执行。修正后待 WSL 重验。
+
+统一装配验证：上一批用户 WSL 存储定向 3、全量 93 个顶层用例通过，0 跳过。本轮新增以下 4 个 Runtime 用例，静态检查通过，运行待 WSL；可执行 `scripts/test-fast.sh -run Runtime` 后跑全量。
+
+| 新增用例 | 守护的不变量 |
+|---|---|
+| `assembly/TestRuntimeHarnessAssemblyIsIsolated` | 两个完整 Harness 各跑两轮：主/子/摘要模型、归档、扩展工具、重试与事件归属独立；子重试不污染父日志；工具切片修改不影响实例 |
+| `assembly/TestRuntimeRejectsInvalidAssembly` | 内置工具重名在构造时拒绝，工厂返回空模型/摘要模型时明确报错 |
+| `assembly/TestRuntimeZeroRetryDoesNotRetry` | 显式零重试策略遇到 429 只请求一次，不被包装器默认值覆盖 |
+| `e2e/TestRuntimeDefaultAssembly` | 新默认入口通过真 SDK/假模型/真 Redis 完成主→子→主，工具正确绑定、父事件不混入子 step；环境后改不改变已装配模型 |
+
+最新验证：用户 WSL guard 定向 3 个、完整回归 90 个顶层用例通过，0 跳过。本轮存储装配测试静态检查通过，运行待 WSL。
+
+| 新增用例（`assembly/storage_test.go`） | 守护的不变量 |
+|---|---|
+| `TestStorageToolsKeepStoresSeparate` | 两套归档/提案/外存读写使用所属 Store；guard Ask 写同一审批库且不执行工具；用户标识保留 |
+| `TestStorageToolsAutomaticSpillUsesConfiguredStore` | 自动外存使用传入 Store，调用标识保留，外存失败不丢完整结果 |
+| `TestStorageToolsRejectMissingStores` | 任一存储缺失在构造时拒绝 |
+
+最新补充：用户 WSL 委派定向 2 个、完整回归 87 个顶层用例通过，0 跳过。本轮 guard 测试仅静态检查通过，待 WSL 运行。
+
+| 新增用例（`assembly/guard_test.go`） | 守护的不变量 |
+|---|---|
+| `TestConfiguredGuardPoliciesAreIsolated` | 两个实例的审批/信任独立；原 map 修改不改变实例；无法审批时不执行 |
+| `TestConfiguredGuardTimeoutsAreIsolated` | 工具收到所属实例的默认/覆盖截止时间，配置 map 修改不影响旧实例 |
+| `TestConfiguredGuardRejectsInvalidConfiguration` | 非法超时、空工具名和空服务器名在构造时拒绝 |
+
+最新验证：用户确认迁移后完整回归 85 个顶层用例通过、0 跳过，覆盖下方迁移后待验状态。本轮新增委派装配测试，静态检查通过，运行待 WSL；此前 85 用例不覆盖本轮新增内容。
+
+| 新增用例（`assembly/delegation_test.go`） | 守护的不变量 |
+|---|---|
+| `TestDelegationToolsKeepFactoriesSeparate` | 两套委派工具在单任务与并行任务中使用各自的子循环工厂 |
+| `TestDelegationToolsRejectMissingConfiguration` | 缺失工厂、非正并发上限明确拒绝；空 Runner 调用返回错误 |
+
 ## 验证状态的读法（2026-09-17）
+
+目录约定：新增测试统一放本目录，按主题拆分；F-1 测试位于 `assembly/config_test.go` 和 `assembly/dependencies_test.go`，通过公开构造与运行入口验证。历史 `internal/` 包内测试暂保留，后续迁移不得丢覆盖。F-1 迁移前用户 WSL 定向 4 个、完整 85 个顶层用例通过、0 跳过；迁移后仅静态检查通过，待 WSL 重验。
+
+F-1 第一批（待 WSL）：新增 `TestConfiguredLoopsKeepDependenciesSeparate`、`TestConfiguredLoopRejectsMissingDependencies`、`TestHarnessDependenciesAreInstanceScoped`、`TestHarnessDependenciesRejectMissing`。检查显式装配的模型/工具/事件写入、工具切片快照、缺少依赖时报错，以及两个 Harness 实例的循环/摘要/提示词工具清单和回复存储归属。静态检查通过，先前 81 用例记录不覆盖本轮。完整默认内置工具与子任务实例隔离尚未实现，不由这些用例作保证。
 
 本文记录测试意图。最新验证：2026-09-17 15:24 用户在 WSL 对本轮未提交工作区执行压缩定向回归与 `scripts/test-fast.sh -v`，完整回归 72 个顶层用例通过、0 失败、0 跳过，e2e 包耗时 0.814s（假模型 + 真 Redis）。本地静态检查也通过；这不代表真模型摘要质量已经验证。
 

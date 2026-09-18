@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/components/tool/utils"
@@ -63,29 +62,32 @@ type DefenseParams struct {
 }
 
 // ArchivalSearchTool 记忆检索工具：滑动窗口里找不到答案时，模型可以主动调用它查更早的历史。
-var ArchivalSearchTool, _ = utils.InferTool(
-	"search_memory_archive",
-	"当用户提到较早之前说过的话、当前对话上下文里找不到时，调用此工具检索完整历史记录。",
-	func(ctx context.Context, params *ArchivalSearchParams) (string, error) {
-		userID, err := getUserID(ctx)
-		if err != nil {
-			return "", err
-		}
-		var store session.RedisStore
-		results, err := store.SearchArchival(ctx, userID, params.Query, session.ArchiveDefaultTopK)
-		if err != nil {
-			return "", fmt.Errorf("归档检索失败: %v", err)
-		}
-		if len(results) == 0 {
-			return "未在历史记录中找到相关内容。", nil
-		}
-		var sb string
-		for i, msg := range results {
-			sb += fmt.Sprintf("%d. [%s] %s\n", i+1, msg.Role, msg.Content)
-		}
-		return "检索到以下历史记录：\n" + sb, nil
-	},
-)
+var ArchivalSearchTool, _ = newArchivalSearchTool(session.RedisStore{})
+
+func newArchivalSearchTool(store session.Store) (tool.InvokableTool, error) {
+	return utils.InferTool(
+		"search_memory_archive",
+		"当用户提到较早之前说过的话、当前对话上下文里找不到时，调用此工具检索完整历史记录。",
+		func(ctx context.Context, params *ArchivalSearchParams) (string, error) {
+			userID, err := getUserID(ctx)
+			if err != nil {
+				return "", err
+			}
+			results, err := store.SearchArchival(ctx, userID, params.Query, session.ArchiveDefaultTopK)
+			if err != nil {
+				return "", fmt.Errorf("归档检索失败: %v", err)
+			}
+			if len(results) == 0 {
+				return "未在历史记录中找到相关内容。", nil
+			}
+			var sb string
+			for i, msg := range results {
+				sb += fmt.Sprintf("%d. [%s] %s\n", i+1, msg.Role, msg.Content)
+			}
+			return "检索到以下历史记录：\n" + sb, nil
+		},
+	)
+}
 
 // sanitizeThreatLevel 把模型给的威胁等级收敛到白名单。
 // 为什么必须做：这个值会被拼进 shell 命令（防御动作的审计落盘），
@@ -140,32 +142,35 @@ func defenseExecProposal(level, emotion string) sandbox.Request {
 // 高危动作并挂起（写 ApprovalStore），等管理员输入 auth:approve / auth:reject 审批。
 // 注意提案里带上了批准后要跑的命令——批准之后就交给沙箱器官真实执行，
 // 不再是"打印一行日志假装执行"（对应 dsh 决策链的 ask→approval→execute）。
-var DefenseTool, _ = utils.InferTool(
-	"execute_system_defense",
-	"当用户愤怒抱怨或发出攻击性指令时调用此工具，起草一个防御动作并挂起，等管理员审批后才真正执行。",
-	func(ctx context.Context, params *DefenseParams) (string, error) {
-		userID, err := getUserID(ctx)
-		if err != nil {
-			return "", err
-		}
-		level := sanitizeThreatLevel(params.ThreatLevel)
-		pending := approval.PendingAction{
-			Action: "execute_system_defense",
-			Param:  params.Emotion,
-			Reason: fmt.Sprintf("检测到情绪=%s、威胁等级=%s，需封禁并留痕", params.Emotion, level),
-			Plan:   defenseExecProposal(level, params.Emotion),
-			// 可选项由**提案方**决定（P2-2）：现在是"批准 / 拒绝"两个，
-			// 将来加"仅本次允许 / 永久封禁"就往这个数组里加，交互协议不用动。
-			AvailableDecisions: []string{"approve", "reject"},
-			RequestedAt:        time.Now(),
-		}
-		store := approval.RedisStore{}
-		if err := store.SetPending(ctx, userID, pending); err != nil {
-			return "", fmt.Errorf("挂起防御动作失败: %v", err)
-		}
-		return fmt.Sprintf("⚠️ 防御动作已起草并挂起，等待管理员审批。\n提案：向审计文件追加一条封禁记录（level=%s）。\n请管理员输入 auth:approve 执行，或 auth:reject 取消。", level), nil
-	},
-)
+var DefenseTool, _ = newDefenseTool(approval.RedisStore{})
+
+func newDefenseTool(store approval.Store) (tool.InvokableTool, error) {
+	return utils.InferTool(
+		"execute_system_defense",
+		"当用户愤怒抱怨或发出攻击性指令时调用此工具，起草一个防御动作并挂起，等管理员审批后才真正执行。",
+		func(ctx context.Context, params *DefenseParams) (string, error) {
+			userID, err := getUserID(ctx)
+			if err != nil {
+				return "", err
+			}
+			level := sanitizeThreatLevel(params.ThreatLevel)
+			pending := approval.PendingAction{
+				Action: "execute_system_defense",
+				Param:  params.Emotion,
+				Reason: fmt.Sprintf("检测到情绪=%s、威胁等级=%s，需封禁并留痕", params.Emotion, level),
+				Plan:   defenseExecProposal(level, params.Emotion),
+				// 可选项由**提案方**决定（P2-2）：现在是"批准 / 拒绝"两个，
+				// 将来加"仅本次允许 / 永久封禁"就往这个数组里加，交互协议不用动。
+				AvailableDecisions: []string{"approve", "reject"},
+				RequestedAt:        time.Now(),
+			}
+			if err := store.SetPending(ctx, userID, pending); err != nil {
+				return "", fmt.Errorf("挂起防御动作失败: %v", err)
+			}
+			return fmt.Sprintf("⚠️ 防御动作已起草并挂起，等待管理员审批。\n提案：向审计文件追加一条封禁记录（level=%s）。\n请管理员输入 auth:approve 执行，或 auth:reject 取消。", level), nil
+		},
+	)
+}
 
 // DelegateParams delegate_task 工具的入参
 type DelegateParams struct {
@@ -174,17 +179,21 @@ type DelegateParams struct {
 
 // DelegateTool 子智能体工具：主 agent 把可拆分的独立子任务派给子智能体执行，
 // 子任务上下文与主对话隔离，只把结果带回来（对应 HARNESS-STUDY M8）。
-var DelegateTool, _ = utils.InferTool(
-	"delegate_task",
-	"当任务可以拆成独立的子任务、且不需要主对话上下文时调用，派一个子智能体去执行并返回结果。",
-	func(ctx context.Context, params *DelegateParams) (string, error) {
-		res, err := subagent.Run(ctx, params.Task)
-		if err != nil {
-			return "", fmt.Errorf("子智能体执行失败: %v", err)
-		}
-		return res.Output, nil
-	},
-)
+var DelegateTool, _ = newDelegateTool(subagent.Run)
+
+func newDelegateTool(run func(context.Context, string) (*subagent.Result, error)) (tool.InvokableTool, error) {
+	return utils.InferTool(
+		"delegate_task",
+		"当任务可以拆成独立的子任务、且不需要主对话上下文时调用，派一个子智能体去执行并返回结果。",
+		func(ctx context.Context, params *DelegateParams) (string, error) {
+			res, err := run(ctx, params.Task)
+			if err != nil {
+				return "", fmt.Errorf("子智能体执行失败: %v", err)
+			}
+			return res.Output, nil
+		},
+	)
+}
 
 // SpillSaveParams store_large_content 工具的入参
 type SpillSaveParams struct {
@@ -193,22 +202,25 @@ type SpillSaveParams struct {
 }
 
 // SaveLargeContentTool 溢出存储工具：把大段内容存起来，只把定位符 + 取回指引给模型（M7 spill）。
-var SaveLargeContentTool, _ = utils.InferTool(
-	"store_large_content",
-	"当需要保存一段很长的内容(如大段文本/长文章)、不想每次都占用对话上下文时调用，返回一个定位符。",
-	func(ctx context.Context, params *SpillSaveParams) (string, error) {
-		userID, err := getUserID(ctx)
-		if err != nil {
-			return "", err
-		}
-		store := spill.RedisStore{}
-		ref, err := store.SaveText(ctx, userID, params.Name, params.Content)
-		if err != nil {
-			return "", fmt.Errorf("溢出存储失败: %v", err)
-		}
-		return fmt.Sprintf("已保存(%d 字节)。%s", ref.Bytes, ref.RetrievalHint), nil
-	},
-)
+var SaveLargeContentTool, _ = newSaveLargeContentTool(spill.RedisStore{})
+
+func newSaveLargeContentTool(store spill.Store) (tool.InvokableTool, error) {
+	return utils.InferTool(
+		"store_large_content",
+		"当需要保存一段很长的内容(如大段文本/长文章)、不想每次都占用对话上下文时调用，返回一个定位符。",
+		func(ctx context.Context, params *SpillSaveParams) (string, error) {
+			userID, err := getUserID(ctx)
+			if err != nil {
+				return "", err
+			}
+			ref, err := store.SaveText(ctx, userID, params.Name, params.Content)
+			if err != nil {
+				return "", fmt.Errorf("溢出存储失败: %v", err)
+			}
+			return fmt.Sprintf("已保存(%d 字节)。%s", ref.Bytes, ref.RetrievalHint), nil
+		},
+	)
+}
 
 // SpillLoadParams load_large_content 工具的入参
 type SpillLoadParams struct {
@@ -216,18 +228,21 @@ type SpillLoadParams struct {
 }
 
 // LoadLargeContentTool 溢出取回工具：按定位符取回之前保存的大段内容。
-var LoadLargeContentTool, _ = utils.InferTool(
-	"load_large_content",
-	"用定位符取回之前保存的大段内容。",
-	func(ctx context.Context, params *SpillLoadParams) (string, error) {
-		store := spill.RedisStore{}
-		content, err := store.LoadText(ctx, params.Locator)
-		if err != nil {
-			return "", err
-		}
-		return content, nil
-	},
-)
+var LoadLargeContentTool, _ = newLoadLargeContentTool(spill.RedisStore{})
+
+func newLoadLargeContentTool(store spill.Store) (tool.InvokableTool, error) {
+	return utils.InferTool(
+		"load_large_content",
+		"用定位符取回之前保存的大段内容。",
+		func(ctx context.Context, params *SpillLoadParams) (string, error) {
+			content, err := store.LoadText(ctx, params.Locator)
+			if err != nil {
+				return "", err
+			}
+			return content, nil
+		},
+	)
+}
 
 // DelegateTasksParams delegate_tasks 工具的入参
 type DelegateTasksParams struct {
@@ -236,23 +251,46 @@ type DelegateTasksParams struct {
 
 // DelegateTasksTool 并行子智能体工具：把多个互相独立的子任务并行派发，
 // 按输入顺序返回每个任务的结果（对应 M8 的"并行拆任务"）。
-var DelegateTasksTool, _ = utils.InferTool(
-	"delegate_tasks",
-	"当有多个互相独立的子任务可以同时做时调用，并行派发给多个子智能体，返回按顺序排列的每个任务结果。",
-	func(ctx context.Context, params *DelegateTasksParams) (string, error) {
-		results := subagent.RunParallel(ctx, params.Tasks, 4)
-		var sb strings.Builder
-		for i, r := range results {
-			sb.WriteString(fmt.Sprintf("任务%d: ", i+1))
-			if r.Err != nil {
-				sb.WriteString("失败(" + r.Err.Error() + ")\n")
-			} else {
-				sb.WriteString(r.Output + "\n")
+var DelegateTasksTool, _ = newDelegateTasksTool(subagent.RunParallel, 4)
+
+func newDelegateTasksTool(run func(context.Context, []string, int) []subagent.Result, concurrency int) (tool.InvokableTool, error) {
+	return utils.InferTool(
+		"delegate_tasks",
+		"当有多个互相独立的子任务可以同时做时调用，并行派发给多个子智能体，返回按顺序排列的每个任务结果。",
+		func(ctx context.Context, params *DelegateTasksParams) (string, error) {
+			results := run(ctx, params.Tasks, concurrency)
+			var sb strings.Builder
+			for i, r := range results {
+				sb.WriteString(fmt.Sprintf("任务%d: ", i+1))
+				if r.Err != nil {
+					sb.WriteString("失败(" + r.Err.Error() + ")\n")
+				} else {
+					sb.WriteString(r.Output + "\n")
+				}
 			}
-		}
-		return sb.String(), nil
-	},
-)
+			return sb.String(), nil
+		},
+	)
+}
+
+// NewDelegationTools 绑定子任务工厂和并发上限。返回的工具仍须由调用方包装 guard。
+func NewDelegationTools(runner subagent.Runner, maxConcurrent int) ([]tool.InvokableTool, error) {
+	if runner == nil {
+		return nil, fmt.Errorf("delegation runner is required")
+	}
+	if maxConcurrent <= 0 {
+		return nil, fmt.Errorf("delegation concurrency must be positive")
+	}
+	single, err := newDelegateTool(runner.Run)
+	if err != nil {
+		return nil, err
+	}
+	parallel, err := newDelegateTasksTool(runner.RunParallel, maxConcurrent)
+	if err != nil {
+		return nil, err
+	}
+	return []tool.InvokableTool{single, parallel}, nil
+}
 
 // 说明：tool/call + tool/result 的落盘以前靠 Eino 的 MessageModifier 钩子（下标差分），
 // 阶段 2.2 换成自研循环后，改由 loop.go 的 executeTools 直接落盘 —— 钩子已删除。
@@ -283,10 +321,13 @@ const spillThreshold = 2000
 // 避免大内容把记忆日志和模型上下文撑爆；模型需要时可调 load_large_content 取回。
 // spill 失败则回退存完整内容（best-effort）。
 func memoryDTOFromToolResult(ctx context.Context, msg *schema.Message) session.MemoryDTO {
+	return toolResultWithStore(ctx, msg, spill.RedisStore{})
+}
+
+func toolResultWithStore(ctx context.Context, msg *schema.Message, store spill.Store) session.MemoryDTO {
 	content := msg.Content
 	if len([]rune(content)) > spillThreshold {
 		if userID, err := getUserID(ctx); err == nil {
-			store := spill.RedisStore{}
 			if ref, err := store.SaveText(ctx, userID, "tool_result", content); err == nil {
 				content = fmt.Sprintf("（工具结果过大已外存）定位符: %s；需要时用 load_large_content 工具取回", ref.Locator)
 			}
@@ -304,20 +345,11 @@ func memoryDTOFromToolResult(ctx context.Context, msg *schema.Message) session.M
 
 // newChatModel 用环境变量配置火山引擎模型（openai 兼容协议）。
 func newChatModel(ctx context.Context) (model.ChatModel, error) {
-	apiKey := os.Getenv("VOLC_ACCESS_KEY")
-	endpoint := os.Getenv("VOLC_ENDPOINT_ID")
-	baseURL := os.Getenv("VOLC_BASE_URL")
-	if baseURL == "" {
-		baseURL = "https://ark.cn-beijing.volces.com/api/v3"
+	factory, err := modelFactoryFromEnv()
+	if err != nil {
+		return nil, err
 	}
-	if apiKey == "" || endpoint == "" {
-		return nil, fmt.Errorf("模型凭证未配置：VOLC_ACCESS_KEY / VOLC_ENDPOINT_ID")
-	}
-	return openai.NewChatModel(ctx, &openai.ChatModelConfig{
-		APIKey:  apiKey,
-		Model:   endpoint,
-		BaseURL: baseURL,
-	})
+	return factory(ctx)
 }
 
 // Summarize 把一段消息列表压成一段中文摘要（供 session 压缩用，纯模型调用、无工具）。
@@ -326,15 +358,7 @@ func Summarize(ctx context.Context, messages []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	joined := strings.Join(messages, "\n")
-	out, err := chatModel.Generate(ctx, []*schema.Message{
-		schema.SystemMessage("你是一个对话压缩器。把下面的历史对话压成一段 100 字以内的中文摘要，保留关键事实。"),
-		schema.UserMessage(joined),
-	})
-	if err != nil {
-		return "", err
-	}
-	return out.Content, nil
+	return summarizeWithModel(ctx, chatModel, messages)
 }
 
 // builtinTools 固定内核的原始工具清单。
@@ -381,6 +405,10 @@ func AllTools() []tool.BaseTool {
 // 把这条链补全（批准后真的把那次工具调用跑起来）属于 HARNESS-TODO 的 P3-2
 // （审批升级链），现在先明确地不做，而不是糊过去。
 func guardAskHandler(ctx context.Context, call guard.Call, reason string) (string, error) {
+	return askWithStore(ctx, call, reason, approval.RedisStore{})
+}
+
+func askWithStore(ctx context.Context, call guard.Call, reason string, store approval.Store) (string, error) {
 	userID, err := getUserID(ctx)
 	if err != nil {
 		return "", err
@@ -389,7 +417,7 @@ func guardAskHandler(ctx context.Context, call guard.Call, reason string) (strin
 	if r := []rune(param); len(r) > 200 {
 		param = string(r[:200]) + "…"
 	}
-	if err := (approval.RedisStore{}).SetPending(ctx, userID, approval.PendingAction{
+	if err := store.SetPending(ctx, userID, approval.PendingAction{
 		Action:      call.Tool,
 		Param:       param,
 		Reason:      reason,
@@ -455,7 +483,14 @@ func envInt(key string) (int, bool) {
 // retryAttemptsSoFar 本轮已经用掉的重试次数（读日志，best-effort）。
 // 读不到就当 0 —— 重试预算是保护措施，不该因为它自己失败而把对话打挂。
 func retryAttemptsSoFar(ctx context.Context, userID uint) int {
-	n, err := session.RedisStore{}.RetryAttemptsInTurn(ctx, userID)
+	return retryAttemptsWithStore(ctx, userID, session.RedisStore{})
+}
+
+func retryAttemptsWithStore(ctx context.Context, userID uint, store session.Store) int {
+	if userID == 0 {
+		return 0
+	}
+	n, err := store.RetryAttemptsInTurn(ctx, userID)
 	if err != nil {
 		return 0
 	}
@@ -468,6 +503,10 @@ func retryAttemptsSoFar(ctx context.Context, userID uint) int {
 // 而"慢是因为上游限流、重试了 3 次"这个事实没有任何痕迹。
 // 记账失败也只打日志 —— 绝不能因为"记不下来"就不让对话继续。
 func retryLogger(ctx context.Context, userID uint) retry.Observer {
+	return retryLoggerWithStore(ctx, userID, session.RedisStore{})
+}
+
+func retryLoggerWithStore(ctx context.Context, userID uint, store session.Store) retry.Observer {
 	return func(attempt int, reason string, backoff time.Duration) {
 		metrics.Default.Inc("llm_retries_total")
 		fmt.Printf(" [重试] 第 %d 次（原因 %s），退避 %s\n", attempt, reason, backoff)
@@ -476,10 +515,10 @@ func retryLogger(ctx context.Context, userID uint) retry.Observer {
 			"reason":     reason,
 			"backoff_ms": backoff.Milliseconds(),
 		})
-		// 注意：这里必须先把 store 取出来再调用 —— 写成
-		// `if err := session.RedisStore{}.AppendEvent(...); err != nil` 过不了编译，
-		// 因为 if 的控制子句里复合字面量后面的 `{` 会被当成语句块的开始。
-		store := session.RedisStore{}
+		// 子任务尚无独立日志，不能把重试事件混入父轮次。
+		if userID == 0 {
+			return
+		}
 		if err := store.AppendEvent(ctx, userID, session.MemoryDTO{
 			Type:    session.EventLLMRetry,
 			Role:    "system",

@@ -73,18 +73,24 @@ type Result struct {
 // Run 派一个子智能体执行 prompt（干净上下文：只有这一条 prompt，无父历史），
 // 等它跑完返回完整回复。递归深度超过 maxDepth 会拒绝（防无限递归）。
 func Run(ctx context.Context, prompt string) (*Result, error) {
+	return runner.Run(ctx, prompt)
+}
+
+// Run 使用当前实例的工厂；不会读取全局 SetRunner 配置。
+func (r Runner) Run(ctx context.Context, prompt string) (*Result, error) {
 	if depthFrom(ctx) >= maxDepth {
 		return nil, fmt.Errorf("子智能体递归深度超过上限 %d", maxDepth)
 	}
-	if runner == nil {
+	if r == nil {
 		return nil, fmt.Errorf("subagent runner 未设置（main 里调 subagent.SetRunner(agent.NewLoop)）")
 	}
-	child, err := runner(ctx)
+	childCtx := withDepth(ctx, depthFrom(ctx)+1)
+	child, err := r(childCtx)
 	if err != nil {
 		return nil, fmt.Errorf("子 agent 构造失败: %w", err)
 	}
 	// 子 agent 内部再派活时深度 +1（它的工具 ctx 会带上这个值）
-	stream, err := child.Stream(withDepth(ctx, depthFrom(ctx)+1), []*schema.Message{schema.UserMessage(prompt)})
+	stream, err := child.Stream(childCtx, []*schema.Message{schema.UserMessage(prompt)})
 	if err != nil {
 		return nil, fmt.Errorf("子 agent 推流失败: %w", err)
 	}
@@ -108,6 +114,11 @@ func Run(ctx context.Context, prompt string) (*Result, error) {
 // RunParallel 并行派发多个独立子任务（最多 maxConcurrent 个同时跑），按输入顺序返回结果。
 // 每个并行任务同样走 Run 的深度检查；单个任务失败不影响其他任务（Err 字段标记）。
 func RunParallel(ctx context.Context, tasks []string, maxConcurrent int) []Result {
+	return runner.RunParallel(ctx, tasks, maxConcurrent)
+}
+
+// RunParallel 在整个批次中使用同一个实例工厂。
+func (r Runner) RunParallel(ctx context.Context, tasks []string, maxConcurrent int) []Result {
 	results := make([]Result, len(tasks))
 	if len(tasks) == 0 {
 		return results
@@ -129,9 +140,9 @@ func RunParallel(ctx context.Context, tasks []string, maxConcurrent int) []Resul
 			defer wg.Done()
 			for idx := range taskCh {
 				// 每个任务写不同的 results[idx]，索引不重复，无数据竞争
-				r, err := Run(ctx, tasks[idx])
-				if r != nil {
-					results[idx] = *r
+				result, err := r.Run(ctx, tasks[idx])
+				if result != nil {
+					results[idx] = *result
 				}
 				results[idx].Err = err
 			}

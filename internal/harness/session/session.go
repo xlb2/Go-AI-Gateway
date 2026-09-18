@@ -281,6 +281,17 @@ type Store interface {
 // RedisStore 是 Store 的 Redis 实现。
 type RedisStore struct{}
 
+// EventStore 为运行时提供同源的会话与批量事件存储。
+// AppendEvents 须先验证整个批次，再整体追加；错误不保证远端未接受写入。
+type EventStore interface {
+	Store
+	AppendEvents(context.Context, uint, []MemoryDTO) error
+}
+
+func (RedisStore) AppendEvents(ctx context.Context, userID uint, events []MemoryDTO) error {
+	return WriteMemoryEvents(ctx, userID, events)
+}
+
 // SaveMessage 把一条消息追加到唯一的记忆日志，只增不减、永久保存。
 func (RedisStore) SaveMessage(ctx context.Context, userID uint, msg *schema.Message) error {
 	dto := MemoryDTO{

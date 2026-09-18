@@ -45,10 +45,14 @@ type Harness struct {
 	Approvals approval.Store
 	// Exec 沙箱执行器：审批通过后的动作在这里真实执行。
 	// 默认是"无隔离"的本机执行器（了解级骨架）；生产换成容器/隔离实现，上层不用改。
-	Exec sandbox.Executor
+	Exec      sandbox.Executor
+	newLoop   func(context.Context) (agent.Loop, error)
+	summarize session.CompactSummarizer
+	toolNames func(context.Context) []string
 }
 
-// New 构造一个用 Redis 实现的 Harness（可替换字段注入别的实现）。
+// New 保留旧的延迟全局装配行为。新调用方使用 NewConfigured 或 NewFromEnv，
+// 仅替换这里的公开字段不能替换旧工具内部的依赖。
 func New() *Harness {
 	return &Harness{
 		Sessions:  session.RedisStore{},
@@ -60,7 +64,7 @@ func New() *Harness {
 	}
 }
 
-// Default 全局默认编排实例（main 启动后即可用）。
+// Default 在 API 启动完成基础设施初始化后替换为 NewFromEnv 的实例。
 var Default = New()
 
 // HandleApprovalCommand 处理人在回路审批命令（auth:approve / auth:reject）。
@@ -269,7 +273,7 @@ func (h *Harness) buildSystemPrompt(ctx context.Context) string {
 - 普通聊天正常答复即可。
 - 不确定的信息不要编造，先查历史。`)
 
-	if names := agent.ToolNames(ctx); len(names) > 0 {
+	if names := h.names(ctx); len(names) > 0 {
 		vars["tools"] = strings.Join(names, "、")
 		b.Set("tools", prompt.OrderTools, `可用工具：{{tools}}。
 工具使用规则：
@@ -338,7 +342,7 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 	}
 
 	// 3. 上下文压缩（best-effort：早期对话压成摘要，替代粗暴截断；失败就跳过本次）
-	if err := h.Sessions.Compact(ctx, userID, agent.Summarize); err != nil {
+	if err := h.Sessions.Compact(ctx, userID, h.summary); err != nil {
 		fmt.Printf(" [压缩] 跳过本次压缩: %v\n", err)
 	}
 
@@ -368,7 +372,7 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 func (h *Harness) runLoop(ctx context.Context, userID uint, fullMessages []*schema.Message, emit func(chunk string)) (string, error) {
 	// 3. agent 循环（模型→工具→模型，直到给出最终答案）。
 	//    走 agent.Loop 这道缝（阶段 2.2 起唯一实现是自研循环）——替换循环时这里一行不用改。
-	agentRunner, err := agent.NewLoop(ctx)
+	agentRunner, err := h.loopFactory(ctx)
 	if err != nil {
 		return "", fmt.Errorf("组装 agent 失败: %w", err)
 	}
@@ -486,7 +490,7 @@ func (h *Harness) ResumeTurn(ctx context.Context, userID uint, emit func(chunk s
 	if _, err := h.Sessions.Repair(ctx, userID); err != nil {
 		fmt.Printf(" [续跑] Repair 失败（继续尝试）: %v\n", err)
 	}
-	if err := h.Sessions.Compact(ctx, userID, agent.Summarize); err != nil {
+	if err := h.Sessions.Compact(ctx, userID, h.summary); err != nil {
 		fmt.Printf(" [压缩] 跳过本次压缩: %v\n", err)
 	}
 

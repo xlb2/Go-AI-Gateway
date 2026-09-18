@@ -8,13 +8,11 @@ import (
 	"go_im_gateway/internal/dao"
 	"go_im_gateway/internal/handler"
 	"go_im_gateway/internal/harness"
-	"go_im_gateway/internal/harness/agent"
 	"go_im_gateway/internal/harness/approval"
 	"go_im_gateway/internal/harness/hooks"
 	"go_im_gateway/internal/harness/mcp"
 	"go_im_gateway/internal/harness/session"
 	"go_im_gateway/internal/harness/spill"
-	"go_im_gateway/internal/harness/subagent"
 	"go_im_gateway/internal/harness/tokenmeter"
 	"go_im_gateway/internal/service"
 	"log"
@@ -61,21 +59,19 @@ func main() {
 	spill.Init(rdb)                               // harness 溢出存储器官注入 Redis
 	hooks.RegisterDefaultHooks()                  // 内置横切钩子（敏感词/超长拦截 + 回复统计）
 
-	// 沙箱后端：启动时明确打一行（HARNESS-TODO 的 P2-4）。
-	// 人必须知道"审批批准之后到底跑在什么环境里"——按 SANDBOX_BACKEND 选，
-	// 配了 docker 却连不上时这里会显示「沙箱不可用」，那种情况下
-	// 所有审批都不会被真正执行（fail-closed，不退回裸跑）。
-	log.Printf("沙箱后端: %s（隔离等级 = %s）\n",
-		harness.Default.Exec.Describe(), harness.Default.Exec.Isolation())
-
 	// MCP 集成（可选）：配了 MCP_SERVER_COMMAND 就连接并注册外部工具；失败只告警不挡启动
 	if err := mcp.ConnectFromEnv(ctx); err != nil {
 		log.Printf("MCP 连接失败（忽略，继续启动）: %v\n", err)
 	}
-	// 子智能体器官注入"造子 agent"的构造器（避免 subagent 包反向依赖 agent 包）
-	subagent.SetRunner(func(ctx context.Context) (subagent.ChildAgent, error) {
-		return agent.NewLoop(ctx)
-	})
+	// 主/子循环、摘要和工具统一装配；在 MCP 发现后固定本实例工具清单。
+	configured, err := harness.NewFromEnv(ctx)
+	if err != nil {
+		log.Fatalf("Harness 装配失败: %v", err)
+	}
+	harness.Default = configured
+	// 明确报告审批执行环境；docker 不可用时保持 fail-closed。
+	log.Printf("沙箱后端: %s（隔离等级 = %s）\n",
+		harness.Default.Exec.Describe(), harness.Default.Exec.Isolation())
 	messageDAO := dao.NewMessageDAO(db)
 	messageService := service.NewMessageService(messageDAO, rdb, mqCh)
 	messageService.StartConsumer() // 启动 MQ 消费者：异步把消息落盘到 MySQL

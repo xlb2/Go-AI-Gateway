@@ -66,6 +66,7 @@ type ownLoop struct {
 	byName      map[string]tool.InvokableTool // 按名字查工具
 	maxSteps    int
 	writeEvents func(context.Context, uint, []session.MemoryDTO) error
+	toolResult  func(context.Context, *schema.Message) session.MemoryDTO
 }
 
 // NewOwnLoop 组装自研循环。
@@ -89,7 +90,6 @@ func NewOwnLoop(ctx context.Context) (Loop, error) {
 	})
 
 	tools := make([]tool.InvokableTool, 0, 8)
-	byName := make(map[string]tool.InvokableTool)
 	for _, t := range AllTools() {
 		if t == nil {
 			continue
@@ -103,15 +103,12 @@ func NewOwnLoop(ctx context.Context) (Loop, error) {
 			continue
 		}
 		tools = append(tools, it)
-		byName[info.Name] = it
 	}
 
-	return &ownLoop{
-		model:    chatModel,
-		tools:    tools,
-		byName:   byName,
-		maxSteps: maxStepsFromEnv(),
-	}, nil
+	return NewConfiguredLoop(ctx, LoopConfig{
+		Model: chatModel, Tools: tools, MaxSteps: maxStepsFromEnv(),
+		WriteEvents: session.WriteMemoryEvents, ToolResult: memoryDTOFromToolResult,
+	})
 }
 
 // maxStepsFromEnv 允许用 AGENT_MAX_STEPS 覆盖步数上限；没配用默认。
@@ -261,7 +258,11 @@ func (l *ownLoop) logStepEvent(ctx context.Context, userID uint, kind, content s
 	if userID == 0 {
 		return
 	}
-	if err := session.WriteMemoryEvents(ctx, userID, []session.MemoryDTO{{
+	write := l.writeEvents
+	if write == nil {
+		write = session.WriteMemoryEvents
+	}
+	if err := write(ctx, userID, []session.MemoryDTO{{
 		Type: kind, Role: "system", Content: content,
 	}}); err != nil {
 		fmt.Printf(" [step] %s 写入未确认: %v\n", kind, err)
@@ -325,6 +326,10 @@ func (l *ownLoop) executeTools(ctx context.Context, userID uint, calls []schema.
 	if write == nil {
 		write = session.WriteMemoryEvents
 	}
+	resultDTO := l.toolResult
+	if resultDTO == nil {
+		resultDTO = memoryDTOFromToolResult
+	}
 	assistant := &schema.Message{Role: schema.Assistant, ToolCalls: calls}
 	if userID != 0 {
 		if err := write(ctx, userID, []session.MemoryDTO{memoryDTOFromToolCall(assistant)}); err != nil {
@@ -341,7 +346,7 @@ func (l *ownLoop) executeTools(ctx context.Context, userID uint, calls []schema.
 		msg.ToolName = tc.Function.Name
 		out = append(out, msg)
 		if userID != 0 {
-			if err := write(ctx, userID, []session.MemoryDTO{memoryDTOFromToolResult(ctx, msg)}); err != nil {
+			if err := write(ctx, userID, []session.MemoryDTO{resultDTO(ctx, msg)}); err != nil {
 				return nil, fmt.Errorf("工具 %s 已调用但结果写入未确认，结果未知；停止后续工具，禁止盲目重试: %w", tc.ID, err)
 			}
 		}
