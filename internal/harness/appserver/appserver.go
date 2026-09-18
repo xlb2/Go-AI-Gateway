@@ -1,7 +1,7 @@
 // Package appserver app-server 协议器官（了解级）：GUI/IDE 驱动 agent 的稳定、版本化、双向、流式 JSON-RPC 契约。
 //
 // 定位：harness 解剖图里的"app-server 协议"（HARNESS-STUDY M11）。
-// v1：JSON-RPC envelope + 方法（agent/run 流式推送 chunk 通知 + approval/command）+ 请求/响应。
+// v1：JSON-RPC envelope + 流式运行、审批，以及活动运行查询/取消。
 // 关键设计：契约带版本（Version="v1"）；agent/run 边跑边以 agent/chunk 通知推送流式回复。
 package appserver
 
@@ -9,8 +9,13 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
+	"go_im_gateway/internal/harness/runstate"
 )
 
 // ProtocolVersion 当前契约版本。
@@ -38,8 +43,39 @@ type AgentRunner interface {
 	HandleApprovalCommand(ctx context.Context, userID uint, text string) (handled bool, reply string)
 }
 
+// RunController is optional so existing AgentRunner implementations remain usable.
+type RunController interface {
+	ActiveRun(uint) (runstate.Info, bool)
+	CancelRun(uint, string) bool
+}
+
+type wsWriter struct {
+	conn   *websocket.Conn
+	mu     sync.Mutex
+	cancel context.CancelFunc
+}
+
+func (w *wsWriter) send(msg Message) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		w.cancel()
+		return
+	}
+	if err := w.conn.WriteJSON(msg); err != nil {
+		log.Printf("app-server: 写响应失败: %v", err)
+		w.cancel()
+	}
+}
+
 // ServeWS 在一个已升级的 WebSocket 上跑 JSON-RPC 循环（直到连接断开）。
 func ServeWS(ctx context.Context, conn *websocket.Conn, runner AgentRunner, userID uint) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stopClose := context.AfterFunc(ctx, func() { conn.Close() })
+	defer func() { stopClose(); conn.Close() }()
+	w := &wsWriter{conn: conn, cancel: cancel}
+	var busy atomic.Bool
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -47,23 +83,54 @@ func ServeWS(ctx context.Context, conn *websocket.Conn, runner AgentRunner, user
 		}
 		var msg Message
 		if err := json.Unmarshal(data, &msg); err != nil {
-			writeError(conn, nil, -32700, "parse error")
+			w.send(errResponse(nil, -32700, "parse error"))
 			continue
 		}
 		if msg.Version != ProtocolVersion {
-			writeError(conn, msg.ID, -32600, "unsupported version, expected "+ProtocolVersion)
+			w.send(errResponse(msg.ID, -32600, "unsupported version, expected "+ProtocolVersion))
 			continue
 		}
 		if msg.Method == "" {
 			continue // 通知：骨架阶段忽略
 		}
-		writeMessage(conn, dispatch(ctx, conn, runner, userID, msg))
+		if msg.Method == "agent/run" || msg.Method == "approval/command" {
+			if !busy.CompareAndSwap(false, true) {
+				w.send(errResponse(msg.ID, -32001, "connection already has an active operation"))
+				continue
+			}
+			go func(msg Message) {
+				response := dispatch(ctx, w.send, runner, userID, msg)
+				busy.Store(false)
+				w.send(response)
+			}(msg)
+			continue
+		}
+		w.send(dispatch(ctx, w.send, runner, userID, msg))
 	}
 }
 
-// dispatch 按方法名分发（v1 支持：agent/run（流式）、approval/command）。
-func dispatch(ctx context.Context, conn *websocket.Conn, runner AgentRunner, userID uint, msg Message) Message {
+// dispatch 执行一个请求；只有状态/取消等短控制操作在读循环内调用。
+func dispatch(ctx context.Context, send func(Message), runner AgentRunner, userID uint, msg Message) Message {
 	switch msg.Method {
+	case "agent/status", "agent/cancel":
+		controller, ok := runner.(RunController)
+		if !ok {
+			return errResponse(msg.ID, -32601, "runner does not support run control")
+		}
+		if msg.Method == "agent/status" {
+			info, active := controller.ActiveRun(userID)
+			if !active {
+				return okResponse(msg.ID, map[string]any{"active": false})
+			}
+			return okResponse(msg.ID, map[string]any{"active": true, "run": info})
+		}
+		var p struct {
+			RunID string `json:"run_id"`
+		}
+		if err := json.Unmarshal(msg.Params, &p); err != nil || strings.TrimSpace(p.RunID) == "" {
+			return errResponse(msg.ID, -32602, "run_id is required")
+		}
+		return okResponse(msg.ID, map[string]bool{"cancel_requested": controller.CancelRun(userID, p.RunID)})
 	case "agent/run":
 		var p struct {
 			Content string `json:"content"`
@@ -73,10 +140,10 @@ func dispatch(ctx context.Context, conn *websocket.Conn, runner AgentRunner, use
 		}
 		// 流式：emit 回调把每个 chunk 作为 agent/chunk 通知推给前端
 		reply, err := runner.RunAgentTurn(ctx, userID, p.Content, func(chunk string) {
-			writeMessage(conn, Message{
+			send(Message{
 				Version: ProtocolVersion,
 				Method:  "agent/chunk",
-				Params:  jsonParams(map[string]string{"chunk": chunk}),
+				Params:  jsonParams(map[string]any{"chunk": chunk, "request_id": msg.ID}),
 			})
 		})
 		if err != nil {
@@ -111,19 +178,4 @@ func errResponse(id *int64, code int, message string) Message {
 func jsonParams(v any) json.RawMessage {
 	data, _ := json.Marshal(v)
 	return data
-}
-
-func writeMessage(conn *websocket.Conn, msg Message) {
-	data, err := json.Marshal(msg)
-	if err != nil {
-		log.Printf("app-server: 序列化响应失败: %v", err)
-		return
-	}
-	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-		log.Printf("app-server: 写响应失败: %v", err)
-	}
-}
-
-func writeError(conn *websocket.Conn, id *int64, code int, message string) {
-	writeMessage(conn, errResponse(id, code, message))
 }

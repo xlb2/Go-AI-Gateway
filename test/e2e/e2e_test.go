@@ -46,6 +46,9 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	if len(os.Args) == 3 && os.Args[1] == "--mcp-approval-fixture" {
+		os.Exit(serveMCPApprovalFixture(os.Args[2]))
+	}
 	addr := os.Getenv("REDIS_ADDR")
 	if addr == "" {
 		addr = "localhost:6379"
@@ -104,20 +107,34 @@ func newEnv(t *testing.T, uid uint) *env {
 }
 
 func (e *env) cleanup() {
+	e.cleanupChildLogs()
 	ctx := context.Background()
 	e.redis.Del(ctx,
 		fmt.Sprintf("agent:V2:history:%d", e.uid),
 		fmt.Sprintf("agent:V2:fold:%d", e.uid),
 		fmt.Sprintf("agent:pending:%d", e.uid),
+		fmt.Sprintf("agent:approval:executions:%d", e.uid),
 	)
 }
 
 func (e *env) reset() {
+	e.cleanupChildLogs()
 	ctx := context.Background()
 	e.redis.Del(ctx, fmt.Sprintf("agent:V2:history:%d", e.uid))
 	e.redis.Del(ctx, fmt.Sprintf("agent:V2:fold:%d", e.uid))
 	e.redis.Del(ctx, fmt.Sprintf("agent:pending:%d", e.uid))
+	e.redis.Del(ctx, fmt.Sprintf("agent:approval:executions:%d", e.uid))
 	e.fake.Reset()
+}
+
+func (e *env) cleanupChildLogs() {
+	ctx := context.Background()
+	for _, kind := range []string{"history", "index"} {
+		it := e.redis.Scan(ctx, 0, fmt.Sprintf("agent:child:%s:%d:*", kind, e.uid), 100).Iterator()
+		for it.Next(ctx) {
+			e.redis.Del(ctx, it.Val())
+		}
+	}
 }
 
 // ctx 带 user_id —— 业务代码（agent.getUserID / guard.userFromCtx）用的就是这个字符串 key，

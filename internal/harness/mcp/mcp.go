@@ -174,11 +174,17 @@ func (t *bridgeTool) InvokableRun(ctx context.Context, argumentsInJSON string, o
 	if err != nil {
 		return "", err
 	}
+	if res == nil {
+		return "", fmt.Errorf("MCP 工具 %s 返回空结果", t.publicName())
+	}
 	var sb strings.Builder
 	for _, c := range res.Content {
 		if tc, ok := c.(mcp.TextContent); ok {
 			sb.WriteString(tc.Text)
 		}
+	}
+	if res.IsError {
+		return "", fmt.Errorf("MCP 工具执行失败（%s）: %s", t.publicName(), sb.String())
 	}
 	return sb.String(), nil
 }

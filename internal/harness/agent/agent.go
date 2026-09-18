@@ -149,6 +149,9 @@ func newDefenseTool(store approval.Store) (tool.InvokableTool, error) {
 		"execute_system_defense",
 		"当用户愤怒抱怨或发出攻击性指令时调用此工具，起草一个防御动作并挂起，等管理员审批后才真正执行。",
 		func(ctx context.Context, params *DefenseParams) (string, error) {
+			if subagent.IsNested(ctx) {
+				return "", fmt.Errorf("子任务审批尚不支持恢复与结果回填，请由主任务发起")
+			}
 			userID, err := getUserID(ctx)
 			if err != nil {
 				return "", err
@@ -164,7 +167,7 @@ func newDefenseTool(store approval.Store) (tool.InvokableTool, error) {
 				AvailableDecisions: []string{"approve", "reject"},
 				RequestedAt:        time.Now(),
 			}
-			if err := store.SetPending(ctx, userID, pending); err != nil {
+			if err := proposePending(ctx, store, userID, pending); err != nil {
 				return "", fmt.Errorf("挂起防御动作失败: %v", err)
 			}
 			return fmt.Sprintf("⚠️ 防御动作已起草并挂起，等待管理员审批。\n提案：向审计文件追加一条封禁记录（level=%s）。\n请管理员输入 auth:approve 执行，或 auth:reject 取消。", level), nil
@@ -275,17 +278,31 @@ func newDelegateTasksTool(run func(context.Context, []string, int) []subagent.Re
 
 // NewDelegationTools 绑定子任务工厂和并发上限。返回的工具仍须由调用方包装 guard。
 func NewDelegationTools(runner subagent.Runner, maxConcurrent int) ([]tool.InvokableTool, error) {
+	return newDelegationTools(runner, maxConcurrent, nil)
+}
+
+func newDelegationTools(runner subagent.Runner, maxConcurrent int, recorder subagent.Recorder) ([]tool.InvokableTool, error) {
 	if runner == nil {
 		return nil, fmt.Errorf("delegation runner is required")
 	}
 	if maxConcurrent <= 0 {
 		return nil, fmt.Errorf("delegation concurrency must be positive")
 	}
-	single, err := newDelegateTool(runner.Run)
+	decorate := func(ctx context.Context) context.Context {
+		if recorder != nil {
+			return subagent.WithRecorder(ctx, recorder)
+		}
+		return ctx
+	}
+	single, err := newDelegateTool(func(ctx context.Context, task string) (*subagent.Result, error) {
+		return runner.Run(decorate(ctx), task)
+	})
 	if err != nil {
 		return nil, err
 	}
-	parallel, err := newDelegateTasksTool(runner.RunParallel, maxConcurrent)
+	parallel, err := newDelegateTasksTool(func(ctx context.Context, tasks []string, limit int) []subagent.Result {
+		return runner.RunParallel(decorate(ctx), tasks, limit)
+	}, maxConcurrent)
 	if err != nil {
 		return nil, err
 	}
@@ -399,11 +416,7 @@ func AllTools() []tool.BaseTool {
 
 // guardAskHandler 流水线判定为 ask 时，把这次工具调用挂起等人工审批。
 //
-// 这里**不**附带执行计划：被拦下的是"任意一次工具调用"，它还没有被翻译成
-// 具体的 argv 或内置动作。于是批准后编排层会**如实拒绝执行**（执行计划非法），
-// 而不是假装执行过 —— 这是刻意保留的诚实缺口。
-// 把这条链补全（批准后真的把那次工具调用跑起来）属于 HARNESS-TODO 的 P3-2
-// （审批升级链），现在先明确地不做，而不是糊过去。
+// 完整调用保存于 Tool，Param 仅用于展示摘要；仅统一 Runtime 能执行类型化工具提案。
 func guardAskHandler(ctx context.Context, call guard.Call, reason string) (string, error) {
 	return askWithStore(ctx, call, reason, approval.RedisStore{})
 }
@@ -417,15 +430,38 @@ func askWithStore(ctx context.Context, call guard.Call, reason string, store app
 	if r := []rune(param); len(r) > 200 {
 		param = string(r[:200]) + "…"
 	}
-	if err := store.SetPending(ctx, userID, approval.PendingAction{
+	pending := approval.PendingAction{
+		Kind:        approval.KindTool,
+		Tool:        &approval.ToolInvocation{Name: call.Tool, Arguments: call.Args, CallID: call.ToolCallID, UserID: userID, RuntimeID: call.RuntimeID},
 		Action:      call.Tool,
 		Param:       param,
 		Reason:      reason,
 		RequestedAt: time.Now(),
-	}); err != nil {
-		return "", err
+	}
+	var saveErr error
+	if call.RuntimeID != "" {
+		if subagent.IsNested(ctx) {
+			return "", fmt.Errorf("子任务审批尚不支持恢复与结果回填，请由主任务发起")
+		}
+		proposals, ok := store.(approval.ProposalStore)
+		if !ok {
+			return "", fmt.Errorf("审批存储不支持保留待处理提案")
+		}
+		saveErr = proposals.Propose(ctx, userID, pending)
+	} else {
+		saveErr = proposePending(ctx, store, userID, pending)
+	}
+	if saveErr != nil {
+		return "", saveErr
 	}
 	return fmt.Sprintf("⚠️ 工具 %s 被工具流水线拦下并要求人工审批（原因：%s），已挂起。请管理员输入 auth:approve 执行 / auth:reject 取消。", call.Tool, reason), nil
+}
+
+func proposePending(ctx context.Context, store approval.Store, userID uint, pending approval.PendingAction) error {
+	if proposals, ok := store.(approval.ProposalStore); ok {
+		return proposals.Propose(ctx, userID, pending)
+	}
+	return store.SetPending(ctx, userID, pending)
 }
 
 // ToolNames 返回当前真实注册的工具名，供 prompt 器官生成"工具指引"片段。

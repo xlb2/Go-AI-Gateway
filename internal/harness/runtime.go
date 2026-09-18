@@ -18,8 +18,14 @@ func NewConfigured(ctx context.Context, cfg agent.RuntimeConfig, executor sandbo
 	if err != nil {
 		return nil, err
 	}
-	return NewWithDependencies(Dependencies{Sessions: cfg.Sessions, Approvals: cfg.Approvals, Executor: executor,
+	h, err := NewWithDependencies(Dependencies{Sessions: cfg.Sessions, Approvals: cfg.Approvals, Executor: executor,
 		NewLoop: runtime.NewLoop, Summarize: runtime.Summarize, ToolNames: runtime.ToolNames})
+	if err != nil {
+		return nil, err
+	}
+	h.executeTool = runtime.ExecuteApproved
+	h.approvalResult = runtime.ToolResult
+	return h, nil
 }
 
 // NewFromEnv 是 API 启动入口；应在加载环境、连接基础设施和发现 MCP 工具后调用。

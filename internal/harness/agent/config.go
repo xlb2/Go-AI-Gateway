@@ -18,6 +18,7 @@ type LoopConfig struct {
 	MaxSteps    int
 	WriteEvents func(context.Context, uint, []session.MemoryDTO) error
 	ToolResult  func(context.Context, *schema.Message) session.MemoryDTO
+	LogNested   bool // WriteEvents must target an independent child log when enabled.
 }
 
 // NewConfiguredLoop 不读取环境或创建存储；所有运行依赖均须显式提供。
@@ -43,5 +44,5 @@ func NewConfiguredLoop(ctx context.Context, cfg LoopConfig) (Loop, error) {
 		}
 		byName[info.Name] = t
 	}
-	return &ownLoop{model: cfg.Model, tools: tools, byName: byName, maxSteps: cfg.MaxSteps, writeEvents: cfg.WriteEvents, toolResult: cfg.ToolResult}, nil
+	return &ownLoop{model: cfg.Model, tools: tools, byName: byName, maxSteps: cfg.MaxSteps, writeEvents: cfg.WriteEvents, toolResult: cfg.ToolResult, logNested: cfg.LogNested}, nil
 }

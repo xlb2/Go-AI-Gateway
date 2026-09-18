@@ -1,5 +1,97 @@
 # test/ — 假模型与端到端测试
 
+F-3 收口验收通过（2026-09-18）：用户 WSL F3Boundary 定向 3、全量 129 个顶层用例通过，0 跳过；提交前 go vet 通过。F-2/F-3 在约定框架范围内完成，下方各批待验描述保留为历史记录，以本条最新验收为准；真实任务统一验收归 F-4。
+
+| 用例 | 守护的不变量 |
+|---|---|
+| `TestF3BoundaryCrossEntrypoints` | 旧 WS 与 RPC 共享同一 Harness：跨入口查到同一运行、并发被拒绝、取消传播且退出后释放 |
+| `TestF3BoundaryNestedChildrenAndApproval` | 孙任务关联直接父运行及委派调用，各层日志合法；子防御动作明确拒绝挂起，不能占父审批槽 |
+| `TestF3BoundaryCanceledChildrenDoNotStart` | 预取消队列不构造模型，构造期间取消不继续建流，空子实例明确返回错误 |
+
+F-3 第五批新增 `e2e/child_trace_test.go` 三项，静态检查通过，待 WSL `scripts/test-fast.sh -run ChildTrace` 与全量回归。上一批 RunTrace 定向 3、全量 123 已由用户验证，0 跳过。
+
+| 用例 | 守护的不变量 |
+|---|---|
+| `TestChildTraceParallelIsolation` | 两个并行子任务有不同运行 ID、正确父运行/委派调用，各自保存输入/step/工具配对/结束，父日志不混写，跨用户查不到子日志 |
+| `TestChildTracePersistenceFailures` | 子开始日志失败零构造，结束写失败不能报告成功，构造失败有中断终态，子记录不落父历史 |
+| `TestChildTraceCancellation` | 父取消传播到子工厂，独立收尾时限记录 interrupted/aborted，而非 completed |
+
+Redis 子日志键为 `agent:child:history:<uid>:<runID>`，父子索引为 `agent:child:index:<uid>:<parentRunID>`；测试按专用账号清理这些键。可用 session.RedisStore.ChildRunIDs/GetChildLog 读取，不改变父会话投影。不代表任意第三方忽略 context 时也能强制停止。
+
+F-3 第四批 `e2e/run_trace_test.go` 已由用户 WSL 验证：RunTrace 定向 3、全量 123 个顶层用例通过，0 跳过。覆盖主运行与审批来源追溯，不代表子任务独立归属与日志已完成。
+
+| 用例 | 守护的不变量 |
+|---|---|
+| `TestRunTraceApprovalOrigin` | 提案来源与原轮事件一致，审批执行/续答是同一新运行，审计及领取记录保留来源，工具调用配对不变 |
+| `TestRunTraceFreshTurnsAndLegacyHistory` | 新轮次分配新运行 ID，兼容会话标识稳定，旧无归属日志不重写且投影可读 |
+| `TestRunTraceRejectsWrongOwnerAndConflicts` | 跨用户或冲突归属拒绝写入，批次不部分落盘，错误提案不保存，不修改调用者 DTO |
+
+最新验收：用户 LegacyWS 定向 2、全量 120 个顶层用例通过，0 跳过。F-3 第三批 `e2e/legacy_ws_test.go` 两项真实旧聊天 WS 测试已验证，接真 Redis、Harness 与受控循环（不调用模型）；不代表真实模型或高并发压力验收。
+
+| 用例 | 守护的不变量 |
+|---|---|
+| `TestLegacyWSControlDuringRun` | 运行中仍处理心跳/查询/取消，重复聊天报忙，旧运行 ID 不能取消，取消后实际退出并释放 Harness 名额 |
+| `TestLegacyWSReplacementCancelsOldRun` | 新连接顶掉旧连接会取消旧任务，旧入口清理不删除新在线记录，新连接断开后正常清理 |
+
+旧 `/ws` 新控制消息：`{"type":"agent/status"}`；`{"type":"agent/cancel","run_id":"状态返回的ID"}`。控制响应为同 type 的 JSON，普通聊天/流式文本保持原格式，任务默认 60 秒时限不变。身份使用 JWT 用户，取消接受不等于任务已退出。尚未压力测试 Redis 推送与流式输出竞争；代码已统一经过 Client 写锁及写入期限。
+
+最新验收：用户 RunControl 定向 2、全量 115 通过，0 跳过。F-3 第二批新增 `test/appserver/control_test.go` 三项，静态检查通过，待 WSL `scripts/test-fast.sh -run RPC` 与全量回归；协议与边界见 [appserver/README.md](appserver/README.md)。
+
+| 用例 | 守护的不变量 |
+|---|---|
+| `TestRPCControlDuringRun` | 流式运行期间同连接可查询/取消，第二个耗时操作报忙，跨用户/旧 ID 不能取消，取消信号与实际退出分离，chunk 关联请求 |
+| `TestRPCDisconnectCancelsOperation` | 普通运行和审批操作均在连接断开后收到 context 取消 |
+| `TestRPCControlValidationAndCompatibility` | 旧 Runner 仍可运行，控制能力缺失明确报错，取消必须提供运行 ID |
+
+最新验收：用户 MCP 定向 1、全量 113 通过，0 跳过，覆盖下方 MCP 失败及待验记录。F-3 本批新增以下两项，静态检查通过，待 WSL `scripts/test-fast.sh -run RunControl` 与全量回归。
+
+| 用例（`assembly/run_control_test.go`） | 守护的不变量 |
+|---|---|
+| `TestRunControlAdmissionAndCancellation` | 普通/续跑/审批不能与当前同用户任务重叠，忙时不写历史或领取审批；取消校验用户和运行 ID，旧 ID 不影响新任务，取消后直到实际退出才释放 |
+| `TestRunControlIndependentUsersAndExit` | 不同用户可并行，父 context 取消后退出释放，预取消请求零写入，空续跑不泄漏占用 |
+
+2026-09-18 10:39 验收纠错：MCP 定向/全量均仅 success 子场景失败，另外三个子场景通过。测试错误地要求假模型的 240 字摘要包含完整长结果；现改为回复检查结果引用，事件精确检查完整结果，远端实收参数/执行次数检查保留。成功场景后续断言尚待运行，需重跑 MCPApprovalTransport 和全量。
+
+F-2 最新证据：用户第三批 ApprovalExecution 定向 4、全量 112 用例通过，0 跳过。本轮新增 MCP 真实 stdio 传输验收，静态检查通过，待用户 WSL 执行 `scripts/test-fast.sh -run MCPApprovalTransport` 与全量回归。
+
+| 用例（`e2e/mcp_approval_test.go`） | 守护的不变量 |
+|---|---|
+| `TestMCPApprovalTransport` | 真实子进程握手/发现/调用；批准前零调用、拒绝零调用、批准原参数仅执行一次；结果配对回填且模型收到工具结果；isError（含空错误文本）不能记成功，重复确认不重放 |
+
+该用例复用测试二进制启动 SDK stdio 服务端，临时文件记录服务端实际调用，退出时关闭桥与清理文件；假模型、真 Redis、真 MCP 传输，无真实模型费用。不证明第三方 MCP 服务兼容性、真实模型工具选择或进程崩溃恢复；这些与协议链路验收分开记录。
+
+第三批已验证用例：
+
+| 用例（`e2e/approval_execution_test.go`） | 守护的不变量 |
+|---|---|
+| `TestApprovalExecutionClaimEvidence` | 领取后提案消失但原计划及状态保留，新 Harness 可查询；跨用户查不到，重复开始与状态回退被拒绝，重复确认不重放 |
+| `TestApprovalExecutionClaimStorageFailure` | 记录键类型错误时领取失败，提案不丢失且零执行 |
+| `TestApprovalExecutionWriteBarriers` | running 写入失败零执行，终态写失败保留 running 且不续答，两者均不重放 |
+| `TestApprovalExecutionOutcomes` | 成功/拒绝/错误有独立状态，结果回填失败不抹掉执行成功证据，取消后仍保存未知结果，沙箱路径也接状态 |
+
+第二批已验证用例：
+
+| 用例 | 守护的不变量 |
+|---|---|
+| `e2e/TestToolApprovalFullCallAndContinuation` | 超过展示长度的参数完整保存/执行，结果按新调用 ID 配对进入模型，重复确认不执行，下次工具调用仍需审批 |
+| `e2e/TestToolApprovalRejectAndFailure` | 拒绝零执行，执行错误明确回填，均能续答且日志配对合法 |
+| `e2e/TestToolApprovalPersistenceBarriers` | 执行前写失败零执行，结果写失败不请求模型，重复确认不重放 |
+| `e2e/TestToolApprovalRejectsDifferentRuntime` | 重建实例不能执行旧实例挂起的工具提案 |
+| `e2e/TestToolApprovalProposalCannotOverwrite` | 新提案不能覆盖未处理提案，过期提案不阻塞新提案 |
+| `assembly/TestToolApprovalGuardRetainsRestrictions` | 一次授权保留 Deny/入参限制/超时，成功与失败结果均脱敏 |
+
+这些用例使用本地 MCP 命名工具、假模型和真 Redis，不代表真实 MCP 服务器已验收。本批通过停止流程模拟崩溃窗口，未实际杀进程/演练 Redis 故障切换；状态查询不自动恢复执行。
+
+F-2 原子领取新增用例（`e2e/approval_claim_test.go`）：静态检查通过，WSL 运行待验。
+
+| 用例 | 守护的不变量 |
+|---|---|
+| `TestApprovalClaimConcurrentConfirmation` | 16 个请求先读到同一提案再同时确认，只执行及审计一次 |
+| `TestApprovalClaimRejectRacesWithApprove` | 批准/拒绝只接受一个，执行次数与获胜决策一致 |
+| `TestApprovalClaimRejectsStaleSnapshot` | 旧快照不能消费新提案，修改本地对象不改变实际计划，重复领取失败 |
+| `TestApprovalClaimChecksExpiryAtConsumption` | 读取时有效、领取时过期的提案不能执行 |
+| `TestApprovalClaimFailureNeverExecutes` | 领取故障或存储缺少领取能力时零执行，提案仍保留 |
+
 2026-09-18 用户验收：Runtime 定向 4、全量 97 顶层用例通过，0 跳过；test-real.sh 六段跑完，显示子任务响应、显式 spill 存取、防御两步审批执行（审计追加 68 字节、退出码 0）和 10 轮响应。第 5 段不能单凭定位符回复证明自动 spill，第 6 段不证明压缩/Repair；未提供重建启动日志，服务构建版本未独立核实。上述为用户终端证据，不扩大成所有机制的验收。
 
 统一装配最新结果：用户重跑 `scripts/test-fast.sh -run Runtime`（4 个）与完整回归（97 个顶层用例）全部通过，0 跳过；覆盖下方断言修正后的待验状态。API 重建后的真模型验收仍待执行。

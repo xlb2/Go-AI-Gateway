@@ -17,6 +17,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 	"github.com/redis/go-redis/v9"
 
+	"go_im_gateway/internal/harness/runstate"
 	"go_im_gateway/internal/harness/tokenmeter"
 )
 
@@ -238,6 +239,7 @@ type ToolCallData struct {
 
 // MemoryDTO 持久化在日志里的一条事件（自研纯净 DTO，避开第三方结构体反序列化陷阱）。
 type MemoryDTO struct {
+	Run            *runstate.Ref  `json:"run,omitempty"`
 	Type           string         `json:"type"`
 	Role           string         `json:"role"`
 	Content        string         `json:"content"`
@@ -756,6 +758,11 @@ func (RedisStore) RetryAttemptsInTurn(ctx context.Context, userID uint) (int, er
 
 // writeMemoryEvent 把一条记忆事件序列化后 RPush 进记忆日志（唯一的写入口）。
 func writeMemoryEvent(ctx context.Context, userID uint, dto MemoryDTO) error {
+	ref, err := runstate.Bind(ctx, userID, dto.Run)
+	if err != nil {
+		return err
+	}
+	dto.Run = ref
 	if rdb == nil {
 		fmt.Println(" [记忆中枢] 致命错误：Redis 连接池未挂载")
 		return fmt.Errorf("redis client is nil")
@@ -790,6 +797,11 @@ func WriteMemoryEvents(ctx context.Context, userID uint, pending []MemoryDTO) er
 	key := fmt.Sprintf("agent:V2:history:%d", userID)
 	values := make([]any, 0, len(pending))
 	for _, dto := range pending {
+		ref, err := runstate.Bind(ctx, userID, dto.Run)
+		if err != nil {
+			return err
+		}
+		dto.Run = ref
 		// 批量路径不能成为"绕过不变量"的后门：和单条写入走同一道把关。
 		// 全部校验完再用一个 RPUSH 写入，避免非法事件导致部分批次被接受。
 		if err := prepareForWrite(&dto); err != nil {

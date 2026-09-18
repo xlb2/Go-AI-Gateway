@@ -43,10 +43,19 @@ func (d Decision) String() string {
 
 // Call 一次工具调用的把关上下文。
 type Call struct {
+	RuntimeID  string
 	UserID     uint
 	Tool       string
 	Args       string // 原始 JSON 入参
 	ToolCallID string
+}
+
+type callIDKey struct{}
+
+func CallID(ctx context.Context) string { id, _ := ctx.Value(callIDKey{}).(string); return id }
+
+func WithCallID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, callIDKey{}, id)
 }
 
 // Verdict 一次判定的结果。
@@ -155,6 +164,16 @@ func (g *gatedTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 
 // InvokableRun 工具真正被调用时走完整条流水线。
 func (g *gatedTool) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
+	return g.run(ctx, argumentsInJSON, false, opts...)
+}
+
+// RunApproved 只放行本次调用的 Ask，不传递可被子调用复用的授权 context。
+// 调用方必须已领取提案，并验证工具、完整参数和实例归属。
+func (p *Pipeline) RunApproved(ctx context.Context, t tool.InvokableTool, args string) (string, error) {
+	return (&gatedTool{pipeline: p, inner: t}).run(ctx, args, true)
+}
+
+func (g *gatedTool) run(ctx context.Context, argumentsInJSON string, approved bool, opts ...tool.Option) (string, error) {
 	p := g.pipeline
 	info, _ := g.inner.Info(ctx)
 	name := "unknown"
@@ -162,6 +181,7 @@ func (g *gatedTool) InvokableRun(ctx context.Context, argumentsInJSON string, op
 		name = info.Name
 	}
 	call := Call{UserID: userFromCtx(ctx), Tool: name, Args: argumentsInJSON}
+	call.ToolCallID, _ = ctx.Value(callIDKey{}).(string)
 
 	// ---- 第 1、2 道关：判定（pre 之后再过 guard，合并规则是"更严者胜"）----
 	verdict := allow()
@@ -175,11 +195,17 @@ func (g *gatedTool) InvokableRun(ctx context.Context, argumentsInJSON string, op
 
 	switch verdict.Decision {
 	case Deny:
+		if approved {
+			return "", fmt.Errorf("工具调用被拒绝: %s", verdict.Reason)
+		}
 		metrics.Default.Inc("tool_denied_total")
 		// 用"工具结果"而不是 error 返回：拒绝是正常业务结果，
 		// 要让模型看见原因并自己改道，而不是把整轮对话炸掉。
 		return fmt.Sprintf("⛔ 该工具调用被把关拒绝（%s），未执行。原因：%s", name, verdict.Reason), nil
 	case Ask:
+		if approved {
+			break
+		}
 		metrics.Default.Inc("tool_ask_total")
 		if p.ask == nil {
 			// 拿不准时的默认值：没人能审批就拒绝（fail-closed）——
@@ -194,7 +220,14 @@ func (g *gatedTool) InvokableRun(ctx context.Context, argumentsInJSON string, op
 	}
 
 	// ---- 第 3 道关：真执行（超时 + 指标包住）----
-	out, err := g.execute(ctx, call, argumentsInJSON, opts...)
+	out, err := g.execute(ctx, call, argumentsInJSON, approved, opts...)
+	if err != nil && approved {
+		message := err.Error()
+		for _, f := range p.post {
+			message = f(ctx, call, message)
+		}
+		return "", &safeExecutionError{message: message, cause: err}
+	}
 
 	// ---- 第 4 道关：结果改写 ----
 	if err == nil {
@@ -204,6 +237,14 @@ func (g *gatedTool) InvokableRun(ctx context.Context, argumentsInJSON string, op
 	}
 	return out, err
 }
+
+type safeExecutionError struct {
+	message string
+	cause   error
+}
+
+func (e *safeExecutionError) Error() string { return e.message }
+func (e *safeExecutionError) Unwrap() error { return e.cause }
 
 // defaultToolTimeout 单次工具执行的默认超时。
 const defaultToolTimeout = 120 * time.Second
@@ -232,7 +273,7 @@ func toolTimeoutFor(toolName string) time.Duration {
 }
 
 // execute 第 3 道关：真执行（超时 + 指标包住）。
-func (g *gatedTool) execute(ctx context.Context, call Call, args string, opts ...tool.Option) (string, error) {
+func (g *gatedTool) execute(ctx context.Context, call Call, args string, strict bool, opts ...tool.Option) (string, error) {
 	p := g.pipeline
 	timeout := p.timeout
 	if timeout <= 0 {
@@ -260,9 +301,15 @@ func (g *gatedTool) execute(ctx context.Context, call Call, args string, opts ..
 		lastErr = err
 		metrics.Default.Inc("tool_errors_total")
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			if strict {
+				return "", fmt.Errorf("工具 %s 超时: %w", call.Tool, context.DeadlineExceeded)
+			}
 			// 超时多半不是"偶然抖动"，重试只会再等一个 timeout，直接放弃
 			return fmt.Sprintf("⏱️ 工具 %s 执行超时(%s)，已终止。", call.Tool, timeout), nil
 		}
+	}
+	if strict {
+		return "", fmt.Errorf("工具 %s 执行失败: %w", call.Tool, lastErr)
 	}
 	// 执行失败也不掀桌子：把错误包成工具结果交给模型，让它决定下一步
 	return fmt.Sprintf("⚠️ 工具 %s 执行失败：%v", call.Tool, lastErr), nil

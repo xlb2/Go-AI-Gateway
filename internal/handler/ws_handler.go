@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"go_im_gateway/internal/harness"
+	"go_im_gateway/internal/harness/appserver"
+	"go_im_gateway/internal/model"
 	"go_im_gateway/internal/service"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -23,6 +26,7 @@ type Client struct {
 	SendMutex     sync.Mutex
 	Conn          *websocket.Conn
 	LastHeartbeat time.Time
+	cancel        context.CancelFunc
 }
 
 // ClientManager 是一本全局花名册，记录【UserID】-> 光缆指针
@@ -33,6 +37,7 @@ type MessagePayload struct {
 	Type     string `Json:"type"`       // 情报类型：是 "ping" 还是 "chat"？
 	ToUserID uint   `json:"to_user_id"` //发给谁
 	Content  string `json:"content"`    //说什么
+	RunID    string `json:"run_id,omitempty"`
 }
 
 // ClientMUtex是一把物理读写锁，死死防住高并发下的内存撕裂
@@ -61,13 +66,40 @@ func ExecuteSystemCommand(emotion string) {
 }
 
 func (c *Client) SendMessage(msg []byte) error {
+	return c.sendFrame(websocket.TextMessage, msg)
+}
+
+func (c *Client) sendFrame(kind int, msg []byte) error {
 	c.SendMutex.Lock()
 	defer c.SendMutex.Unlock()
-	return c.Conn.WriteMessage(websocket.TextMessage, msg)
+	if err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		if c.cancel != nil {
+			c.cancel()
+		}
+		c.Conn.Close()
+		return err
+	}
+	err := c.Conn.WriteMessage(kind, msg)
+	if err != nil {
+		if c.cancel != nil {
+			c.cancel()
+		}
+		c.Conn.Close()
+	}
+	return err
+}
+
+type ChatMessages interface {
+	PullOfflineMessages(uint) ([]model.Message, error)
+	SendPrivateMessage(uint, uint, string) error
 }
 
 // 带透视眼的安保队长2.0
 func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.HandlerFunc {
+	return ConnectWSWithRunner(msgService, rdb, harness.Default)
+}
+
+func ConnectWSWithRunner(msgService ChatMessages, rdb *redis.Client, runner appserver.AgentRunner) gin.HandlerFunc {
 	return func(c *gin.Context) {
 
 		// uidStr := c.Query("uid")
@@ -119,6 +151,12 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 			fmt.Println("光缆架设失败:", err)
 			return
 		}
+		connectionCtx, cancel := context.WithCancel(context.WithValue(c.Request.Context(), "user_id", userID))
+		defer cancel()
+		client := &Client{Conn: conn, LastHeartbeat: time.Now(), cancel: cancel}
+		stopClose := context.AfterFunc(connectionCtx, func() { conn.Close() })
+		defer stopClose()
+		var busy atomic.Bool
 		//======核心战术动作1：上锁，登记召册====
 		ClientMUtex.Lock()
 
@@ -126,14 +164,14 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 		if oldClient, exists := ClientManager[userID]; exists {
 			fmt.Printf("【系统警告】检测到 UserID: %d 发生多端登录！正在强制掐断旧连接...\n", userID)
 			// 2.  核心修复：物理拔掉旧连接的网线！绝对不能漏掉这一步，否则直接 FD 泄漏！
+			if oldClient.cancel != nil {
+				oldClient.cancel()
+			}
 			oldClient.Conn.Close()
 		}
 
 		// 3. 安全登记新连接
-		ClientManager[userID] = &Client{
-			Conn:          conn,
-			LastHeartbeat: time.Now(),
-		}
+		ClientManager[userID] = client
 
 		// 4. 计算当前真实在线人数 (直接拿 Map 的长度最准，不需要自己搞个容易 Data Race 的变量)
 		currentOnline := len(ClientManager)
@@ -144,8 +182,10 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 
 		//核心战术2：设置拔网线时的物理回收机制====
 		defer func() {
-			ClientMUtex.Lock()            //准备拔网线，再次锁死
-			delete(ClientManager, userID) //从花名册种删除
+			ClientMUtex.Lock() //准备拔网线，再次锁死
+			if ClientManager[userID] == client {
+				delete(ClientManager, userID)
+			}
 			ClientMUtex.Unlock()
 			conn.Close()
 			fmt.Printf("【系统广播】UserID: %d 已彻底断开，内存已回收\n", userID)
@@ -157,7 +197,7 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 			fmt.Printf("【系统广播】正在为 UserID %d 补发 %d 条离线消息...\n", userID, len(offlineMessages))
 			for _, msg := range offlineMessages {
 				outbound := fmt.Sprintf("【离线补发 - 来自 UserID %d】: %s", msg.FromUserID, msg.Content)
-				conn.WriteMessage(websocket.TextMessage, []byte(outbound))
+				client.SendMessage([]byte(outbound))
 			}
 
 		}
@@ -166,12 +206,12 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 		channelName := fmt.Sprintf("user:%d:channel", userID)
 
 		// 2. 向 Redis 塔台申请订阅
-		pubsub := rdb.Subscribe(context.Background(), channelName)
+		pubsub := rdb.Subscribe(connectionCtx, channelName)
+		defer pubsub.Close()
 
 		// 3. 极其核心：劈开平行宇宙！派一个独立的侦察兵去死等 Redis 塔台
 		go func() {
-			// 防御装甲：当这个侦察兵阵亡（或者光缆断开）时，必须向 Redis 塔台退订频道，防止内存泄漏！
-			defer pubsub.Close()
+			// 订阅由连接入口负责关闭，断线时也能释放没有收到任何消息的订阅。
 
 			//拿到无线电接收器
 			ch := pubsub.Channel()
@@ -180,7 +220,7 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 			for msg := range ch {
 				fmt.Printf("【Redis 塔台】截获发给 UserID %d 的跨节点情报: %s\n", userID, msg.Payload)
 				// 拿到情报后，顺着手里这根 WebSocket 光缆，直接砸向前端屏幕！
-				err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload))
+				err := client.SendMessage([]byte(msg.Payload))
 				if err != nil {
 					break
 				}
@@ -195,7 +235,7 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 				break //异常断开，触发defer回收
 			}
 			ClientMUtex.Lock()
-			if client, exists := ClientManager[userID]; exists {
+			if ClientManager[userID] == client {
 				client.LastHeartbeat = time.Now()
 			}
 			ClientMUtex.Unlock()
@@ -205,52 +245,76 @@ func ConnectWS(msgService *service.MessageService, rdb *redis.Client) gin.Handle
 			var payload MessagePayload
 			import_json_err := json.Unmarshal(message, &payload)
 			if import_json_err != nil {
-				conn.WriteMessage(messageType, []byte("情报格式错误，必须是 JSON！"))
+				client.sendFrame(messageType, []byte("情报格式错误，必须是 JSON！"))
 				continue
 			}
 			//=====心跳拦截与生命体征的刷新=====
 			if payload.Type == "ping" {
 				// 只需要给前端回一个响声，证明服务器还活着
-				conn.WriteMessage(messageType, []byte(`{"type":"pong","content":"活着呢"}`))
+				client.sendFrame(messageType, []byte(`{"type":"pong","content":"活着呢"}`))
+				continue
+			}
+			if payload.Type == "agent/status" || payload.Type == "agent/cancel" {
+				response := map[string]any{"type": payload.Type}
+				control, ok := runner.(appserver.RunController)
+				if !ok {
+					response["error"] = "runner does not support run control"
+				} else if payload.Type == "agent/status" {
+					info, active := control.ActiveRun(userID)
+					response["active"] = active
+					if active {
+						response["run"] = info
+					}
+				} else if strings.TrimSpace(payload.RunID) == "" {
+					response["error"] = "run_id is required"
+				} else {
+					response["cancel_requested"] = control.CancelRun(userID, payload.RunID)
+				}
+				data, _ := json.Marshal(response)
+				client.SendMessage(data)
 				continue
 			}
 
 			if payload.ToUserID == 999 {
 
-				func() {
+				if !busy.CompareAndSwap(false, true) {
+					client.SendMessage([]byte("当前连接已有任务运行，请等待结束或取消该任务。"))
+					continue
+				}
+				go func(payload MessagePayload, messageType int) {
+					defer busy.Store(false)
 					// 1. 声明 Context
-					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					ctx, cancel := context.WithTimeout(connectionCtx, 60*time.Second)
 					// 2. 这里的 defer 是安全的！因为它只在这个匿名函数结束时触发，不会堆积在外部的死循环里！
 					defer cancel()
 					ctx = context.WithValue(ctx, "user_id", userID)
 
-					h := harness.Default
+					h := runner
 
 					// 3. 人在回路审批：有待审批的高危任务时，只处理 auth:approve / auth:reject
 					if handled, reply := h.HandleApprovalCommand(ctx, userID, strings.TrimSpace(payload.Content)); handled {
-						conn.WriteMessage(messageType, []byte(reply))
+						client.sendFrame(messageType, []byte(reply))
 						return
 					}
 
 					// 4. 跑一轮 agent 对话（pre钩子→记忆→Eino循环→落盘→post钩子），流式推给前端
 					if _, err := h.RunAgentTurn(ctx, userID, payload.Content, func(chunk string) {
-						conn.WriteMessage(messageType, []byte(chunk))
+						client.sendFrame(messageType, []byte(chunk))
 					}); err != nil {
 						failMsg := fmt.Sprintf("Agent 执行失败: %v", err)
 						fmt.Println(failMsg)
-						conn.WriteMessage(messageType, []byte(failMsg))
+						client.sendFrame(messageType, []byte(failMsg))
 					}
-				}()
+				}(payload, messageType)
 
-				// 匿名函数执行完毕，所有的临时变量、Context 会被干干净净地回收
-				// 然后在外层的长连接里，我们继续等待下一句话
+				// 读循环继续接收控制消息，任务返回后才释放连接的忙标记。
 				continue
 			}
 			err = msgService.SendPrivateMessage(userID, payload.ToUserID, payload.Content)
 			if err != nil {
-				conn.WriteMessage(messageType, []byte("系统警告：消息发送失败 "+err.Error()))
+				client.sendFrame(messageType, []byte("系统警告：消息发送失败 "+err.Error()))
 			} else {
-				conn.WriteMessage(messageType, []byte("系统：炮弹已升空，已交由参谋部全网路由！"))
+				client.sendFrame(messageType, []byte("系统：炮弹已升空，已交由参谋部全网路由！"))
 			}
 
 		}

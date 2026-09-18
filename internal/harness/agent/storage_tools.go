@@ -50,7 +50,7 @@ func (s *StorageTools) ToolResult(ctx context.Context, msg *schema.Message) sess
 	return toolResultWithStore(ctx, msg, s.spill)
 }
 
-// Ask 可直接注入 guard.Config。这里只负责挂起，通用批准执行仍由 F-2 补齐。
+// Ask 可直接注入 guard.Config；批准执行与回填由 Harness 和所属 Runtime 负责。
 func (s *StorageTools) Ask(ctx context.Context, call guard.Call, reason string) (string, error) {
 	return askWithStore(ctx, call, reason, s.approvals)
 }

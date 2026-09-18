@@ -13,9 +13,14 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cloudwego/eino/flow/agent"
 	"github.com/cloudwego/eino/schema"
+	"github.com/google/uuid"
+	"go_im_gateway/internal/harness/guard"
+	"go_im_gateway/internal/harness/runstate"
+	"go_im_gateway/internal/harness/session"
 )
 
 // maxDepth 递归派发深度上限（防无限递归：子 agent 内部还能再派子 agent）。
@@ -64,6 +69,7 @@ func SetRunner(r Runner) {
 
 // Result 子任务结果。
 type Result struct {
+	Run *runstate.Ref
 	// Output 已收到的回复；Err 非 nil 时只是部分结果，不能当作成功。
 	Output string
 	// Err 子任务失败原因（并行时单个任务失败不阻塞其他任务）
@@ -77,7 +83,10 @@ func Run(ctx context.Context, prompt string) (*Result, error) {
 }
 
 // Run 使用当前实例的工厂；不会读取全局 SetRunner 配置。
-func (r Runner) Run(ctx context.Context, prompt string) (*Result, error) {
+func (r Runner) Run(ctx context.Context, prompt string) (result *Result, runErr error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if depthFrom(ctx) >= maxDepth {
 		return nil, fmt.Errorf("子智能体递归深度超过上限 %d", maxDepth)
 	}
@@ -85,9 +94,60 @@ func (r Runner) Run(ctx context.Context, prompt string) (*Result, error) {
 		return nil, fmt.Errorf("subagent runner 未设置（main 里调 subagent.SetRunner(agent.NewLoop)）")
 	}
 	childCtx := withDepth(ctx, depthFrom(ctx)+1)
+	if parent, ok := runstate.FromContext(ctx); ok {
+		ref := runstate.Ref{UserID: parent.UserID, SessionID: parent.SessionID, RunID: uuid.NewString(), ParentRunID: parent.RunID, ParentToolCallID: guard.CallID(ctx)}
+		childCtx = runstate.WithRef(childCtx, ref)
+		defer func() {
+			if result != nil {
+				result.Run = &ref
+			}
+		}()
+		if write, _ := ctx.Value(recorderKey{}).(Recorder); write != nil {
+			if err := write(childCtx, ref.UserID, []session.MemoryDTO{{Type: session.EventUserMessage, Role: "user", Content: prompt}}); err != nil {
+				return nil, fmt.Errorf("child start log: %w", err)
+			}
+			defer func() {
+				output, reason := "", "completed"
+				if result != nil {
+					output = result.Output
+				}
+				if runErr != nil {
+					reason = "error"
+				}
+				if childCtx.Err() != nil {
+					reason = "aborted"
+					if runErr == nil {
+						runErr = childCtx.Err()
+					}
+				}
+				endCtx, cancel := context.WithTimeout(context.WithoutCancel(childCtx), 5*time.Second)
+				defer cancel()
+				endReason := session.TurnCompleted
+				if runErr != nil {
+					endReason = session.TurnInterrupted
+				}
+				err := write(endCtx, ref.UserID, []session.MemoryDTO{
+					{Type: session.EventAssistantMessage, Role: "assistant", Content: output, Interrupted: runErr != nil},
+					{Type: session.EventTurnEnd, Role: "system", Content: session.TurnEndContent(endReason, reason)},
+				})
+				if err != nil {
+					runErr = errors.Join(runErr, fmt.Errorf("child result log unconfirmed: %w", err))
+				}
+				if result != nil {
+					result.Err = runErr
+				}
+			}()
+		}
+	}
 	child, err := r(childCtx)
 	if err != nil {
 		return nil, fmt.Errorf("子 agent 构造失败: %w", err)
+	}
+	if err := childCtx.Err(); err != nil {
+		return nil, err
+	}
+	if child == nil {
+		return nil, fmt.Errorf("子 agent 构造器返回空实例")
 	}
 	// 子 agent 内部再派活时深度 +1（它的工具 ctx 会带上这个值）
 	stream, err := child.Stream(childCtx, []*schema.Message{schema.UserMessage(prompt)})
@@ -109,6 +169,13 @@ func (r Runner) Run(ctx context.Context, prompt string) (*Result, error) {
 		}
 	}
 	return &Result{Output: out.String()}, nil
+}
+
+type Recorder func(context.Context, uint, []session.MemoryDTO) error
+type recorderKey struct{}
+
+func WithRecorder(ctx context.Context, write Recorder) context.Context {
+	return context.WithValue(ctx, recorderKey{}, write)
 }
 
 // RunParallel 并行派发多个独立子任务（最多 maxConcurrent 个同时跑），按输入顺序返回结果。

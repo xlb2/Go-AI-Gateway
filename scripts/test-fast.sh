@@ -5,7 +5,8 @@
 #   scripts/test-fast.sh -run Approval -v
 #
 # 只依赖 docker 里的 im_redis（没起的话用例会自动 skip，不会误报失败）。
-# 测试是**进程内**起假模型（httptest），不启动任何独立服务 —— 也就不会惊动端点防护。
+# 假模型在进程内启动；MCP 验收会用测试二进制启动临时 stdio 子进程。
+# 本脚本由用户在 WSL 运行，本机 Windows 不执行 go test（EDR 限制）。
 #
 # 注意这里是 bash 而不是 sh：需要 `set -o pipefail` 来保证管道里 go test 的
 # 退出码不被 awk 顶掉。一个"测试挂了但脚本报成功"的回归脚本比没有更糟。

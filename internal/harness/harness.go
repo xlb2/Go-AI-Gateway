@@ -41,14 +41,17 @@ import (
 
 // Harness 编排对象：持有记忆/审批/沙箱器官接口，对外提供一轮对话的唯一入口。
 type Harness struct {
+	runs      runRegistry
 	Sessions  session.Store
 	Approvals approval.Store
 	// Exec 沙箱执行器：审批通过后的动作在这里真实执行。
 	// 默认是"无隔离"的本机执行器（了解级骨架）；生产换成容器/隔离实现，上层不用改。
-	Exec      sandbox.Executor
-	newLoop   func(context.Context) (agent.Loop, error)
-	summarize session.CompactSummarizer
-	toolNames func(context.Context) []string
+	Exec           sandbox.Executor
+	newLoop        func(context.Context) (agent.Loop, error)
+	summarize      session.CompactSummarizer
+	toolNames      func(context.Context) []string
+	executeTool    func(context.Context, uint, approval.PendingAction) (string, error)
+	approvalResult func(context.Context, *schema.Message) session.MemoryDTO
 }
 
 // New 保留旧的延迟全局装配行为。新调用方使用 NewConfigured 或 NewFromEnv，
@@ -85,6 +88,10 @@ var Default = New()
 // 有挂起动作时返回 (handled=true, 提示语)；没有则返回 (false, "")，
 // 由调用方继续走正常 agent 对话。
 func (h *Harness) HandleApprovalCommand(ctx context.Context, userID uint, text string) (handled bool, reply string) {
+	cmd, arg := splitCommand(text)
+	if cmd == "auth:status" {
+		return true, h.approvalStatus(ctx, userID, arg)
+	}
 	pending, err := h.Approvals.GetPending(ctx, userID)
 	switch {
 	case errors.Is(err, approval.ErrExpired):
@@ -92,11 +99,16 @@ func (h *Harness) HandleApprovalCommand(ctx context.Context, userID uint, text s
 		// 而不是让用户以为"没有待审批任务"（人还以为提案还挂着）。
 		return true, fmt.Sprintf("⌛ 刚才挂起的高危动作已超时作废（有效期 %s），没有执行任何动作。\n要执行的话请重新发起。",
 			approval.TTL)
-	case err != nil || pending == nil:
+	case err != nil:
+		return true, fmt.Sprintf("读取审批状态失败，未执行任何动作：%v", err)
+	case pending == nil:
+		cmd, _ := splitCommand(text)
+		if cmd == "auth:approve" || cmd == "auth:reject" {
+			return true, "没有待处理的审批提案，未执行任何动作。"
+		}
 		return false, ""
 	}
 
-	cmd, arg := splitCommand(text)
 	switch cmd {
 	case "auth:approve":
 		if arg == "" {
@@ -106,21 +118,73 @@ func (h *Harness) HandleApprovalCommand(ctx context.Context, userID uint, text s
 		if arg != pending.ConfirmCode() {
 			return true, "❌ 确认码不对，没有执行任何动作。\n再次输入 auth:approve 可以看到完整提案与当前确认码。"
 		}
-		h.Approvals.ClearPending(ctx, userID)
+		runCtx, done, err := h.beginRun(ctx, userID, "approval")
+		if err != nil {
+			return true, err.Error()
+		}
+		defer done()
+		ctx = runCtx
+		claimed, err := h.claimApproval(ctx, userID, *pending, "approve")
+		if err != nil {
+			return true, fmt.Sprintf("审批未获执行权，未执行任何动作：%v", err)
+		}
 		metrics.Default.Inc("approvals_approved_total")
-		outcome := h.executeApproved(ctx, userID, *pending)
-		h.audit(ctx, userID, *pending, "approved", outcome)
-		return true, outcome
+		outcome := h.executeApproved(ctx, userID, *claimed)
+		h.audit(ctx, userID, *claimed, "approved", outcome)
+		return true, outcome + "\n查询执行状态：auth:status " + claimed.ID
 	case "auth:reject":
+		runCtx, done, err := h.beginRun(ctx, userID, "approval")
+		if err != nil {
+			return true, err.Error()
+		}
+		defer done()
+		ctx = runCtx
 		// 拒绝一步即可：不多问，因为"不做"本身就是安全的那一边
-		h.Approvals.ClearPending(ctx, userID)
+		claimed, err := h.claimApproval(ctx, userID, *pending, "reject")
+		if err != nil {
+			return true, fmt.Sprintf("审批拒绝未确认，未执行任何动作：%v", err)
+		}
+		if err := h.transitionApproval(ctx, userID, claimed.ID, approval.Claimed, approval.Rejected); err != nil {
+			return true, fmt.Sprintf("拒绝状态写入未确认，未派发执行：%v\n查询执行状态：auth:status %s", err, claimed.ID)
+		}
 		metrics.Default.Inc("approvals_rejected_total")
 		outcome := "审批已拒绝，动作取消（未执行任何动作）。"
-		h.audit(ctx, userID, *pending, "rejected", outcome)
-		return true, outcome
+		if claimed.Kind == approval.KindTool {
+			outcome = h.resolveToolApproval(ctx, userID, *claimed, false)
+		}
+		h.audit(ctx, userID, *claimed, "rejected", outcome)
+		return true, outcome + "\n查询执行状态：auth:status " + claimed.ID
 	default:
 		return true, approvalPrompt(*pending)
 	}
+}
+
+func (h *Harness) claimApproval(ctx context.Context, userID uint, pending approval.PendingAction, decision string) (*approval.PendingAction, error) {
+	allowed := false
+	for _, option := range pending.Decisions() {
+		if option == decision {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return nil, fmt.Errorf("提案不允许 %s", decision)
+	}
+	store, ok := h.Approvals.(approval.ClaimStore)
+	if !ok {
+		return nil, fmt.Errorf("审批存储不支持原子领取")
+	}
+	if _, ok := h.Approvals.(approval.ExecutionStore); !ok {
+		return nil, fmt.Errorf("审批存储不支持持久化执行状态")
+	}
+	claimed, err := store.ClaimPending(ctx, userID, pending)
+	if err != nil {
+		return nil, err
+	}
+	if claimed == nil {
+		return nil, fmt.Errorf("审批存储未返回领取的提案")
+	}
+	return claimed, nil
 }
 
 // approvalPrompt 回显待审批提案：要执行什么、什么时候作废、可以怎么回。
@@ -130,10 +194,17 @@ func (h *Harness) HandleApprovalCommand(ctx context.Context, userID uint, text s
 func approvalPrompt(p approval.PendingAction) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "⏸️ 有待审批的高危动作（%s）\n", p.Action)
+	if p.ID != "" {
+		fmt.Fprintf(&b, "提案 ID：%s\n", p.ID)
+	}
 	if p.Reason != "" {
 		fmt.Fprintf(&b, "原因：%s\n", p.Reason)
 	}
-	fmt.Fprintf(&b, "将要执行：%s\n", p.Plan.Summary())
+	if p.Kind == approval.KindTool && p.Tool != nil {
+		fmt.Fprintf(&b, "将要执行工具：%s\n完整参数：%s\n原调用：%s\n", p.Tool.Name, p.Tool.Arguments, p.Tool.CallID)
+	} else {
+		fmt.Fprintf(&b, "将要执行：%s\n", p.Plan.Summary())
+	}
 	if !p.ExpiresAt.IsZero() {
 		fmt.Fprintf(&b, "有效期：还剩 %s（%s 作废）\n",
 			p.Remaining().Truncate(time.Second), p.ExpiresAt.Format("15:04:05"))
@@ -167,6 +238,12 @@ func splitCommand(text string) (string, string) {
 //     不写清楚，审批链上流通的就是假信息，那比没有沙箱更危险。
 //  3. **如实回执**：写清"到底执行了什么、在什么隔离条件下"，失败了也要说。
 func (h *Harness) executeApproved(ctx context.Context, userID uint, p approval.PendingAction) string {
+	if p.Kind == approval.KindTool {
+		return h.resolveToolApproval(ctx, userID, p, true)
+	}
+	if p.Kind != "" && p.Kind != approval.KindSandbox {
+		return "已拒绝执行：未知审批类型"
+	}
 	if err := sandbox.Validate(p.Plan); err != nil {
 		metrics.Default.Inc("sandbox_refused_total")
 		fmt.Printf("[沙箱] 拒绝执行（执行计划非法）: %v\n", err)
@@ -194,10 +271,16 @@ func (h *Harness) executeApproved(ctx context.Context, userID uint, p approval.P
 		return msg
 	}
 
+	if err := h.transitionApproval(ctx, userID, p.ID, approval.Claimed, approval.Running); err != nil {
+		return fmt.Sprintf("执行状态写入未确认，动作未执行：%v", err)
+	}
 	metrics.Default.Inc("sandbox_runs_total")
 	start := time.Now()
 	res, runErr := exec.Run(ctx, p.Plan)
 	metrics.Default.ObserveDuration("sandbox_run_seconds", time.Since(start))
+	if err := h.finishApproval(ctx, userID, p.ID, runErr != nil || res.ExitCode != 0); err != nil {
+		return fmt.Sprintf("动作已派发，但执行状态写入未确认，需人工核实，禁止盲目重试：%v", err)
+	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "审批通过，动作已真实执行（%s）。\n", p.Action)
@@ -224,12 +307,16 @@ func (h *Harness) executeApproved(ctx context.Context, userID uint, p approval.P
 // 为什么必须落盘：审批是"人介入"的动作，要能追溯谁批的、批了什么、真实结果如何。
 func (h *Harness) audit(ctx context.Context, userID uint, p approval.PendingAction, decision, outcome string) {
 	payload, err := json.Marshal(map[string]any{
-		"decision": decision,
-		"action":   p.Action,
-		"param":    p.Param,
-		"reason":   p.Reason,
-		"plan":     p.Plan.Summary(),
-		"outcome":  outcome,
+		"proposal_id": p.ID,
+		"origin":      p.Origin,
+		"kind":        p.Kind,
+		"tool":        p.Tool,
+		"decision":    decision,
+		"action":      p.Action,
+		"param":       p.Param,
+		"reason":      p.Reason,
+		"plan":        p.Plan.Summary(),
+		"outcome":     outcome,
 	})
 	if err != nil {
 		payload = []byte(fmt.Sprintf("decision=%s action=%s", decision, p.Action))
@@ -303,6 +390,11 @@ func (h *Harness) ensureSystemPrompt(ctx context.Context, userID uint, msg *sche
 // 流程：pre 钩子(可拦) → 存系统提示/用户消息 → 投影历史 → 自研 agent 循环(流式) → 落盘回复 → post 钩子。
 // emit 逐块回调流式回复（WebSocket 直接转发）；返回完整回复文本。
 func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string, emit func(chunk string)) (out string, err error) {
+	ctx, done, err := h.beginRun(ctx, userID, "turn")
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	// 埋点：每轮结束记录轮次计数 + 耗时分布；出错额外计 errors_total
 	start := time.Now()
 	defer func() {
@@ -480,6 +572,11 @@ func (h *Harness) runLoop(ctx context.Context, userID uint, fullMessages []*sche
 //
 // 返回 resumed=false 表示没有可续跑的开放轮次（此时什么都不做）。
 func (h *Harness) ResumeTurn(ctx context.Context, userID uint, emit func(chunk string)) (string, bool, error) {
+	ctx, done, err := h.beginRun(ctx, userID, "resume")
+	if err != nil {
+		return "", false, err
+	}
+	defer done()
 	if _, open, err := h.Sessions.ResumePoint(ctx, userID); err != nil {
 		return "", false, err
 	} else if !open {

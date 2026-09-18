@@ -30,6 +30,7 @@ import (
 	einoagent "github.com/cloudwego/eino/flow/agent"
 	"github.com/cloudwego/eino/schema"
 
+	"go_im_gateway/internal/harness/guard"
 	"go_im_gateway/internal/harness/retry"
 	"go_im_gateway/internal/harness/session"
 	"go_im_gateway/internal/harness/subagent"
@@ -61,6 +62,7 @@ const (
 
 // ownLoop 就是"推倒黑盒"之后的循环。
 type ownLoop struct {
+	logNested   bool
 	model       model.ChatModel               // 已包一层重试的模型
 	tools       []tool.InvokableTool          // 已套 guard 流水线的工具（保序）
 	byName      map[string]tool.InvokableTool // 按名字查工具
@@ -185,7 +187,7 @@ func (l *ownLoop) run(ctx context.Context, input []*schema.Message, m model.Base
 		}
 	}()
 	userID, _ := getUserID(ctx) // best-effort：写事件用，取不到就写不了（不影响对话）
-	if subagent.IsNested(ctx) {
+	if subagent.IsNested(ctx) && !l.logNested {
 		// 子 agent 的痕迹不写进父会话日志：既是隔离（中间过程不该回流），
 		// 也避免父子两股 step 事件交错、把父日志的 step 序列搞乱。
 		userID = 0
@@ -361,7 +363,7 @@ func (l *ownLoop) runOne(ctx context.Context, tc schema.ToolCall) string {
 	if !ok {
 		return fmt.Sprintf("⚠️ 未知工具 %s，未执行。", tc.Function.Name)
 	}
-	out, err := it.InvokableRun(ctx, tc.Function.Arguments)
+	out, err := it.InvokableRun(guard.WithCallID(ctx, tc.ID), tc.Function.Arguments)
 	if err != nil {
 		return fmt.Sprintf("⚠️ 工具 %s 执行失败：%v", tc.Function.Name, err)
 	}
