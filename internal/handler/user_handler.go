@@ -15,8 +15,6 @@ import (
 	"gorm.io/gorm"
 )
 
-var jwtSecret = []byte("go_im_gateway_super_secret_key_2026")
-
 type CustomClaims struct {
 	UserID uint `json:"user_id"`
 	jwt.RegisteredClaims
@@ -65,9 +63,7 @@ func (h *UserHandler) Login(c *gin.Context) {
 		},
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-
-	tokenString, err := token.SignedString(jwtSecret)
+	tokenString, err := signToken(claims)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "护照签发失败"})
 		return

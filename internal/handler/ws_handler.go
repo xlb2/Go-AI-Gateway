@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
 )
@@ -128,22 +127,14 @@ func ConnectWSWithRunner(msgService ChatMessages, rdb *redis.Client, runner apps
 			return
 		}
 		//=====核心的第二步：复用JWT的核查逻辑，现场验算防伪钢印=====
-		token, err := jwt.ParseWithClaims(tokenString, &CustomClaims{}, func(token *jwt.Token) (interface{}, error) {
-			return jwtSecret, nil
-		})
-
-		if err != nil || !token.Valid {
+		claims, err := ParseToken(tokenString)
+		if err != nil {
 			fmt.Println("物理拦截：护照已过期或被篡改！")
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "无效的护照"})
 			return
 		}
 
 		//======核心的第三步：提取身份信息=======
-		claims, ok := token.Claims.(*CustomClaims)
-		if !ok {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "护照载荷损坏"})
-			return
-		}
 		userID := claims.UserID //拿到身份证明
 		//只有身份核实无误，才允许执行光缆的升级
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)

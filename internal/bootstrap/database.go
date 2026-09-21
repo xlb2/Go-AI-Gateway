@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"fmt"
+	"go_im_gateway/internal/knowledge"
 	"go_im_gateway/internal/model"
 	"log"
 	"time"
@@ -35,6 +36,9 @@ func InitDB(dsn string) *gorm.DB {
 		panic("数据库迁移失败: " + err.Error())
 	}
 	fmt.Println("数据库物理表结构已同步！")
+	if err := knowledge.Migrate(db); err != nil {
+		log.Fatalf("资料库迁移失败: %v", err)
+	}
 
 	return db
 }

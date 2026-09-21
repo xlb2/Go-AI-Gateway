@@ -1,5 +1,60 @@
 # test/ — 假模型与端到端测试
 
+最新验收补记（2026-09-21，依据用户 WSL 日志与工作区交接）：RAGEvaluation 定向2、带 knowledgeintegration 全量167项通过，0跳过；独立开发集评测执行通过。覆盖下方累计待验记录，本次提交整理未重跑运行测试。真实模型和页面端到端仍不在该证据范围内；后续暂停检索扩展，回到 Harness 学习与建设。
+
+K-0评测增量（2026-09-21，WSL待验）：`TestRAGEvaluationQueriesAndRanking`验证去重查询、稳定排序；`TestRAGEvaluationScoringAndHoldout`验证多来源部分召回、无答案候选单独计数及排除holdout。普通带knowledgeintegration全量预计167。实际语料评测`TestRAGDevelopmentEvaluation`仅在额外rageval标签下启用，由 `bash scripts/eval-rag.sh`运行，独立1项，不混入167；执行PASS不表示质量达标，见 [rag/README.md](rag/README.md)。
+
+最新验收（2026-09-21）：用户WSL `KnowledgeChunkSearch|KnowledgeSearch` 定向5、带knowledgeintegration全量165项通过，均0跳过。覆盖下方分段检索待验记录；这些是机制回归，不是K-0检索质量评分或性能测试。未提交。
+
+分段检索增量（2026-09-21，WSL待验）：新增 `TestKnowledgeChunkSearchBoundaryAndFallback`（跨窗口长词、缺失/过期规则回退与重建切换）、`TestKnowledgeChunkSearchMixedPagination`（重叠去重、片段/原文混合分页）；原SearchAgentEvidence要求实际片段命中。定向 `KnowledgeChunkSearch|KnowledgeSearch` 预计5、带tag全量165，静态检查通过。用户上一批KnowledgeChunks定向4/全量163已通过，0跳过。
+
+分段索引增量（2026-09-21，WSL待验）：新增 `TestKnowledgeChunksOriginalCoordinates`（原文无损与Unicode位置/重叠）、`TestKnowledgeChunksImportAndRebuild`（自动索引与并发重建）、`TestKnowledgeChunksFailureAtomicity`（片段/标记写失败回滚，保留旧索引）、`TestKnowledgeChunksHTTPAndExistingData`（旧资料missing、重建、分页与接口归属）。后3项需knowledgeintegration，定向KnowledgeChunks预计4，全量163；go vet通过。迁移重复检查更新至版本1/2/3/4。用户此前KnowledgeSearch定向3/全量159已通过、0跳过。
+
+关键词基线增量（2026-09-21，WSL待验）：新增 `TestKnowledgeSearchIsolationAndExactMatch`（Unicode位置、字面符号、大小写、库/用户边界）、`TestKnowledgeSearchPaginationAndVersions`（分页及旧版本排除）、`TestKnowledgeSearchAgentEvidence`（搜索候选→读取→回答→可核对快照）。需knowledgeintegration，定向KnowledgeSearch预计3、全量159；go vet通过，未跑题集质量评分。契约见 [search.md](knowledge/search.md)。
+
+最新验收（2026-09-21）：用户 WSL `scripts/test-fast.sh -tags knowledgeintegration -run KnowledgeEvidence` 定向3、带 tag全量156项通过，均0跳过。覆盖下方工具来源展示待验状态；不等同于真实模型和页面端到端验收。未提交。
+
+工具来源展示增量（2026-09-21，WSL待验）：`TestKnowledgeEvidenceSnapshot`（模型自报引用不参与、版本更新后仍打开旧片段、历史只带元数据）、`TestKnowledgeEvidenceHTTPIsolation`（用户/库/会话/轮次/事件逐层校验）、`TestKnowledgeEvidenceRejectsUnpairedResults`（孤立、失败、参数不匹配结果不生成来源）。需knowledgeintegration，定向KnowledgeEvidence预计3，全量156，静态检查通过。浏览器验证范围见 [evidence.md](knowledge/evidence.md)。
+
+最新验收（2026-09-21）：用户 WSL `scripts/test-fast.sh -tags knowledgeintegration -run KnowledgeReadingTools` 定向3、带 tag全量153项通过，均0跳过，覆盖下方资料只读工具待验记录。假模型集成回归不等于真实模型工具选择或页面端到端验收，未提交。
+
+资料只读工具增量（2026-09-21，WSL待验）：`TestKnowledgeReadingToolsScopeAndVersions` 覆盖同用户跨库/跨用户/版本串读拒绝、Unicode分页、旧版本与每轮预算；`TestKnowledgeReadingToolsPagination` 覆盖列表游标；`TestKnowledgeReadingToolsHTTPAndWriteBarrier` 覆盖列表→原文→回答及工具日志写失败停止。均需 knowledgeintegration，定向 KnowledgeReadingTools 预计3、全量153，go vet通过。详见 [reading-tools.md](knowledge/reading-tools.md)。
+
+最新验收（2026-09-21）：用户 WSL `scripts/test-fast.sh -tags knowledgeintegration -run 'KnowledgeExecutionEvents|ConfiguredLoopStepWriteBarrier'` 定向3、带 tag全量150项通过，均0跳过，覆盖下方执行日志增量待验记录。不代表真实模型/浏览器端到端已验收，未提交。
+
+会话执行日志增量（2026-09-21，WSL 待验）：新增 `TestKnowledgeExecutionEventsHTTP`（成功 step 对、start/end 写失败无 done）、`TestKnowledgeExecutionEventsFencing`（不同会话轮次隔离、结束/超期拒写），均需 knowledgeintegration；新增 `TestConfiguredLoopStepWriteBarrier`（start 失败不派工具、handoff 失败不继续调模型）。重复迁移现断言版本1/2/3。静态检查通过，定向 `KnowledgeExecutionEvents|ConfiguredLoopStepWriteBarrier` 预计3、带 tag全量150；下方147不覆盖本批。
+
+最新验收（2026-09-21）：用户 WSL `scripts/test-fast.sh -tags knowledgeintegration -run 'KnowledgeConversation|KnowledgeChat'` 定向 8、带 tag 全量 147 个顶层用例通过，均 0 跳过。覆盖下方持久会话迁移纠错与回归待验状态；不等同于真实模型和真实浏览器端到端验收。未提交。
+
+持久会话回归纠错：用户运行定向6项/全量8项因迁移版本2主键重复而失败，均发生在数据库初始化。已隔离 GORM 固定连接内的语句状态；knowledge/database 测试辅助仍连续迁移两次，并逐次核对版本集合恰为1/2。顶层用例数量不变，8/147待重验，不能标通过。
+
+持久会话增量（2026-09-21，待 WSL）：新增 5 项 KnowledgeConversation 测试，旧 Chat HTTP 测试切换会话协议，覆盖存储恢复/归属、版本快照、并发去重/过期页面、超期 writer、写入屏障与取消。详见 [knowledge/conversations.md](knowledge/conversations.md)。定向 KnowledgeConversation|KnowledgeChat 预计 8，带 tag 全量 147；前一轮 142 不覆盖本次代码。
+
+最新验收（2026-09-21）：用户 WSL `scripts/test-fast.sh -tags knowledgeintegration -run KnowledgeChat` 定向 3、带 tag 全量 142 个顶层用例通过，0 跳过，覆盖下方 Chat 待验记录。该证据不包含真实模型和浏览器上传/取消端到端验证。
+
+2026-09-21：用户 K-1 首批 Knowledge 定向 5、带 knowledgeintegration 全量 139 通过，0 跳过。新增 Chat 三项（下表）静态检查通过、WSL 待验；带 tag 全量预计 142。旧待验记录由本条覆盖，但不将旧结果用于新增代码。
+
+| 用例 | 守护的不变量 |
+|---|---|
+| TestKnowledgeChatHistoryContract | 限制角色、轮次和长度，拒绝客户端 system 注入 |
+| TestKnowledgeChatAttachmentContract | 原文和标题进入本轮上下文，缺少附件及超限拒绝 |
+| TestKnowledgeChatHTTPIsolationAndStream | MySQL 归属过滤、模型收到附件、流式结束、错误脱敏及释放名额、无旧历史混入 |
+
+K-1 第一批：新增 knowledge/ 三项无数据库测试与两项显式 `knowledgeintegration` MySQL 集成测试，详见 [knowledge/README.md](knowledge/README.md)。静态检查通过，WSL 未运行；`scripts/test-fast.sh -tags knowledgeintegration -run Knowledge` 预计 5 项，全量带 tag 预计 139 项。普通快速回归不包含两个 MySQL 用例，不据此宣称数据库通过。
+
+最新验收（2026-09-21）：用户在 Redis PONG 后运行 JWT|LegacyWS|F3Boundary 定向 8、全量 134 项，均通过、0 跳过。覆盖下方 JWT 待验与此前 Redis 不可用时的跳过结果；不代表真实 API 启动或生产部署已验证。未提交。
+
+2026-09-21 JWT 修复：新增 `assembly/jwt_test.go` 三个顶层用例，覆盖无效配置、旧公开密钥伪造、算法/有效期/用户 ID、密钥更换与 HTTP/WS/RPC 拒绝；旧 WS 用例改用显式测试密钥。`go vet ./...` 通过，用户 WSL 待验：`scripts/test-fast.sh -run 'JWT|LegacyWS|F3Boundary'` 和全量，预计 8/134，以实际为准。旧公开密钥只在负向测试中保留，不作为配置默认值。
+
+F-4 状态更正：用户已提供定向 2、全量 131 项通过，0 跳过，下方待验为历史记录；该结果不覆盖本次 JWT 改动。K-0 RAG 样本见 `rag/README.md`，仅为待运行的评测设计，不计入 Go 测试数量。
+
+F-4 固定场景验收已实现，待用户 WSL 执行 `scripts/test-fast.sh -run Framework` 与全量。说明见 [framework.md](framework.md)。本批只增加测试与文档，静态检查通过，尚不能标记 F-4 验收完成。
+
+| 用例 | 守护的不变量 |
+|---|---|
+| `TestFrameworkAcceptance` | 同一发布任务覆盖成功/拒绝/失败/取消，检查执行次数、审批状态、名额释放、新 Harness 读取历史且不重放副作用 |
+| `TestFrameworkReplacement` | 两个独立模型 HTTP 替身与两个工具通过统一配置接入，原模型零请求，不修改核心循环 |
+
 F-3 收口验收通过（2026-09-18）：用户 WSL F3Boundary 定向 3、全量 129 个顶层用例通过，0 跳过；提交前 go vet 通过。F-2/F-3 在约定框架范围内完成，下方各批待验描述保留为历史记录，以本条最新验收为准；真实任务统一验收归 F-4。
 
 | 用例 | 守护的不变量 |

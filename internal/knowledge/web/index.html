@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>资料工作台</title><link rel="stylesheet" href="/knowledge/style.css"><script src="/knowledge/conversations.js" defer></script><script src="/knowledge/app.js" defer></script></head>
+<body>
+<section id="auth">
+  <a class="brand" href="/knowledge"><span class="brand-mark" aria-hidden="true">K</span> 资料工作台</a>
+  <div class="auth-inner"><span class="eyebrow">KNOWLEDGE WORKSPACE</span><h1>回到你的资料工作台</h1><form id="loginForm">
+    <label>用户名<input id="username" autocomplete="username" required minlength="3" maxlength="20"></label><label>密码<input id="password" type="password" autocomplete="current-password" required minlength="6"></label>
+    <button class="primary" type="submit">登录</button><button id="register" type="button">注册账号</button>
+  </form></div>
+</section>
+<main id="workspace" hidden>
+  <aside id="sidebar" aria-label="工作区导航">
+    <div class="sidebar-brand"><a class="brand" href="/knowledge"><span class="brand-mark" aria-hidden="true">K</span> 资料工作台</a><button id="closeSidebar" class="icon-button mobile-only" title="收起导航" aria-label="收起导航">×</button></div>
+    <button id="clearChat" class="new-chat"><span aria-hidden="true">＋</span> 新建对话</button>
+    <div class="nav-heading"><h2>资料库</h2><button id="newLibrary" class="icon-button" title="新建资料库" aria-label="新建资料库">＋</button></div>
+    <form id="libraryForm" hidden><label class="sr-only" for="libraryName">新资料库名称</label><div class="inline"><input id="libraryName" maxlength="100" required placeholder="资料库名称"><button type="submit" class="icon-button" title="创建资料库" aria-label="创建资料库">↵</button></div></form>
+    <nav id="libraries" aria-label="资料库列表"></nav><button id="moreLibraries" class="text-button" hidden>加载更多资料库</button>
+    <div class="nav-heading"><h2>对话记录</h2></div><nav id="conversations" aria-label="会话列表"></nav><button id="moreConversations" class="text-button" hidden>加载更多对话</button>
+    <div class="sidebar-bottom"><span class="account-avatar" aria-hidden="true">我</span><span>个人工作区<small>资料与对话</small></span><button id="logout" class="icon-button" title="退出登录" aria-label="退出登录">⇥</button></div>
+  </aside>
+  <button id="sidebarBackdrop" class="backdrop" aria-label="收起导航" hidden></button>
+  <div class="main-column">
+    <header class="topbar">
+      <div class="title-group"><button id="openSidebar" class="icon-button mobile-only" title="打开导航" aria-label="打开导航">☰</button><span class="breadcrumb">工作台<span aria-hidden="true">/</span></span><h1 id="libraryTitle">选择资料库</h1></div>
+      <div class="header-actions"><button id="refresh" class="icon-button" title="刷新资料" aria-label="刷新资料">↻</button><button id="filesTab" aria-expanded="false" aria-controls="filesPanel">资料 <span id="sourceCount" class="count">0</span></button></div>
+    </header>
+    <div class="work-area">
+      <section id="chatPanel" aria-label="资料对话">
+        <div id="conversationScroll"><div id="chatEmpty" class="chat-empty"><div class="empty-mark" aria-hidden="true">K</div><h2>从一个问题开始</h2><p id="emptyContext">选择你的资料库</p></div><div id="messages" role="log" aria-label="对话记录" aria-live="polite"></div></div>
+        <div class="composer-dock">
+          <form id="chatForm">
+            <div id="attachments"></div><label class="sr-only" for="chatInput">消息</label><textarea id="chatInput" rows="2" maxlength="16000" required placeholder="提问，或附上资料一起聊聊…"></textarea>
+            <div class="composer-toolbar"><div class="composer-tools">
+              <button id="uploadButton" type="button" class="icon-button" title="上传附件" aria-label="上传附件">＋</button><input id="chatFile" type="file" accept=".md,.txt" hidden>
+              <label class="sr-only" for="chatSource">选择资料附件</label><select id="chatSource" title="选择资料附件"><option value="">添加资料</option></select>
+            </div><span id="generationState" class="generation-state" role="status"></span><button id="sendChat" class="send-button" type="submit" title="发送消息" aria-label="发送消息">↑</button><button id="stopChat" class="send-button stop-button" type="button" title="停止生成" aria-label="停止生成" hidden>■</button></div>
+          </form>
+          <div class="composer-meta"><span id="scopeLabel">尚未选择资料库</span><span>回复由 AI 生成</span></div>
+        </div>
+      </section>
+      <section id="filesPanel" aria-label="资料面板" hidden>
+        <div class="panel-heading"><div><span class="eyebrow">LIBRARY</span><h2>资料</h2></div><button id="chatTab" class="icon-button" title="关闭资料面板" aria-label="关闭资料面板">×</button></div>
+        <form id="importForm" hidden><label>导入资料<input id="file" type="file" accept=".md,.txt" required></label><div class="inline"><label class="sr-only" for="sourceTitle">资料标题</label><input id="sourceTitle" maxlength="200" placeholder="标题（默认文件名）"><button type="submit">导入</button></div><span class="subtle">Markdown / TXT · 最大 2 MiB</span></form>
+        <div class="source-list"><p id="empty">请先创建或选择资料库。</p><div id="sources"></div><button id="moreSources" class="text-button" hidden>加载更多资料</button></div>
+        <article class="reader"><div class="reader-heading"><h2 id="documentTitle">原文</h2><button id="attachCurrent" class="icon-button" title="附加到对话" aria-label="附加到对话" disabled>＋</button></div><p id="documentMeta" class="subtle"></p><pre id="body">选择一份资料开始阅读。</pre></article>
+      </section>
+    </div>
+  </div>
+</main><div id="notice" role="status" aria-live="polite"></div>
+</body></html>

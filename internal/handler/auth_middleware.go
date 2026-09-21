@@ -37,15 +37,19 @@ func JWTAuthMiddleware() gin.HandlerFunc {
 }
 
 func ParseToken(tokenString string) (*CustomClaims, error) {
+	key, err := jwtSigningKey()
+	if err != nil {
+		return nil, fmt.Errorf("身份验证配置不可用")
+	}
 	token, err := jwt.ParseWithClaims(tokenString, &CustomClaims{}, func(token *jwt.Token) (interface{}, error) {
-		return jwtSecret, nil
-	})
+		return key, nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithExpirationRequired())
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("护照已过期或防伪钢印被篡改: %v", err)
 	}
 
 	claims, ok := token.Claims.(*CustomClaims)
-	if ok && token.Valid {
+	if ok && token.Valid && claims.UserID != 0 {
 		return claims, nil
 	}
 	return nil, fmt.Errorf("护照载荷解析失败")

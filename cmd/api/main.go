@@ -26,6 +26,9 @@ import (
 func main() {
 	// 1. 加载全局配置
 	cfg := config.LoadConfig()
+	if err := handler.ValidateJWTConfig(); err != nil {
+		log.Fatalf("JWT 配置无效: %v", err)
+	}
 
 	// 2. 监听系统信号，支持优雅停机
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

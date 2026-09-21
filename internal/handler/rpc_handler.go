@@ -5,7 +5,6 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 
 	"go_im_gateway/internal/harness/appserver"
 )
@@ -19,16 +18,9 @@ func RPCConnect(runner appserver.AgentRunner) gin.HandlerFunc {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "请求未携带护照"})
 			return
 		}
-		token, err := jwt.ParseWithClaims(tokenString, &CustomClaims{}, func(token *jwt.Token) (interface{}, error) {
-			return jwtSecret, nil
-		})
-		if err != nil || !token.Valid {
+		claims, err := ParseToken(tokenString)
+		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "无效的护照"})
-			return
-		}
-		claims, ok := token.Claims.(*CustomClaims)
-		if !ok {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "护照载荷损坏"})
 			return
 		}
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)

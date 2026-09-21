@@ -3,7 +3,9 @@ package bootstrap
 import (
 	"go_im_gateway/internal/handler"
 	"go_im_gateway/internal/harness"
+	"go_im_gateway/internal/harness/agent"
 	"go_im_gateway/internal/harness/metrics"
+	"go_im_gateway/internal/knowledge"
 	"go_im_gateway/internal/service"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +19,15 @@ func InitGinRouter(
 	rdb *redis.Client,
 ) *gin.Engine {
 	r := gin.Default()
+	knowledge.RegisterPage(r)
+	knowledgeGroup := r.Group("/api/v1", handler.JWTAuthMiddleware())
+	knowledge.Register(knowledgeGroup, knowledge.NewStore(userHandler.DB))
+	// The document chat has its own explicit input scope, not the legacy user history.
+	if cfg, err := agent.RuntimeConfigFromEnv(); err == nil {
+		knowledge.NewChat(knowledge.NewStore(userHandler.DB), cfg.NewModel).Register(knowledgeGroup)
+	} else {
+		knowledge.NewChat(knowledge.NewStore(userHandler.DB), nil).Register(knowledgeGroup)
+	}
 
 	// 启动WebSocket心跳检测
 	handler.StartHeartbeatChecker()

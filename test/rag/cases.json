@@ -1,0 +1,26 @@
+{
+  "version": "k0-v1",
+  "status": "designed-not-executed",
+  "cases": [
+    {"id":"Q01","split":"dev","kind":"exact","question":"CompactionTo 和 FoldPoint 分别表示什么？","sources":["S02"],"evidence":"三个决策","expected":"覆盖终点与读取起点职责不同，不能扩大摘要覆盖范围。","must_not":"把摘要追加位置当成全部可丢弃历史的终点"},
+    {"id":"Q02","split":"dev","kind":"semantic","question":"压缩后消息少了，为什么不一定是好事？","sources":["S02"],"evidence":"一个真实错误","expected":"未被摘要覆盖的近期消息可能被读取指针跳过。","must_not":"只以 token 降低判定压缩正确"},
+    {"id":"Q03","split":"dev","kind":"exact","question":"添加工具需要单独修改提示词工具列表吗？","sources":["S03"],"evidence":"RuntimeConfig.ExtraTools","expected":"统一装配的工具清单与提示词名称同源。","must_not":"声称任意旧兼容路径都已完全隔离"},
+    {"id":"Q04","split":"dev","kind":"semantic","question":"共享一个模型工厂意味着父子任务用同一个模型对象吗？","sources":["S03"],"evidence":"共享工厂","expected":"工厂按次产生独立模型，不共享可变绑定状态。","must_not":"把工厂与模型实例混为一谈"},
+    {"id":"Q05","split":"dev","kind":"exact","question":"PendingAction.Param 和 Tool.Arguments 可以互换吗？","sources":["S04"],"evidence":"展示摘要不是执行参数","expected":"Param 可截断，执行参数必须完整保留。","must_not":"用展示摘要执行"},
+    {"id":"Q06","split":"dev","kind":"semantic","question":"批准一次工具后，下次调用就不用再批准了吗？","sources":["S04"],"evidence":"批准只作用于这次调用","expected":"单次授权，不永久信任工具服务器。","must_not":"批准自动升级为永久权限"},
+    {"id":"Q07","split":"dev","kind":"exact","question":"approval:<提案ID> 为什么是新的工具调用 ID？","sources":["S04"],"evidence":"等待审批","expected":"原调用已有等待结果，新调用对记录实际执行，避免同 ID 重复结果。","must_not":"覆盖原等待记录"},
+    {"id":"Q08","split":"dev","kind":"semantic","question":"工具返回 error 能证明没有改动远端吗？","sources":["S04"],"evidence":"领取之后进程退出","expected":"不能，效果可能发生但响应失败，记录 unknown 并核实。","must_not":"自动重试非幂等副作用"},
+    {"id":"Q09","split":"dev","kind":"exact","question":"parent_run_id 和 parent_tool_call_id 记录哪一层父任务？","sources":["S05"],"evidence":"归属关系","expected":"直接父运行和派发调用，不能只记根运行。","must_not":"孙任务一律只关联最顶层"},
+    {"id":"Q10","split":"dev","kind":"semantic","question":"按了取消，为什么还不能立即发起下一任务？","sources":["S05"],"evidence":"取消和退出","expected":"取消是协作信号，入口实际退出才释放占用。","must_not":"cancel 会强制杀掉 goroutine"},
+    {"id":"Q11","split":"dev","kind":"multi","question":"工具记录成功与模型成功续答有什么区别？","sources":["S04","S06"],"evidence":"succeeded 与模型续答；取消时结果写入","expected":"执行状态与结果日志/模型续答是不同证据，后者仍可失败。","must_not":"succeeded 证明整个任务完美结束"},
+    {"id":"Q12","split":"dev","kind":"conflict","question":"讲义说独立子日志没实现，另一份却画了子日志，怎么理解？","sources":["S03","S05"],"evidence":"独立子任务日志仍未实现；独立子日志","expected":"按 F-1 历史与 F-3 后续描述区分，不抹去来源差异。","must_not":"把两份材料都当成同一时刻的现状"},
+    {"id":"Q13","split":"dev","kind":"unanswerable","question":"这个系统在生产环境的 P99 延迟是多少？","sources":[],"evidence":"none","expected":"语料没有生产性能测量，无法给数值。","must_not":"编造毫秒值"},
+    {"id":"Q14","split":"dev","kind":"unanswerable","question":"系统支持每秒一万并发用户的硬件配置是什么？","sources":[],"evidence":"none","expected":"没有规模测试或部署配置依据。","must_not":"凭一般经验当成本项目验证结论"},
+    {"id":"Q15","split":"holdout","kind":"semantic","question":"日志已经有子任务了，为何还不能直接批准子任务？","sources":["S05"],"evidence":"为什么子审批暂时拒绝","expected":"用户审批槽及续答属于主会话，子挂起恢复与回填未接通。","must_not":"有日志就等于能安全恢复执行"},
+    {"id":"Q16","split":"holdout","kind":"exact","question":"MCP 的 result.IsError 为 true 但 Go error 为 nil 时怎么办？","sources":["S04"],"evidence":"真实协议与真实模型","expected":"协议成功不代表业务成功，桥接为执行错误。","must_not":"一律报告执行成功"},
+    {"id":"Q17","split":"holdout","kind":"multi","question":"取消审批任务后，哪些事实可以确认，哪些不能？","sources":["S05","S06"],"evidence":"取消和退出；取消分支","expected":"等待任务退出核实名额释放，保留 unknown；不证明副作用回滚或结果日志必达。","must_not":"收到取消即证明零副作用"},
+    {"id":"Q18","split":"holdout","kind":"semantic","question":"为什么压缩保留内容可能超过设置的保留比例？","sources":["S02"],"evidence":"保留完整轮次","expected":"边界回退到完整轮次以保护工具配对，比例为软目标。","must_not":"承诺无限保留原文"},
+    {"id":"Q19","split":"holdout","kind":"semantic","question":"F-4 使用两个模型服务证明了不同厂商模型都可靠了吗？","sources":["S06"],"evidence":"替换验收","expected":"仅证明配置替换与受控协议链，不证明各厂商推理质量。","must_not":"将假模型回归当真实模型质量评测"},
+    {"id":"Q20","split":"holdout","kind":"unanswerable","question":"当前向量数据库的备份恢复命令是什么？","sources":[],"evidence":"none","expected":"这些资料未定义向量数据库与备份方案。","must_not":"虚构已部署数据库和命令"}
+  ]
+}

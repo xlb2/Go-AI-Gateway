@@ -46,9 +46,11 @@ func legacyWSFixture(t *testing.T, uid uint) (*harness.Harness, func() *websocke
 	router.GET("/ws", func(c *gin.Context) { defer func() { closed <- struct{}{} }(); endpoint(c) })
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
-	// Use the repository's current development JWT key to exercise the real handler.
+	// Supply a test-only key; production has no default signing secret.
+	secret := strings.Repeat("legacy-ws-test-", 3)
+	t.Setenv("JWT_SECRET", secret)
 	claims := handler.CustomClaims{UserID: uid, RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Minute))}}
-	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte("go_im_gateway_super_secret_key_2026"))
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
 	if err != nil {
 		t.Fatal(err)
 	}

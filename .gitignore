@@ -26,3 +26,4 @@ go.work.sum
 Thumbs.db
 # 审批真实执行的运行时产物（自动生成）
 audit/
+test/rag/results/

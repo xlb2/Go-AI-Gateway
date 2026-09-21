@@ -200,47 +200,55 @@ func (l *ownLoop) run(ctx context.Context, input []*schema.Message, m model.Base
 			sw.Send(nil, err)
 			return
 		}
-		l.logStepEvent(ctx, userID, session.EventStepStart, "")
+		if err := l.logStepEvent(ctx, userID, session.EventStepStart, ""); err != nil {
+			sw.Send(nil, err)
+			return
+		}
 
 		chunks, err := drain(ctx, reader, sw)
 		reader = nil // drain 拥有并关闭本步 reader。
 		if err != nil {
-			l.logStepEvent(ctx, userID, session.EventStepEnd, string(reasonForError(ctx)))
-			sw.Send(nil, err) // 契约 2：中断原样透传（调用方据此标 interrupted）
+			logErr := l.logStepEvent(ctx, userID, session.EventStepEnd, string(reasonForError(ctx)))
+			sw.Send(nil, errors.Join(err, logErr))
 			return
 		}
 
 		full, err := schema.ConcatMessages(chunks) // 契约 5：流式分片拼成完整消息（含 tool_call 合并）
 		if err != nil {
-			l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepError))
-			sw.Send(nil, fmt.Errorf("拼接模型回复失败: %w", err))
+			logErr := l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepError))
+			sw.Send(nil, errors.Join(fmt.Errorf("拼接模型回复失败: %w", err), logErr))
 			return
 		}
 		messages = append(messages, full)
 
 		if isTruncated(full) {
-			l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepMaxTokens))
-			sw.Send(nil, ErrOutputTruncated)
+			logErr := l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepMaxTokens))
+			sw.Send(nil, errors.Join(ErrOutputTruncated, logErr))
 			return // 被 token 上限截断：以非 EOF 错误结束
 		}
 		if len(full.ToolCalls) == 0 {
-			l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepCompleted))
+			if err := l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepCompleted)); err != nil {
+				sw.Send(nil, err)
+			}
 			return // 退出：模型不再要工具，这一轮说完
 		}
 
 		results, err := l.executeTools(ctx, userID, full.ToolCalls)
 		if err != nil {
-			l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepError))
-			sw.Send(nil, err)
+			logErr := l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepError))
+			sw.Send(nil, errors.Join(err, logErr))
 			return
 		}
 		messages = append(messages, results...)
 		if step == l.maxSteps {
-			l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepMaxSteps))
-			sw.Send(nil, fmt.Errorf("%w: %d", ErrMaxSteps, l.maxSteps))
+			logErr := l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepMaxSteps))
+			sw.Send(nil, errors.Join(fmt.Errorf("%w: %d", ErrMaxSteps, l.maxSteps), logErr))
 			return
 		}
-		l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepHandoff))
+		if err := l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepHandoff)); err != nil {
+			sw.Send(nil, err)
+			return
+		}
 
 		next, err := m.Stream(ctx, messages) // 交棒：把工具结果喂回去再调一次模型
 		if err != nil {
@@ -256,9 +264,9 @@ func (l *ownLoop) run(ctx context.Context, input []*schema.Message, m model.Base
 }
 
 // logStepEvent 把 step 边界写进日志（log-only，不喂模型）。user_id 取不到就跳过（best-effort）。
-func (l *ownLoop) logStepEvent(ctx context.Context, userID uint, kind, content string) {
+func (l *ownLoop) logStepEvent(ctx context.Context, userID uint, kind, content string) error {
 	if userID == 0 {
-		return
+		return nil
 	}
 	write := l.writeEvents
 	if write == nil {
@@ -267,8 +275,9 @@ func (l *ownLoop) logStepEvent(ctx context.Context, userID uint, kind, content s
 	if err := write(ctx, userID, []session.MemoryDTO{{
 		Type: kind, Role: "system", Content: content,
 	}}); err != nil {
-		fmt.Printf(" [step] %s 写入未确认: %v\n", kind, err)
+		return fmt.Errorf("step event %s: %w", kind, err)
 	}
+	return nil
 }
 
 // isTruncated 这次模型输出是不是被 token 上限截断了（OpenAI 协议：finish_reason == "length"）。
