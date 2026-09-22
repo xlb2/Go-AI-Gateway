@@ -32,6 +32,8 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 	ctx = context.WithValue(ctx, "user_id", userID)
 	display := newDisplay(output)
 	showReasoning := true
+	pasteMode := false
+	var paste strings.Builder
 	readCtx, stopReading := context.WithCancel(ctx)
 	defer stopReading()
 	type line struct {
@@ -61,8 +63,14 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := display.prompt(); err != nil {
-			return err
+		if pasteMode {
+			if _, err := io.WriteString(output, "... "); err != nil {
+				return err
+			}
+		} else {
+			if err := display.prompt(); err != nil {
+				return err
+			}
 		}
 		var next line
 		select {
@@ -80,29 +88,58 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 			return fmt.Errorf("read input: %w", next.err)
 		}
 		text := strings.TrimSpace(next.text)
-		if text == "" {
+		pasted := false
+		if pasteMode {
+			switch text {
+			case "/cancel":
+				paste.Reset()
+				pasteMode = false
+				continue
+			case "/send":
+				text = strings.TrimSuffix(paste.String(), "\n")
+				paste.Reset()
+				pasteMode = false
+				pasted = true
+			default:
+				if paste.Len()+len(next.text)+1 > 64*1024 {
+					return fmt.Errorf("paste exceeds 64 KiB; nothing sent")
+				}
+				paste.WriteString(next.text)
+				paste.WriteByte('\n')
+				continue
+			}
+		}
+		if strings.TrimSpace(text) == "" {
 			continue
 		}
-		switch text {
-		case "/reasoning on", "/reasoning off":
-			showReasoning = text == "/reasoning on"
-			if _, err := fmt.Fprintf(output, "Reasoning display: %s\n", strings.TrimPrefix(text, "/reasoning ")); err != nil {
-				return err
+		if !pasted {
+			switch text {
+			case "/paste":
+				pasteMode = true
+				if _, err := fmt.Fprintln(output, "Paste mode: /send submits, /cancel discards (on a separate line)."); err != nil {
+					return err
+				}
+				continue
+			case "/reasoning on", "/reasoning off":
+				showReasoning = text == "/reasoning on"
+				if _, err := fmt.Fprintf(output, "Reasoning display: %s\n", strings.TrimPrefix(text, "/reasoning ")); err != nil {
+					return err
+				}
+				continue
+			case "/exit":
+				return nil
+			case "/help":
+				if _, err := fmt.Fprintln(output, "\nCommands\n  /help                Show commands\n  /exit                Exit\n  /paste               Collect multiline input; /send submits, /cancel discards\n  /reasoning on|off    Show / hide provider reasoning\n  auth:approve [code]   Review / confirm approval\n  auth:reject          Reject pending action\n  auth:status <id>     Check action status\n\nCtrl+C cancels an active turn; exits when idle."); err != nil {
+					return err
+				}
+				continue
 			}
-			continue
-		case "/exit":
-			return nil
-		case "/help":
-			if _, err := fmt.Fprintln(output, "\nCommands\n  /help                Show commands\n  /exit                Exit\n  /reasoning on|off    Show / hide provider reasoning\n  auth:approve [code]   Review / confirm approval\n  auth:reject          Reject pending action\n  auth:status <id>     Check action status\n\nCtrl+C cancels an active turn; exits when idle."); err != nil {
-				return err
+			if strings.HasPrefix(text, "/") {
+				if _, err := fmt.Fprintln(output, "Unknown command. /help"); err != nil {
+					return err
+				}
+				continue
 			}
-			continue
-		}
-		if strings.HasPrefix(text, "/") {
-			if _, err := fmt.Fprintln(output, "Unknown command. /help"); err != nil {
-				return err
-			}
-			continue
 		}
 		if err := display.begin(); err != nil {
 			return err
@@ -150,6 +187,11 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 				outputMu.Lock()
 				defer outputMu.Unlock()
 				if closed || chunk == "" || writeErr != nil {
+					return
+				}
+				writeErr = display.clearProgress()
+				if writeErr != nil {
+					cancel()
 					return
 				}
 				if kind == "answer" {
@@ -210,7 +252,12 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 					emitSection("reasoning", chunk)
 				}
 			})
-			handled, reply := runner.HandleApprovalCommand(runCtx, userID, text)
+			// Pasted commands are message content, never approval actions.
+			var handled bool
+			var reply string
+			if !pasted {
+				handled, reply = runner.HandleApprovalCommand(runCtx, userID, text)
+			}
 			var err error
 			if !handled {
 				reply, err = runner.RunAgentTurn(runCtx, userID, text, emit)
@@ -221,6 +268,9 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 			}
 			outputMu.Lock()
 			closed = true
+			if writeErr == nil {
+				writeErr = display.clearProgress()
+			}
 			if writeErr == nil {
 				writeErr = display.finishReasoning()
 			}
@@ -247,6 +297,9 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 			return outcome.writeErr
 		}
 		if _, err := fmt.Fprintln(output); err != nil {
+			return err
+		}
+		if err := display.toolSummary(); err != nil {
 			return err
 		}
 		if wasCanceled || errors.Is(outcome.runErr, context.Canceled) {

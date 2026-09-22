@@ -1,5 +1,25 @@
 # test/ — 假模型与端到端测试
 
+2026-09-22 累计回归最新验收：用户提供WSL `bash scripts/test-fast.sh -tags knowledgeintegration` 结果，189个顶层用例通过、0跳过，覆盖此前工作区读取/搜索上下文、工具诊断分类、模型输入证据、步数默认20及显式/paste改动的回归待验记录。真实模型对话可见8次调用及定点补读，但引用完整性和300字约束仍有不足，不将模型自述当执行证据。自动多行粘贴与输入编辑优化按用户要求后置，真实终端/paste及运行中取消仍待交互验收。本轮仅记录用户测试证据，未重跑测试、未提交或push。
+
+2026-09-22 CLI多行粘贴（未提交）：逐行Scanner会把多段粘贴排成多轮，新增显式/paste收集、独立行/send提交、/cancel丢弃；保留空行，粘贴正文不走CLI/审批命令分派，EOF/Ctrl+C退出不提交未完成正文，64KiB累计上限。普通模式仍逐行提交，未实现自动粘贴识别。新增TestCLIPaste覆盖多段CRLF、命令正文、取消、空提交、EOF及超限；go vet含tag与CLI构建通过，用户WSL定向及全量待验，未运行本地测试。
+
+2026-09-22 搜索上下文与限制分类（未提交）：search_files默认前后2行、context_lines可选0..5，重叠窗口去重并标记match，50行上限含上下文。结果新增has_more/content_truncated/scan_limited，旧truncated为三者或；CLI改为more/clipped/limited分项统计。新增WorkspaceSearchContext和WorkspaceResultLimitsDistinct，调整真实Harness汇总断言；go vet含tag与CLI构建通过，WSL Workspace预计7/累计全量188待验。未改外存阈值、未增加符号工具，待同题实际对照调用数与回答质量。
+
+2026-09-22 CLI工具诊断汇总（未提交）：Progress增加实际工具耗时/规范化参数哈希和已知文件工具结果元数据，CLI每轮汇总次数、耗时、截断、重复，最多显示最近3次read_file实际行范围，不恢复逐调用刷屏，不打印参数正文。截断含分页，重复非自动错误判定；未知结果不猜测。加强ConfiguredLoopsKeepDependenciesSeparate和WorkspaceHarnessRead（真实SDK输入证据及CLI统计）既有用例，无新增顶层测试；go vet含tag及CLI构建通过，WSL定向2/全量186待重验。Agent最新“全是定位符”自述仍非事实证据，本轮不改外存、不新增outline。
+
+2026-09-22 验收与步数调整（未提交）：用户WSL模型输入证据定向4项、knowledgeintegration全量186项通过、0跳过，覆盖此前工作区工具/CLI收起/模型证据待验。按用户要求默认maxSteps从10改为20，仍可由AGENT_MAX_STEPS正整数覆盖，未改用户.env，不改变触顶报错语义。每步为一次模型调用，可含多个工具；本次常量调整后go vet含tag及CLI构建通过，运行未重验，不能把此前186当调整后证据。
+
+2026-09-22 模型输入证据回归（未提交）：针对Agent外存/推理反馈新增TestStorageSpillThresholdPerResult、TestModelEvidenceLargeResultAcrossTurns、TestModelEvidenceReasoningRoles及TestWorkspaceEmptySearchFields。假模型测试快照保留role/content/reasoning_content（不经摘要JSON接口暴露），核对单条2000rune阈值、本轮正文/跨轮定位符/再次load、同轮assistant推理字段与user/历史隔离。工作区结果显式lines=[]、skipped=0；未调整外存策略或步数。go vet含tag与CLI构建通过，WSL定向4/累计全量186待验；未声称已证实或复现真实历史对话异常。详见test/model-evidence.md。
+
+用例表见 [模型输入证据验收](model-evidence.md)。
+
+2026-09-22 CLI工具状态收起（未提交）：按用户要求将模型/工具状态改为终端单行原地更新，回答/推理/结束前清除，每轮只保留工具调用次数；非TTY仅汇总，不刷状态明细。工具事件持久化与错误传播不变，修正NO_COLOR下等待行清理。调整TestCLIToolProgress断言，go vet含tag及CLI构建通过，WSL CLI8项及累计全量182待验。用户真实日志证明工作区工具能调用，但本次代码解释触及10步上限未完成；不因此标记任务成功，本批不调整步数预算。
+
+2026-09-22 CLI只读工作区（未提交）：新增internal/workspace及CLI -workspace（默认当前目录），通过Runtime.ExtraTools装配list_files/read_file/search_files，不改Loop或API/Web文件权限。os.Root限根、拒符号链接/父目录/绝对路径、排除隐藏与常见敏感/生成路径，普通UTF-8文件1MiB上限，行号/分页/截断及扫描预算明确。并发恶意文件替换、挂载/硬链接及源码硬编码秘密不保证，范围见docs/cli.md。新增test/workspace三项与e2e一项，go vet含tag及CLI构建通过；WSL Workspace预计4/带knowledgeintegration全量182待验，真实模型读代码待验。当前git main与本地origin/main一致（只读status，未fetch/push），本轮不提交。
+
+用例表与运行命令见 [只读工作区工具](workspace/README.md)。
+
 2026-09-22 提交前最终验收：用户 WSL `bash scripts/test-fast.sh -tags knowledgeintegration` 全量178项通过、0跳过，覆盖本批CLI、OpenCode、工具进度、推理字段及单行窗口相关测试，覆盖下方旧待验状态。本地最终go vet含knowledgeintegration/rageval通过，固定CLI构建通过；真实窄终端/缩放/复制粘贴、运行中取消仍不在本次自动回归证据内。完整交接见 [CLI 文档](../docs/cli.md)。
 
 2026-09-22 推理单行窗口（未提交）：用户确认真实推理字段可见，要求缩短显示。CLI仅保留最近120 rune，按实时终端宽度保守双列预算截尾，原地重绘，回答/工具状态/结束时清除；过滤换行及控制字符，NO_COLOR仍可单行更新，非TTY或TERM=dumb只输出一次收到推理的提示、不输出全文。使用已在go.sum和本地缓存的x/term v0.41.0读取宽度。保留终端原生输入、选中复制和粘贴，未接管剪贴板/鼠标，仍不支持将多行粘贴作为单条编辑。调整TestCLIReasoning纯文本断言；静态检查及构建通过，WSL CLI8项与实际窄窗口/复制粘贴待验，未运行本地测试。

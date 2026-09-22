@@ -15,11 +15,18 @@ import (
 )
 
 type display struct {
-	out             io.Writer
-	color           bool
-	terminal        *os.File
-	reasoningTail   []rune
-	reasoningActive bool
+	out                 io.Writer
+	color               bool
+	terminal            *os.File
+	reasoningTail       []rune
+	reasoningActive     bool
+	progressActive      bool
+	toolCalls           int
+	toolTime            time.Duration
+	truncated, repeated int
+	more, limited       int
+	seen                map[string]bool
+	reads               []agent.ToolObservation
 }
 
 func newDisplay(out io.Writer) display {
@@ -113,13 +120,18 @@ func (d display) prompt() error {
 	return err
 }
 
-func (d display) begin() error {
+func (d *display) begin() error {
+	d.toolCalls = 0
+	d.toolTime, d.truncated, d.repeated = 0, 0, 0
+	d.more, d.limited = 0, 0
+	d.seen = make(map[string]bool)
+	d.reads = nil
 	_, err := fmt.Fprint(d.out, "\n"+d.style("1;36", "Agent")+"\n"+d.style("2", "Working...")+"\n")
 	return err
 }
 
 func (d display) clearWaiting() error {
-	if !d.color {
+	if d.terminal == nil {
 		return nil
 	}
 	_, err := io.WriteString(d.out, "\x1b[1A\r\x1b[2K")
@@ -131,12 +143,35 @@ func (d display) status(label, color string, elapsed time.Duration) error {
 	return err
 }
 
-func (d display) progress(event agent.Progress) error {
+func (d *display) progress(event agent.Progress) error {
+	if o := event.Observation; o != nil {
+		d.toolTime += o.Elapsed
+		if o.ContentTruncated {
+			d.truncated++
+		}
+		if o.HasMore {
+			d.more++
+		}
+		if o.ScanLimited {
+			d.limited++
+		}
+		if d.seen[o.Fingerprint] {
+			d.repeated++
+		}
+		d.seen[o.Fingerprint] = true
+		if o.Path != "" {
+			d.reads = append(d.reads, *o)
+			if len(d.reads) > 3 {
+				d.reads = d.reads[1:]
+			}
+		}
+	}
 	label, color := "", "2"
 	switch event.Kind {
 	case agent.ProgressModel:
 		label = "Model  processing..."
 	case agent.ProgressToolStart:
+		d.toolCalls++
 		label, color = "Tool   running   ", "36"
 	case agent.ProgressToolReturned:
 		label = "Tool   returned  "
@@ -145,9 +180,12 @@ func (d display) progress(event agent.Progress) error {
 	default:
 		return nil
 	}
+	if d.terminal == nil {
+		return nil
+	}
 	// Tool names are external metadata; never let them control the terminal.
 	name := []rune(strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return -1
 		}
 		return r
@@ -155,6 +193,48 @@ func (d display) progress(event agent.Progress) error {
 	if len(name) > 80 {
 		name = name[:80]
 	}
-	_, err := fmt.Fprintln(d.out, d.style(color, label+string(name)))
+	width, _, err := term.GetSize(int(d.terminal.Fd()))
+	if err != nil || width < 2 {
+		return nil
+	}
+	text := []rune(label + string(name))
+	if len(text) > (width-1)/2 {
+		text = text[:(width-1)/2]
+	}
+	d.progressActive = true
+	_, err = fmt.Fprint(d.out, "\r\x1b[2K"+d.style(color, string(text)))
 	return err
+}
+
+func (d *display) clearProgress() error {
+	if !d.progressActive {
+		return nil
+	}
+	d.progressActive = false
+	_, err := io.WriteString(d.out, "\r\x1b[2K")
+	return err
+}
+
+func (d display) toolSummary() error {
+	if d.toolCalls == 0 {
+		return nil
+	}
+	if _, err := fmt.Fprintln(d.out, d.style("2", fmt.Sprintf("Tools: %d calls | %.1fs | %d more | %d clipped | %d limited | %d repeated", d.toolCalls, d.toolTime.Seconds(), d.more, d.truncated, d.limited, d.repeated))); err != nil {
+		return err
+	}
+	for _, read := range d.reads {
+		path := []rune(strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+				return -1
+			}
+			return r
+		}, read.Path))
+		if len(path) > 100 {
+			path = append([]rune("..."), path[len(path)-97:]...)
+		}
+		if _, err := fmt.Fprintf(d.out, "  read %s:%d-%d\n", string(path), read.FirstLine, read.LastLine); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
@@ -37,7 +38,7 @@ import (
 )
 
 // defaultMaxSteps 一轮最多跑多少步（防止模型/工具互相喂结果导致无限循环）。
-const defaultMaxSteps = 10
+const defaultMaxSteps = 20
 
 var (
 	ErrOutputTruncated = errors.New("模型输出达到长度上限，回复不完整")
@@ -376,11 +377,13 @@ func (l *ownLoop) runOne(ctx context.Context, tc schema.ToolCall) string {
 		return fmt.Sprintf("⚠️ 未知工具 %s，未执行。", tc.Function.Name)
 	}
 	reportProgress(ctx, Progress{Kind: ProgressToolStart, Tool: tc.Function.Name})
+	started := time.Now()
 	out, err := it.InvokableRun(guard.WithCallID(ctx, tc.ID), tc.Function.Arguments)
+	observation := observeTool(tc.Function.Name, tc.Function.Arguments, out, time.Since(started))
 	if err != nil {
-		reportProgress(ctx, Progress{Kind: ProgressToolFailed, Tool: tc.Function.Name})
+		reportProgress(ctx, Progress{Kind: ProgressToolFailed, Tool: tc.Function.Name, Observation: observation})
 		return fmt.Sprintf("⚠️ 工具 %s 执行失败：%v", tc.Function.Name, err)
 	}
-	reportProgress(ctx, Progress{Kind: ProgressToolReturned, Tool: tc.Function.Name})
+	reportProgress(ctx, Progress{Kind: ProgressToolReturned, Tool: tc.Function.Name, Observation: observation})
 	return out
 }

@@ -29,6 +29,47 @@ func (r runner) HandleApprovalCommand(ctx context.Context, uid uint, input strin
 	return false, ""
 }
 
+func TestCLIPaste(t *testing.T) {
+	for _, tc := range []struct {
+		name, input, want string
+		wantErr           bool
+	}{
+		{"paragraphs", "/paste\r\nfirst\r\n\r\nsecond\r\nthird\r\n/send\r\n/exit\r\n", "first\n\nsecond\nthird", false},
+		{"commands_are_text", "/paste\n/exit\nauth:approve 1234\n/send\n/exit\n", "/exit\nauth:approve 1234", false},
+		{"approval_is_text", "/paste\nauth:reject\n/send\n/exit\n", "auth:reject", false},
+		{"cancel", "/paste\nfirst\n/cancel\n/exit\n", "", false},
+		{"empty", "/paste\n/send\n/exit\n", "", false},
+		{"eof_discards", "/paste\nfirst\nsecond\n", "", false},
+		{"bounded", "/paste\n" + strings.Repeat(strings.Repeat("x", 1024)+"\n", 65), "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			var inputs []string
+			r := runner{
+				run: func(_ context.Context, _ uint, input string, _ func(string)) (string, error) {
+					inputs = append(inputs, input)
+					return "ok", nil
+				},
+				approve: func(context.Context, uint, string) (bool, string) {
+					t.Error("pasted content dispatched as approval command")
+					return false, ""
+				},
+			}
+			err := cli.Run(context.Background(), r, 1, io.NopCloser(strings.NewReader(tc.input)), &out, nil)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error: %v", err)
+			}
+			if tc.want == "" {
+				if len(inputs) != 0 {
+					t.Fatalf("unexpected turns: %q", inputs)
+				}
+			} else if len(inputs) != 1 || inputs[0] != tc.want {
+				t.Fatalf("turns: %q, want one %q", inputs, tc.want)
+			}
+		})
+	}
+}
+
 func TestCLIConversationAndApproval(t *testing.T) {
 	var out bytes.Buffer
 	var inputs []string

@@ -44,6 +44,31 @@ type contentStore struct {
 	fail          bool
 }
 
+func TestStorageSpillThresholdPerResult(t *testing.T) {
+	ctx := context.WithValue(context.Background(), "user_id", uint(7))
+	store := &contentStore{name: "spill:fixture"}
+	set, err := agent.NewStorageTools(&archiveStore{}, &pendingStore{}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		text := strings.Repeat("中", 2000)
+		msg := schema.ToolMessage(text, "call")
+		if got := set.ToolResult(ctx, msg); got.Content != text {
+			t.Fatalf("per-result boundary changed after %d calls", i)
+		}
+	}
+	if store.content != "" {
+		t.Fatal("2000-rune result unexpectedly spilled")
+	}
+	text := strings.Repeat("中", 2001)
+	msg := schema.ToolMessage(text, "call")
+	got := set.ToolResult(ctx, msg)
+	if !strings.Contains(got.Content, "spill:fixture") || store.content != text || msg.Content != text {
+		t.Fatal("spill did not preserve original model message")
+	}
+}
+
 func (s *contentStore) SaveText(_ context.Context, owner uint, _, content string) (spill.Ref, error) {
 	if s.fail {
 		return spill.Ref{}, errors.New("store unavailable")

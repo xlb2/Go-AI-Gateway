@@ -69,10 +69,8 @@ func TestCLIToolProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := output.String()
-	start := strings.Index(text, "Tool   running   search_memory_archive")
-	returned := strings.Index(text, "Tool   returned  search_memory_archive")
-	if start < 0 || returned <= start || strings.Count(text, "Model  processing...") != 2 {
-		t.Fatalf("missing or unordered progress: %s", text)
+	if strings.Count(text, "Tools: 1 calls") != 1 || strings.Contains(text, "Tool   running") || strings.Contains(text, "Tool   returned") || strings.Contains(text, "Model  processing") {
+		t.Fatalf("expected compact progress summary: %s", text)
 	}
 	counts := e.countTypes()
 	if counts[session.EventToolCall] != 1 || counts[session.EventToolResult] != 1 {

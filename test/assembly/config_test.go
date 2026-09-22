@@ -53,6 +53,10 @@ func TestConfiguredLoopsKeepDependenciesSeparate(t *testing.T) {
 			t.Fatalf("wrong result: %+v", events)
 		}
 		want := []agent.Progress{{Kind: agent.ProgressModel}, {Kind: agent.ProgressToolStart, Tool: name}, {Kind: agent.ProgressToolReturned, Tool: name}, {Kind: agent.ProgressModel}}
+		if len(progress) != 4 || progress[2].Observation == nil || progress[2].Observation.Fingerprint == "" || progress[2].Observation.Elapsed < 0 {
+			t.Fatalf("missing tool diagnostics: %+v", progress)
+		}
+		progress[2].Observation = nil
 		if !reflect.DeepEqual(progress, want) {
 			t.Fatalf("unexpected progress: %+v", progress)
 		}

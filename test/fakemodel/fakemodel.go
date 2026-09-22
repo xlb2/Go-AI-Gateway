@@ -72,13 +72,14 @@ type Fault struct {
 
 // RequestInfo 记录一次收到的请求，供测试断言"模型到底收到了什么"。
 type RequestInfo struct {
-	Seq       int      `json:"seq"`
-	Stream    bool     `json:"stream"`
-	NumMsgs   int      `json:"num_msgs"`
-	HasTools  bool     `json:"has_tools"`
-	ToolNames []string `json:"tool_names,omitempty"`
-	LastUser  string   `json:"last_user"`
-	MatchedBy string   `json:"matched_by"` // 命中了哪条规则（便于排查）
+	Messages  []MessageSnapshot `json:"-"` // Test-only evidence; never exposed by the request summary endpoint.
+	Seq       int               `json:"seq"`
+	Stream    bool              `json:"stream"`
+	NumMsgs   int               `json:"num_msgs"`
+	HasTools  bool              `json:"has_tools"`
+	ToolNames []string          `json:"tool_names,omitempty"`
+	LastUser  string            `json:"last_user"`
+	MatchedBy string            `json:"matched_by"` // 命中了哪条规则（便于排查）
 }
 
 // Server 假模型服务器：持有场景、命中计数和请求记录。
@@ -150,16 +151,22 @@ func (s *Server) Requests() []RequestInfo {
 	defer s.mu.Unlock()
 	out := make([]RequestInfo, len(s.reqs))
 	copy(out, s.reqs)
+	for i := range out {
+		out[i].Messages = append([]MessageSnapshot(nil), out[i].Messages...)
+	}
 	return out
 }
 
 // ---- OpenAI 请求/响应的最小子集（只解我们需要的字段）----
 
 // chatMessageIn 请求里的一条消息（只解我们需要的字段）。
-type chatMessageIn struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+type MessageSnapshot struct {
+	Role             string `json:"role"`
+	Content          string `json:"content"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
+
+type chatMessageIn = MessageSnapshot
 
 type chatRequest struct {
 	Model    string          `json:"model"`
@@ -232,7 +239,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		s.reqs = append(s.reqs, RequestInfo{
 			Seq: len(s.reqs) + 1, Stream: req.Stream, NumMsgs: len(req.Messages),
 			HasTools: hasTools, ToolNames: toolNames, LastUser: truncate(lastUser, 60),
-			MatchedBy: fmt.Sprintf("fault(HTTP %d)", f.Status),
+			MatchedBy: fmt.Sprintf("fault(HTTP %d)", f.Status), Messages: append([]MessageSnapshot(nil), req.Messages...),
 		})
 		seq := len(s.reqs)
 		s.mu.Unlock()
@@ -248,7 +255,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	s.reqs = append(s.reqs, RequestInfo{
 		Seq: len(s.reqs) + 1, Stream: req.Stream, NumMsgs: len(req.Messages),
 		HasTools: hasTools, ToolNames: toolNames, LastUser: truncate(lastUser, 60),
-		MatchedBy: matchedBy,
+		MatchedBy: matchedBy, Messages: append([]MessageSnapshot(nil), req.Messages...),
 	})
 	seq := len(s.reqs)
 	s.mu.Unlock()
