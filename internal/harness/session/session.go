@@ -316,11 +316,7 @@ func (RedisStore) GetHistory(ctx context.Context, userID uint) ([]*schema.Messag
 		return nil, err
 	}
 	history := ProjectMessagesFrom(dtos, base)
-	before := len(history)
 	history = tokenmeter.TrimToBudget(history, budget.ContextWindow)
-	used := tokenmeter.Used(history)
-	fmt.Printf(" [记忆中枢] 为 UserID %d 唤醒 %d 条记忆（投影 %d 条, 裁剪掉 %d 条, 约 %d token, 预算 %s）\n",
-		userID, len(history), before, before-len(history), used, budget.String())
 	return history, nil
 }
 
@@ -485,7 +481,6 @@ func (RedisStore) SearchArchival(ctx context.Context, userID uint, query string,
 	for _, s := range scored {
 		results = append(results, s.msg)
 	}
-	fmt.Printf(" [归档检索] UserID %d 查询 %q 命中 %d 条\n", userID, query, len(results))
 	return results, nil
 }
 
@@ -649,12 +644,6 @@ func (RedisStore) Repair(ctx context.Context, userID uint) (int, error) {
 			return 0, err
 		}
 	}
-	if unclosedSteps > 0 || len(openCalls) > 0 {
-		fmt.Printf(" [修复] UserID %d 补了 %d 个 step/end + %d 条 tool/result（%d 轮未闭合）\n",
-			userID, unclosedSteps, len(openCalls), unclosedTurns)
-	} else {
-		fmt.Printf(" [修复] UserID %d 补了 1 条 turn/end（%d 轮未闭合）\n", userID, unclosedTurns)
-	}
 	return unclosedTurns, nil
 }
 
@@ -779,8 +768,6 @@ func writeMemoryEvent(ctx context.Context, userID uint, dto MemoryDTO) error {
 	_, err = rdb.RPush(ctx, key, data).Result()
 	if err != nil {
 		fmt.Printf(" [记忆中枢] 记忆落盘失败: %v\n", err)
-	} else {
-		fmt.Printf(" [记忆中枢] 成功刻录 1 条新记忆! (Type: %s, Role: %s)\n", dto.Type, dto.Role)
 	}
 	return err
 }
@@ -816,7 +803,6 @@ func WriteMemoryEvents(ctx context.Context, userID uint, pending []MemoryDTO) er
 	if err := rdb.RPush(ctx, key, values...).Err(); err != nil {
 		return fmt.Errorf("写入记忆事件失败: %w", err)
 	}
-	fmt.Printf(" [记忆中枢] 工具调用已刻录 %d 条 (含 tool/call + tool/result 配对)\n", len(pending))
 	return nil
 }
 
@@ -946,8 +932,6 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 		// 这时候没有"早期对话"可压 —— 交给 GetHistory 的硬裁兜底，不要硬造一条空摘要。
 		return nil
 	}
-	fmt.Printf(" [压缩] UserID %d 用量约 %d token 超过触发线 %d，压缩 %d 条早期消息（保留自 seq %d）\n",
-		userID, used, budget.TriggerTokens(), len(toCompress), keepSeq)
 	// 摘要输入 = 旧摘要（如果有）+ 本轮新增的溢出消息，保证新摘要覆盖全部早期对话
 	contents := make([]string, 0, len(toCompress)+1)
 	if prevSummary != "" {

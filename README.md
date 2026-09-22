@@ -1,5 +1,36 @@
 # Go-AI-Gateway
 
+## 当前主入口：CLI（2026-09-22）
+
+完整操作、调用链和验证边界见 [CLI 使用与实现交接](docs/cli.md)。下方早期验收数字为历史记录，最新状态以该文档及 test/README.md 顶部为准。
+
+提交前最新验收（2026-09-22）：用户WSL带knowledgeintegration全量178项通过、0跳过；本地静态检查和CLI构建通过。真实模型对话、工具进度及推理字段已由用户验证，单行推理窗口和复制粘贴等终端交互仍需实际验收。
+
+推理显示默认开启：服务商返回独立 `reasoning_content` 时，用单行滑动窗口显示最近一段，按终端宽度截尾，切换到回答或工具状态时清除。非终端或 `TERM=dumb` 仅显示收到推理的提示，不输出全文。`/reasoning off` 隐藏，`/reasoning on` 恢复，仅本进程生效；不改变模型推理配置，也不代表获得完整内部思考。没有字段时不显示推理区，推理文本不写入最终回答历史。复制粘贴沿用终端原生操作；当前仍是单行输入，多行粘贴会被按行处理。
+
+终端显示：启动栏展示用户、工作目录和实际隔离状态；You/Agent 分区，等待提示与结束耗时，取消和错误单独标记。真实终端启用颜色，`NO_COLOR=1` 或 `TERM=dumb` 关闭；重定向输出保持纯文本。保留滚动历史，当前仍为单行输入、原样流式文本，不包含 Markdown 渲染或全屏编辑器。
+
+OpenCode接入修复：针对官方HTTPS地址自动发送稳定的`x-opencode-session`及`User-Agent: go-ai-gateway/0.1`，覆盖统一模型工厂的流式/非流式请求。同会话跨轮和子任务共享路由标识，不使用每次变化的run_id。Go的Base URL为`https://opencode.ai/zen/go/v1`，模型ID填入历史变量`VOLC_ENDPOINT_ID`，仅适用于Chat Completions模型。依据[官方客户端要求](https://opencode.ai/docs/go/#where-can-i-use-it)。静态检查/编译通过，新增3项回归及真实OpenCode调用待验；此前172项不覆盖本修复。
+
+最新验收：用户WSL的CLI定向5项、带knowledgeintegration全量172项通过，均0跳过；已重建启动到输入提示符。覆盖下文回归待验描述；真实模型问答、终端取消及重启后的历史仍待验证。
+
+直接通过终端使用已有Harness；Web代码和路由保留，暂停扩展。CLI只需Redis和模型配置（仓库根目录.env中的VOLC_ACCESS_KEY / VOLC_ENDPOINT_ID，可选VOLC_BASE_URL、REDIS_ADDR），不启动HTTP、MySQL或RabbitMQ，也不要求JWT_SECRET。
+
+```bash
+# WSL / Git Bash，在仓库根目录执行；脚本先编译再启动
+bash scripts/run-agent.sh -user 1
+```
+
+```powershell
+# PowerShell，在仓库根目录执行
+go build -o bin/gwagent.exe ./cmd/agent
+.\bin\gwagent.exe -user 1
+```
+
+输入文本后回车，回复流式输出。`/exit`退出、`/help`查看命令；运行中Ctrl+C取消当前调用并等待返回，空闲Ctrl+C退出。审批继续使用`auth:approve`、`auth:approve <确认码>`、`auth:reject`和`auth:status <提案ID>`，不自动批准。
+
+默认user=1，复用对应的旧Redis历史；这是本地身份选择，不是用户认证。不要用同一user并发运行多个CLI/API进程，当前运行锁仅限实例内。Web的MySQL会话、资料工具未自动接入CLI。本批没有重写Loop或改造多会话存储。静态检查与编译已通过，5项新增回归及真实终端交互待WSL验收，见 [CLI验收](test/cli/README.md)。下方Web入口与早期能力说明保留为历史背景，最新验证状态见test/README.md。
+
 > 资料工作台第一批：API 重建启动后打开 `/knowledge`，可创建个人资料库、导入 UTF-8 Markdown/TXT 并读取原文（每份最多 2 MiB）。持久化与页面运行验收待 WSL；范围及命令见 [资料模块验收](test/knowledge/README.md)。专题、笔记和 RAG 尚未实现。
 
 > 登录配置：启动前必须设置 `JWT_SECRET`（至少 32 字节，建议使用独立随机值，不能有首尾空白），缺失或过短时 API 拒绝启动。可在 WSL 用 `openssl rand -hex 32` 生成并填入不受版本控制的 `.env`。更换密钥后旧令牌失效，需要重新登录；多实例必须配置相同密钥。本项目不提供默认密钥，也不会自动生成临时密钥。JWT 修复新增回归待用户 WSL 验证。

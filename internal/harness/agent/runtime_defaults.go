@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -53,6 +54,13 @@ func modelFactoryFromEnv() (ModelFactory, error) {
 	}
 	return func(ctx context.Context) (model.ChatModel, error) {
 		copy := cfg
+		if isOpenCodeEndpoint(copy.BaseURL) {
+			id, err := openCodeSession(ctx)
+			if err != nil {
+				return nil, err
+			}
+			copy.HTTPClient = &http.Client{Timeout: copy.Timeout, Transport: openCodeTransport{base: http.DefaultTransport, session: id}}
+		}
 		return openai.NewChatModel(ctx, &copy)
 	}, nil
 }

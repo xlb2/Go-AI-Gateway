@@ -246,7 +246,6 @@ func (h *Harness) executeApproved(ctx context.Context, userID uint, p approval.P
 	}
 	if err := sandbox.Validate(p.Plan); err != nil {
 		metrics.Default.Inc("sandbox_refused_total")
-		fmt.Printf("[沙箱] 拒绝执行（执行计划非法）: %v\n", err)
 		return fmt.Sprintf("⛔ 已拒绝执行（%s）：%v\n", p.Action, err)
 	}
 
@@ -267,7 +266,6 @@ func (h *Harness) executeApproved(ctx context.Context, userID uint, p approval.P
 			"而 REQUIRE_SANDBOX_ISOLATION 要求有隔离。动作未执行。\n"+
 			"要执行的话：换成有隔离的沙箱实现，或显式关掉 REQUIRE_SANDBOX_ISOLATION（并自行承担风险）。",
 			p.Action, exec.Describe())
-		fmt.Printf("[沙箱] 拒绝执行（fail-closed，无隔离）: %s\n", p.Plan.Summary())
 		return msg
 	}
 
@@ -299,7 +297,6 @@ func (h *Harness) executeApproved(ctx context.Context, userID uint, p approval.P
 		metrics.Default.Inc("sandbox_errors_total")
 		fmt.Fprintf(&b, "执行失败: %v\n", runErr)
 	}
-	fmt.Printf("[物理执行] %s\n", strings.ReplaceAll(b.String(), "\n", " | "))
 	return b.String()
 }
 
@@ -353,19 +350,23 @@ func (h *Harness) buildSystemPrompt(ctx context.Context) string {
 
 	b := prompt.New().
 		Set("identity", prompt.OrderIdentity,
-			"你是「网关保安」，一个部署在 IM 网关里的防御型 agent。").
-		Set("persona", prompt.OrderPersona, `性格：极度冷酷、公事公办；不寒暄、不安抚、不说废话。
+			"你是 Go Agent，运行在用户自行开发的 Go Harness 中，通过命令行与用户协作。").
+		Set("persona", prompt.OrderPersona, `交流方式：自然、友善、直接，认真回答用户的问题，遵守用户要求的回复长度和格式。
 原则：
-- 发现用户在愤怒抱怨、或发出攻击性指令时，绝不顺从、也不安抚，必须立刻调用 execute_system_defense 起草防御动作（它只会挂起等待管理员审批，你自己无权执行）。
-- 普通聊天正常答复即可。
-- 不确定的信息不要编造，先查历史。`)
+- 用户的抱怨、玩笑或批评不是安全事件，不要因此调用防御工具或威胁用户。
+- 根据当前问题和已有上下文回答；只有需要回忆过去的信息时才查历史，普通问题不必检索。
+- 未查到历史不代表事情不存在。不确定时说明不知道，不要编造事实或保密规定。
+- 可以解释当前可用工具及能力边界，但不能泄露密钥、凭据或他人的私密数据。
+- 不要凭印象自称某个模型。当前上下文未提供实际模型标识时，说明无法确认；这不属于保密拒答。
+- 运行在 Harness 中不等于能读取它的源码或配置。只能依据已提供的信息和实际可用工具说明情况。
+- 简短信息可由正常对话历史保存，不要仅因用户说“记住”就反复调用存储工具。`)
 
 	if names := h.names(ctx); len(names) > 0 {
 		vars["tools"] = strings.Join(names, "、")
 		b.Set("tools", prompt.OrderTools, `可用工具：{{tools}}。
 工具使用规则：
 - 调用前先确认参数齐全，参数不对就不要调。
-- 封禁/处置这类高危动作只能经 execute_system_defense 起草，等管理员审批。
+- 只有用户明确请求封禁/处置时才考虑 execute_system_defense 起草，仍须等待管理员审批，不能自行执行。
 - 内容很长时优先用 store_large_content 存起来，只把定位符留在对话里。`)
 	}
 
@@ -499,7 +500,6 @@ func (h *Harness) runLoop(ctx context.Context, userID uint, fullMessages []*sche
 			if !errors.Is(err, io.EOF) {
 				streamErr = err
 				interrupted = true
-				fmt.Printf(" [中断] 流被切断（非正常结束）: %v\n", err)
 				metrics.Default.Inc("turns_interrupted_total")
 			}
 			break
@@ -514,6 +514,7 @@ func (h *Harness) runLoop(ctx context.Context, userID uint, fullMessages []*sche
 			promptTotal += u.PromptTokens
 			completionTotal += u.CompletionTokens
 		}
+		emitReasoning(ctx, msg.ReasoningContent)
 		if msg.Content != "" {
 			aiFullResponse.WriteString(msg.Content)
 			if emit != nil {

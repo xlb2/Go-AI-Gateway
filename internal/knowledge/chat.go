@@ -14,6 +14,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 	"github.com/gin-gonic/gin"
 	"go_im_gateway/internal/harness/agent"
+	"go_im_gateway/internal/harness/runstate"
 	"go_im_gateway/internal/harness/session"
 )
 
@@ -112,6 +113,7 @@ func (chat *Chat) respond(c *gin.Context) {
 	defer cancel()
 	// The loop's existing tools expect the real business owner, never a turn ID.
 	ctx = context.WithValue(ctx, "user_id", owner)
+	ctx = runstate.WithRef(ctx, runstate.Ref{UserID: owner, SessionID: fmt.Sprintf("knowledge:%d", conversation), RunID: fmt.Sprint(turn.ID)})
 	var answer strings.Builder
 	finalized := false
 	finish := func(status string) error {

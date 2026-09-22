@@ -15,6 +15,8 @@ func TestConfiguredLoopStepWriteBarrier(t *testing.T) {
 	for _, boundary := range []string{session.EventStepStart, session.EventStepEnd} {
 		t.Run(boundary, func(t *testing.T) {
 			ctx := context.WithValue(context.Background(), "user_id", uint(7))
+			var progress []agent.Progress
+			ctx = agent.WithProgress(ctx, func(event agent.Progress) { progress = append(progress, event) })
 			counter := &countingTool{name: "read", out: "fact"}
 			m := &fakeModel{steps: []streamStep{func(context.Context) (*schema.StreamReader[*schema.Message], error) {
 				return streamOf(&schema.Message{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{ID: "call", Function: schema.FunctionCall{Name: "read", Arguments: `{}`}}}}), nil
@@ -50,6 +52,9 @@ func TestConfiguredLoopStepWriteBarrier(t *testing.T) {
 			}
 			if len(counter.calls) != want || m.next != 1 {
 				t.Fatalf("tool calls=%d model calls=%d", len(counter.calls), m.next)
+			}
+			if boundary == session.EventStepStart && (len(progress) != 1 || progress[0].Kind != agent.ProgressModel) {
+				t.Fatalf("reported tool execution before write barrier: %+v", progress)
 			}
 		})
 	}

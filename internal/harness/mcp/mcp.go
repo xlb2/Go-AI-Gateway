@@ -49,7 +49,6 @@ func ConnectFromEnv(ctx context.Context) error {
 		return err
 	}
 	RegisterBridge(b)
-	fmt.Printf(" [MCP] 已连接 server=%s 工具数=%d\n", name, len(b.Tools))
 	return nil
 }
 

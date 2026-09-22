@@ -1,5 +1,27 @@
 # test/ — 假模型与端到端测试
 
+2026-09-22 提交前最终验收：用户 WSL `bash scripts/test-fast.sh -tags knowledgeintegration` 全量178项通过、0跳过，覆盖本批CLI、OpenCode、工具进度、推理字段及单行窗口相关测试，覆盖下方旧待验状态。本地最终go vet含knowledgeintegration/rageval通过，固定CLI构建通过；真实窄终端/缩放/复制粘贴、运行中取消仍不在本次自动回归证据内。完整交接见 [CLI 文档](../docs/cli.md)。
+
+2026-09-22 推理单行窗口（未提交）：用户确认真实推理字段可见，要求缩短显示。CLI仅保留最近120 rune，按实时终端宽度保守双列预算截尾，原地重绘，回答/工具状态/结束时清除；过滤换行及控制字符，NO_COLOR仍可单行更新，非TTY或TERM=dumb只输出一次收到推理的提示、不输出全文。使用已在go.sum和本地缓存的x/term v0.41.0读取宽度。保留终端原生输入、选中复制和粘贴，未接管剪贴板/鼠标，仍不支持将多行粘贴作为单条编辑。调整TestCLIReasoning纯文本断言；静态检查及构建通过，WSL CLI8项与实际窄窗口/复制粘贴待验，未运行本地测试。
+
+2026-09-22 CLI推理字段显示（未提交）：本地锁定依赖Eino v0.8.11 schema及OpenAI ACL v0.1.17确认reasoning_content映射为ReasoningContent，Loop原样转发；Harness新增独立回调，CLI默认显示Reasoning (provider)，/reasoning on|off仅控制显示，无字段无占位，不强制开启模型推理，不混入最终回答持久化。新增TestCLIReasoning三子场景（显示/隐藏/无字段）经假SSE→真实SDK→Harness→CLI验证并检查历史隔离；go vet含tag和CLI构建通过，WSL CLI预计8、合并ConfiguredLoop预计11、带knowledgeintegration全量预计178待验。未请求真实模型，当前服务是否返回字段待验；用户此前日志已确认工具进度真实可见，工具进度回归运行结果未提供。
+
+2026-09-22 CLI工具进度（未提交）：ownLoop通过每轮context观察器报告模型请求、工具开始/返回/报错，CLI串行化状态与文本写入；不显示参数/结果正文，returned不等于业务成功或落盘成功，未知工具标记failed/unavailable。子循环不混入主面板；审批直接执行/摘要未接独立状态，工具结果写失败仍由原错误路径报告。新增TestCLIToolProgress（假模型+真Redis）并加强ConfiguredLoopsKeepDependenciesSeparate、ConfiguredLoopStepWriteBarrier断言。go vet含tag、CLI构建通过；用户WSL CLI预计7、合并ConfiguredLoop预计10、带knowledgeintegration全量预计177待验，真实显示待验。
+
+2026-09-22 CLI显示验收补记（用户WSL日志）：CLI定向6项通过、0跳过；run-agent.sh重建后启动元信息、You/Agent分区和Done耗时已实际显示，真实模型正常回复，语气较旧人设自然。文本记录不证明颜色、窄窗口布局或运行中取消已验；带knowledgeintegration全量预计176及OpenCode定向3结果仍待提供。本轮只记录验收，不扩工具、不提交。
+
+2026-09-22 CLI显示优化（未提交）：新增display.go，启动元信息、You/Agent分区、等待提示、耗时和状态颜色；复用已有go-isatty依赖，非终端/NO_COLOR/TERM=dumb纯文本降级，不接管全屏或改变Harness调用链。新增TestCLIBanner，已有对话测试补纯文本断言；go vet含tag和CLI构建通过，WSL CLI预计6/带knowledgeintegration全量预计176及真实显示待用户验收。保留单行输入、原样流式文本，未实现Markdown渲染、工具面板或输入编辑器。
+
+2026-09-22 CLI人设纠正（未提交）：用户对话暴露旧“网关保安/极度冷酷/抱怨即防御”提示仍在生效。已将Harness系统提示改为协作助手，同步防御工具描述，只在明确处置请求时考虑提案；区分未知与保密、历史缺失与事实不存在，普通问答不强制查历史，短记忆不滥用外存。不注入或猜测真实模型名，不新增源码读取能力；审批机制不变。go vet含tag与CLI构建通过，真实语气效果待用户重建验证；既有历史保留。用户最新日志确认过程打印已消失、空闲Ctrl+C可退出。
+
+2026-09-22 CLI输出清理（未提交）：删除记忆读写/检索、修复成功、压缩开始、重试过程、MCP连接和回复字数等过程打印，去掉沙箱/流中断的重复输出；错误提示、事件持久化及指标保留，不新增日志框架。go vet含knowledgeintegration/rageval及CLI构建通过；本批未跑运行测试。用户真实模型两轮已记住并答出CLI-7392，覆盖此前真实对话待验；重启历史与Ctrl+C仍待验，OpenCode新增3项WSL结果尚未收到。
+
+OpenCode修复（2026-09-22，WSL待验）：`test/assembly/opencode_test.go`新增3项，截获真实SDK生成的HTTP请求，不访问外网或使用真实Key。`TestOpenCodeSessionHeaders`覆盖流式多步/多轮/子运行/摘要的稳定头和不同身份隔离；`TestOpenCodeRequiresSessionIdentity`覆盖缺身份时明确失败；`TestOpenCodeHeadersDoNotAffectOtherProviders`覆盖火山及相似域名不注入专用头。go vet带tag及CLI构建通过；定向OpenCode预计3、带knowledgeintegration全量预计175待用户WSL。Web共用工厂时附加已有conversation身份，不改变其存储或恢复边界。
+
+CLI最新验收（2026-09-22，用户WSL日志）：CLI定向5项、带knowledgeintegration全量172项通过，均0跳过；run-agent.sh重建启动至user:1输入提示符，local/none隔离状态已显示。覆盖下方CLI待验记录；真实模型对话、终端Ctrl+C与重启历史尚未验证，未提交。
+
+CLI增量（2026-09-22，WSL待验）：新增 `TestCLIConversationAndApproval`、`TestCLIErrorAndCommands`、`TestCLICancelWaitsBeforeNextTurn`、`TestCLIInputAndOutputFailures`，以及真Harness/Redis链路 `TestCLIHarnessHistory`。定向CLI预计5项，带knowledgeintegration全量预计172；静态检查与编译通过，不代表运行验收。用例表与实际终端验收见 [cli/README.md](cli/README.md)。CLI为当前主入口，Web保留但暂停扩展。
+
 最新验收补记（2026-09-21，依据用户 WSL 日志与工作区交接）：RAGEvaluation 定向2、带 knowledgeintegration 全量167项通过，0跳过；独立开发集评测执行通过。覆盖下方累计待验记录，本次提交整理未重跑运行测试。真实模型和页面端到端仍不在该证据范围内；后续暂停检索扩展，回到 Harness 学习与建设。
 
 K-0评测增量（2026-09-21，WSL待验）：`TestRAGEvaluationQueriesAndRanking`验证去重查询、稳定排序；`TestRAGEvaluationScoringAndHoldout`验证多来源部分召回、无答案候选单独计数及排除holdout。普通带knowledgeintegration全量预计167。实际语料评测`TestRAGDevelopmentEvaluation`仅在额外rageval标签下启用，由 `bash scripts/eval-rag.sh`运行，独立1项，不混入167；执行PASS不表示质量达标，见 [rag/README.md](rag/README.md)。

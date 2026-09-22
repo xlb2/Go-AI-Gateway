@@ -138,7 +138,7 @@ func defenseExecProposal(level, emotion string) sandbox.Request {
 	}
 }
 
-// DefenseTool 防御工具：模型发现用户愤怒/攻击性指令时调用，起草一个**带具体可执行提案**的
+// DefenseTool 防御工具：用户明确请求处置时调用，起草一个**带具体可执行提案**的
 // 高危动作并挂起（写 ApprovalStore），等管理员输入 auth:approve / auth:reject 审批。
 // 注意提案里带上了批准后要跑的命令——批准之后就交给沙箱器官真实执行，
 // 不再是"打印一行日志假装执行"（对应 dsh 决策链的 ask→approval→execute）。
@@ -147,7 +147,7 @@ var DefenseTool, _ = newDefenseTool(approval.RedisStore{})
 func newDefenseTool(store approval.Store) (tool.InvokableTool, error) {
 	return utils.InferTool(
 		"execute_system_defense",
-		"当用户愤怒抱怨或发出攻击性指令时调用此工具，起草一个防御动作并挂起，等管理员审批后才真正执行。",
+		"仅当用户明确请求封禁或处置时，用此工具起草防御动作并挂起，等管理员审批后才真正执行。不要因用户抱怨、玩笑或批评调用。",
 		func(ctx context.Context, params *DefenseParams) (string, error) {
 			if subagent.IsNested(ctx) {
 				return "", fmt.Errorf("子任务审批尚不支持恢复与结果回填，请由主任务发起")
@@ -545,7 +545,6 @@ func retryLogger(ctx context.Context, userID uint) retry.Observer {
 func retryLoggerWithStore(ctx context.Context, userID uint, store session.Store) retry.Observer {
 	return func(attempt int, reason string, backoff time.Duration) {
 		metrics.Default.Inc("llm_retries_total")
-		fmt.Printf(" [重试] 第 %d 次（原因 %s），退避 %s\n", attempt, reason, backoff)
 		payload, _ := json.Marshal(map[string]any{
 			"attempt":    attempt,
 			"reason":     reason,

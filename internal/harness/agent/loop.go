@@ -131,6 +131,7 @@ func (l *ownLoop) Stream(ctx context.Context, input []*schema.Message, _ ...eino
 		return nil, err
 	}
 
+	reportProgress(ctx, Progress{Kind: ProgressModel})
 	first, err := bound.Stream(ctx, input)
 	if err != nil {
 		return nil, err // 契约 1：同步返回（对齐 react，TestNonRetryableErrorFailsFast 靠它）
@@ -250,6 +251,7 @@ func (l *ownLoop) run(ctx context.Context, input []*schema.Message, m model.Base
 			return
 		}
 
+		reportProgress(ctx, Progress{Kind: ProgressModel})
 		next, err := m.Stream(ctx, messages) // 交棒：把工具结果喂回去再调一次模型
 		if err != nil {
 			// 失败发生在**下一个 step 的模型调用**上 —— 上一个 step 已闭合，
@@ -370,11 +372,15 @@ func (l *ownLoop) executeTools(ctx context.Context, userID uint, calls []schema.
 func (l *ownLoop) runOne(ctx context.Context, tc schema.ToolCall) string {
 	it, ok := l.byName[tc.Function.Name]
 	if !ok {
+		reportProgress(ctx, Progress{Kind: ProgressToolFailed, Tool: tc.Function.Name})
 		return fmt.Sprintf("⚠️ 未知工具 %s，未执行。", tc.Function.Name)
 	}
+	reportProgress(ctx, Progress{Kind: ProgressToolStart, Tool: tc.Function.Name})
 	out, err := it.InvokableRun(guard.WithCallID(ctx, tc.ID), tc.Function.Arguments)
 	if err != nil {
+		reportProgress(ctx, Progress{Kind: ProgressToolFailed, Tool: tc.Function.Name})
 		return fmt.Sprintf("⚠️ 工具 %s 执行失败：%v", tc.Function.Name, err)
 	}
+	reportProgress(ctx, Progress{Kind: ProgressToolReturned, Tool: tc.Function.Name})
 	return out
 }

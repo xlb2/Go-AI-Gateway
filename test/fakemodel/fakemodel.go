@@ -31,6 +31,7 @@ type ToolCall struct {
 
 // Reply 一次回复。
 type Reply struct {
+	Reasoning string     `json:"reasoning,omitempty"`
 	Text      string     `json:"text,omitempty"`
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 	// AbortAfter > 0：先正常发这么多片内容，然后**把流弄坏**，模拟真实世界的
@@ -460,6 +461,9 @@ func (s *Server) writeStream(w http.ResponseWriter, reply Reply, promptTokens in
 	}
 
 	send(map[string]any{"role": "assistant"}, nil)
+	for _, r := range reply.Reasoning {
+		send(map[string]any{"reasoning_content": string(r)}, nil)
+	}
 
 	if len(reply.ToolCalls) > 0 {
 		for i, tc := range reply.ToolCalls {

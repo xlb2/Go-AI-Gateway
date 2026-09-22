@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
 	"testing"
 
 	"github.com/cloudwego/eino/components/model"
@@ -16,6 +17,8 @@ import (
 func TestConfiguredLoopsKeepDependenciesSeparate(t *testing.T) {
 	ctx := context.WithValue(context.Background(), "user_id", uint(7))
 	for _, name := range []string{"alpha", "beta"} {
+		var progress []agent.Progress
+		ctx := agent.WithProgress(ctx, func(event agent.Progress) { progress = append(progress, event) })
 		counter := &countingTool{name: name, out: name}
 		m := &fakeModel{steps: []streamStep{func(context.Context) (*schema.StreamReader[*schema.Message], error) {
 			return streamOf(&schema.Message{Role: schema.Assistant, ToolCalls: []schema.ToolCall{{ID: name, Function: schema.FunctionCall{Name: name, Arguments: `{}`}}}}), nil
@@ -48,6 +51,10 @@ func TestConfiguredLoopsKeepDependenciesSeparate(t *testing.T) {
 		}
 		if events[2].Type != session.EventToolResult || events[2].Content != name {
 			t.Fatalf("wrong result: %+v", events)
+		}
+		want := []agent.Progress{{Kind: agent.ProgressModel}, {Kind: agent.ProgressToolStart, Tool: name}, {Kind: agent.ProgressToolReturned, Tool: name}, {Kind: agent.ProgressModel}}
+		if !reflect.DeepEqual(progress, want) {
+			t.Fatalf("unexpected progress: %+v", progress)
 		}
 	}
 }
