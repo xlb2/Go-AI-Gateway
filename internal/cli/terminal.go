@@ -146,6 +146,7 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 		}
 		started := time.Now()
 		runCtx, cancel := context.WithCancel(ctx)
+		runCtx, accounting := agent.WithModelAccounting(runCtx)
 		type result struct{ runErr, writeErr error }
 		done := make(chan result, 1)
 		go func() {
@@ -161,6 +162,10 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 				defer outputMu.Unlock()
 				if closed || writeErr != nil {
 					return
+				}
+				if event.Kind == agent.ProgressModelUsage {
+					writeErr = display.progress(event)
+					return // Accounting must not split the answer/reasoning display.
 				}
 				writeErr = display.finishReasoning()
 				if writeErr != nil {
@@ -300,6 +305,9 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 			return err
 		}
 		if err := display.toolSummary(); err != nil {
+			return err
+		}
+		if err := display.accountingSummary(accounting.Snapshot()); err != nil {
 			return err
 		}
 		if wasCanceled || errors.Is(outcome.runErr, context.Canceled) {

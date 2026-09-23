@@ -260,7 +260,8 @@ if not current or current ~= ARGV[1] then return 0 end
 local deadline = tonumber(ARGV[2])
 local now = redis.call('TIME')
 local millis = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-if deadline > 0 and millis >= deadline then return -1 end
+local clientMillis = tonumber(ARGV[5])
+if deadline > 0 and (millis >= deadline or clientMillis >= deadline) then return -1 end
 if redis.call('HSETNX', KEYS[2], ARGV[3], ARGV[4]) ~= 1 then return 0 end
 redis.call('DEL', KEYS[1])
 return 1
@@ -291,7 +292,10 @@ func (RedisStore) ClaimPending(ctx context.Context, userID uint, expected Pendin
 	if err != nil {
 		return nil, err
 	}
-	result, err := claimScript.Run(ctx, rdb, []string{key, executionKey(userID)}, expected.snapshot, deadline, action.ID, string(record)).Int()
+	// ExpiresAt/GetPending use the application clock. A slower Redis clock
+	// must not revive a proposal already expired there; a faster Redis clock
+	// still rejects it atomically at consumption. Snapshot identity stays first.
+	result, err := claimScript.Run(ctx, rdb, []string{key, executionKey(userID)}, expected.snapshot, deadline, action.ID, string(record), time.Now().UnixMilli()).Int()
 	if err != nil {
 		return nil, fmt.Errorf("领取审批结果未确认，禁止执行: %w", err)
 	}

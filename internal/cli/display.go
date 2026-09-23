@@ -15,18 +15,21 @@ import (
 )
 
 type display struct {
-	out                 io.Writer
-	color               bool
-	terminal            *os.File
-	reasoningTail       []rune
-	reasoningActive     bool
-	progressActive      bool
-	toolCalls           int
-	toolTime            time.Duration
-	truncated, repeated int
-	more, limited       int
-	seen                map[string]bool
-	reads               []agent.ToolObservation
+	out                                                    io.Writer
+	color                                                  bool
+	terminal                                               *os.File
+	reasoningTail                                          []rune
+	reasoningActive                                        bool
+	progressActive                                         bool
+	toolCalls                                              int
+	toolTime                                               time.Duration
+	truncated, repeated                                    int
+	more, limited                                          int
+	seen                                                   map[string]bool
+	reads                                                  []agent.ToolObservation
+	modelCalls, usageSteps, promptTokens, completionTokens int
+	inputTotals                                            agent.InputObservation
+	unknownSchemas                                         int
 }
 
 func newDisplay(out io.Writer) display {
@@ -126,6 +129,8 @@ func (d *display) begin() error {
 	d.more, d.limited = 0, 0
 	d.seen = make(map[string]bool)
 	d.reads = nil
+	d.modelCalls, d.usageSteps, d.promptTokens, d.completionTokens = 0, 0, 0, 0
+	d.inputTotals, d.unknownSchemas = agent.InputObservation{}, 0
 	_, err := fmt.Fprint(d.out, "\n"+d.style("1;36", "Agent")+"\n"+d.style("2", "Working...")+"\n")
 	return err
 }
@@ -144,6 +149,26 @@ func (d display) status(label, color string, elapsed time.Duration) error {
 }
 
 func (d *display) progress(event agent.Progress) error {
+	if o := event.Input; o != nil {
+		d.modelCalls++
+		d.inputTotals.System += o.System
+		d.inputTotals.User += o.User
+		d.inputTotals.Assistant += o.Assistant
+		d.inputTotals.ToolResults += o.ToolResults
+		d.inputTotals.Reasoning += o.Reasoning
+		d.inputTotals.Structure += o.Structure
+		d.inputTotals.Total += o.Total
+		if o.Tools < 0 {
+			d.unknownSchemas++
+		} else {
+			d.inputTotals.Tools += o.Tools
+		}
+	}
+	if u := event.Usage; u != nil {
+		d.usageSteps++
+		d.promptTokens += u.Prompt
+		d.completionTokens += u.Completion
+	}
 	if o := event.Observation; o != nil {
 		d.toolTime += o.Elapsed
 		if o.ContentTruncated {
@@ -216,6 +241,23 @@ func (d *display) clearProgress() error {
 }
 
 func (d display) toolSummary() error {
+	if d.modelCalls > 0 {
+		o := d.inputTotals
+		tools := fmt.Sprint(o.Tools)
+		if d.unknownSchemas > 0 {
+			tools += "+unknown"
+		}
+		if _, err := fmt.Fprintf(d.out, "Input estimate (main loop): %d tokens / %d requests | system=%d user=%d assistant=%d tool-results=%d reasoning=%d structure=%d tools=%s\n", o.Total, d.modelCalls, o.System, o.User, o.Assistant, o.ToolResults, o.Reasoning, o.Structure, tools); err != nil {
+			return err
+		}
+		usage := "unknown"
+		if d.usageSteps > 0 {
+			usage = fmt.Sprintf("input=%d output=%d", d.promptTokens, d.completionTokens)
+		}
+		if _, err := fmt.Fprintf(d.out, "Usage (reported steps %d/%d): %s | cache=unknown | excludes hidden retries, summaries and child runs\n", d.usageSteps, d.modelCalls, usage); err != nil {
+			return err
+		}
+	}
 	if d.toolCalls == 0 {
 		return nil
 	}
@@ -235,6 +277,32 @@ func (d display) toolSummary() error {
 		if _, err := fmt.Fprintf(d.out, "  read %s:%d-%d\n", string(path), read.FirstLine, read.LastLine); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (d display) accountingSummary(s agent.AccountingSnapshot) error {
+	for _, group := range []struct {
+		name   string
+		totals agent.AttemptTotals
+	}{
+		{"main", s.Main}, {"child", s.Child}, {"summary", s.Summary},
+	} {
+		t := group.totals
+		if t.Attempts == 0 {
+			continue
+		}
+		usage := "unknown"
+		if t.WithUsage > 0 {
+			usage = fmt.Sprintf("input=%d output=%d", t.Prompt, t.Completion)
+		}
+		if _, err := fmt.Fprintf(d.out, "Model attempts (%s): %d | input-estimate=%d | usage=%d/%d %s | observed-errors=%d | unknown-schemas=%d\n", group.name, t.Attempts, t.EstimatedInput, t.WithUsage, t.Attempts, usage, t.Errors, t.UnknownSchemas); err != nil {
+			return err
+		}
+	}
+	if s.Main.Attempts+s.Child.Attempts+s.Summary.Attempts > 0 {
+		_, err := fmt.Fprintln(d.out, "Attempt usage includes retries and observed partial streams; do not add step usage again. Cache/fees unknown.")
+		return err
 	}
 	return nil
 }

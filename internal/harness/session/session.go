@@ -764,8 +764,7 @@ func writeMemoryEvent(ctx context.Context, userID uint, dto MemoryDTO) error {
 		fmt.Printf(" [记忆中枢] 记忆序列化崩溃: %v\n", err)
 		return err
 	}
-	key := fmt.Sprintf("agent:V2:history:%d", userID)
-	_, err = rdb.RPush(ctx, key, data).Result()
+	err = appendSourceEvents(ctx, userID, data)
 	if err != nil {
 		fmt.Printf(" [记忆中枢] 记忆落盘失败: %v\n", err)
 	}
@@ -781,7 +780,6 @@ func WriteMemoryEvents(ctx context.Context, userID uint, pending []MemoryDTO) er
 	if rdb == nil {
 		return fmt.Errorf("redis client is nil")
 	}
-	key := fmt.Sprintf("agent:V2:history:%d", userID)
 	values := make([]any, 0, len(pending))
 	for _, dto := range pending {
 		ref, err := runstate.Bind(ctx, userID, dto.Run)
@@ -800,7 +798,7 @@ func WriteMemoryEvents(ctx context.Context, userID uint, pending []MemoryDTO) er
 		}
 		values = append(values, data)
 	}
-	if err := rdb.RPush(ctx, key, values...).Err(); err != nil {
+	if err := appendSourceEvents(ctx, userID, values...); err != nil {
 		return fmt.Errorf("写入记忆事件失败: %w", err)
 	}
 	return nil

@@ -142,6 +142,7 @@ func (r *Runtime) NewLoop(ctx context.Context) (Loop, error) {
 	if m == nil {
 		return nil, fmt.Errorf("model factory returned nil")
 	}
+	m = accountModel(m, false)
 	userID, err := getUserID(ctx)
 	if err != nil {
 		return nil, err
@@ -184,6 +185,7 @@ func (r *Runtime) Summarize(ctx context.Context, messages []string) (string, err
 }
 
 func summarizeWithModel(ctx context.Context, m model.ChatModel, messages []string) (string, error) {
+	m = accountModel(m, true)
 	out, err := m.Generate(ctx, []*schema.Message{
 		schema.SystemMessage("你是一个对话压缩器。把下面的历史对话压成一段 100 字以内的中文摘要，保留关键事实。"),
 		schema.UserMessage(strings.Join(messages, "\n")),

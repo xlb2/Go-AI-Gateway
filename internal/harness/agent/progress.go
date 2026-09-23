@@ -16,6 +16,8 @@ type Progress struct {
 	Kind        string
 	Tool        string
 	Observation *ToolObservation
+	Input       *InputObservation
+	Usage       *ModelUsage
 }
 
 // ToolObservation contains bounded diagnostics, never arguments or result bodies.
@@ -65,6 +67,7 @@ func observeTool(name, args, out string, elapsed time.Duration) *ToolObservation
 
 const (
 	ProgressModel        = "model"
+	ProgressModelUsage   = "model-usage"
 	ProgressToolStart    = "tool-start"
 	ProgressToolReturned = "tool-returned"
 	ProgressToolFailed   = "tool-failed"

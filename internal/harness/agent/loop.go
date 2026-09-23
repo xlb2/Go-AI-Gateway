@@ -86,7 +86,7 @@ func NewOwnLoop(ctx context.Context) (Loop, error) {
 		return nil, err
 	}
 
-	chatModel = retry.Wrap(chatModel, retry.Config{
+	chatModel = retry.Wrap(accountModel(chatModel, false), retry.Config{
 		Policy:         retryPolicyFromEnv(),
 		InitialAttempt: retryAttemptsSoFar(ctx, userID),
 		Observer:       retryLogger(ctx, userID),
@@ -127,12 +127,12 @@ func maxStepsFromEnv() int {
 // 关键：**第一次模型调用同步做** —— 建流失败要在这里直接返回 error（契约 1），
 // 之后的行进放到 goroutine 里，通过 schema.Pipe 把 chunk 流给调用方。
 func (l *ownLoop) Stream(ctx context.Context, input []*schema.Message, _ ...einoagent.AgentOption) (*schema.StreamReader[*schema.Message], error) {
-	bound, err := l.bindTools(ctx)
+	bound, toolTokens, err := l.bindTools(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	reportProgress(ctx, Progress{Kind: ProgressModel})
+	observeInput(ctx, input, toolTokens)
 	first, err := bound.Stream(ctx, input)
 	if err != nil {
 		return nil, err // 契约 1：同步返回（对齐 react，TestNonRetryableErrorFailsFast 靠它）
@@ -159,30 +159,31 @@ func (l *ownLoop) Stream(ctx context.Context, input []*schema.Message, _ ...eino
 	go func() {
 		defer close(done)
 		defer sw.Close() // 正常结束 → 调用方 Recv 得到 io.EOF（契约 2）
-		l.run(ctx, input, bound, first, sw)
+		l.run(ctx, input, bound, first, sw, toolTokens)
 	}()
 	return schema.MergeStreamReaders([]*schema.StreamReader[*schema.Message]{out, canceled}), nil
 }
 
 // bindTools 把工具的 schema 绑到模型上（等价 react 内部的 ChatModelWithTools）。
 // 不绑的话请求里没有 tools，模型根本不知道有哪些工具可用。
-func (l *ownLoop) bindTools(ctx context.Context) (model.BaseChatModel, error) {
+func (l *ownLoop) bindTools(ctx context.Context) (model.BaseChatModel, int, error) {
 	infos := make([]*schema.ToolInfo, 0, len(l.tools))
 	for _, it := range l.tools {
 		info, err := it.Info(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("读取工具 schema 失败: %w", err)
+			return nil, 0, fmt.Errorf("读取工具 schema 失败: %w", err)
 		}
 		infos = append(infos, info)
 	}
-	return einoagent.ChatModelWithTools(l.model, nil, infos)
+	bound, err := einoagent.ChatModelWithTools(l.model, nil, infos)
+	return bound, estimateToolSchemas(infos), err
 }
 
 // run 是循环本体（在一个 goroutine 里跑），逐步推进直到退出或失败。
 //
 // P3-1：每一步都落一对 `step/start` / `step/end`（log-only），step/end 带**结构化原因**。
 // 这样"跑到第几步、最后一步为什么结束"可从日志重建 —— 断点续跑的地基。
-func (l *ownLoop) run(ctx context.Context, input []*schema.Message, m model.BaseChatModel, reader *schema.StreamReader[*schema.Message], sw *schema.StreamWriter[*schema.Message]) {
+func (l *ownLoop) run(ctx context.Context, input []*schema.Message, m model.BaseChatModel, reader *schema.StreamReader[*schema.Message], sw *schema.StreamWriter[*schema.Message], toolTokens int) {
 	defer func() {
 		if reader != nil {
 			reader.Close()
@@ -222,6 +223,10 @@ func (l *ownLoop) run(ctx context.Context, input []*schema.Message, m model.Base
 			return
 		}
 		messages = append(messages, full)
+		if full.ResponseMeta != nil && full.ResponseMeta.Usage != nil {
+			u := full.ResponseMeta.Usage
+			reportProgress(ctx, Progress{Kind: ProgressModelUsage, Usage: &ModelUsage{Prompt: u.PromptTokens, Completion: u.CompletionTokens}})
+		}
 
 		if isTruncated(full) {
 			logErr := l.logStepEvent(ctx, userID, session.EventStepEnd, string(StepMaxTokens))
@@ -252,7 +257,7 @@ func (l *ownLoop) run(ctx context.Context, input []*schema.Message, m model.Base
 			return
 		}
 
-		reportProgress(ctx, Progress{Kind: ProgressModel})
+		observeInput(ctx, messages, toolTokens)
 		next, err := m.Stream(ctx, messages) // 交棒：把工具结果喂回去再调一次模型
 		if err != nil {
 			// 失败发生在**下一个 step 的模型调用**上 —— 上一个 step 已闭合，

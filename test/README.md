@@ -1,5 +1,35 @@
 # test/ — 假模型与端到端测试
 
+2026-09-23 CM-1a验收与README重构：用户WSL HistorySource定向2/knowledgeintegration全量201通过、0跳过，覆盖此前CM-1a待验。按用户要求重构仓库首页为CLI Harness定位、最小启动、能力表、上下文路线及明确边界；删除首页历史交接堆叠，核对仓库内相对链接和差异格式。仅文档更新，未重跑测试、未提交/push；CM-1相邻消息/外存/工具接入仍待后续。
+
+2026-09-23 CM-1a存储基础（未提交）：新增SourceAt/ReadSource，来源绑定owner+随机日志代次+原始seq，Unicode正文分页上限2000；单条/批量写入口用Lua管理代次并追加，读取原子核对代次，重建或代次丢失拒绝旧ID。兼容旧日志仅补元数据不改原文；保留type/role/interrupted。新增HistorySource两项回归，go vet三标签通过，WSL定向2/全量201待验。契约test/history-source.md：仅主user日志，尚无项目空间/相邻消息/外存展开/模型工具，不改历史选择；CM-1未完成。未本地运行测试/真实模型、未提交/push。
+
+2026-09-23 工具证据最新验收：用户WSL ContextBaseline定向4/knowledgeintegration全量199通过、0跳过。reading-dev补采run-20260923T084722Z-66816.json三轮PASS，工具证据确认1–27截断且有后续，45–55完整但有后续，90–100完整且无后续；回答82/77/68字符，助手复核本题通过。实报输入13894/输出349、5次主调用均有usage；未改模型策略，不把与旧报告差异当节省或质量修复。评审见test/contextbaseline/review-20260923-reading-evidence.md，原失败和quality=unreviewed保留。停止重复补采，下一工程切片CM-1稳定来源/分页回读；费用缓存及旧evidence问题仍未完成。仅更新文档，未本地测试/调用模型、未提交/push。
+
+2026-09-23 CM-0工具证据补齐（未提交）：采集器逐轮保存主循环工具返回/失败事件，复用ToolObservation名称/参数哈希/耗时/实际行范围及分页截断标志，复制快照，不保存原始参数或结果正文；缺观察值保留null。新增ContextBaselineToolEvidence真Harness/文件工具回归，覆盖中部has_more与末尾无后续、跨轮隔离及正文不泄漏。生产循环不变，无额外模型调用；go vet三标签通过，WSL ContextBaseline预计4/全量199待验。回归通过后仅重采reading-dev核对分页证据；不覆盖旧报告或宣称修正了模型质量，CM-1尚未开始。未本地跑测试/真实模型、未提交/push。
+
+2026-09-23 四开发场景基线交接：用户evidence-dev/reading-dev各三轮采集PASS，但助手复核并非质量全过。evidence末轮去Markdown后105字符超100，step定义未满足项目预期且题面缺专有定义；reading验收码/行号正确，但45–55无后续页说法混淆文件分页，实际调用范围因报告缺工具元数据无法核实。四题合计实报输入37954/输出1952、17次主调用均有usage；费用缓存未知。详情test/contextbaseline/review-20260923-evidence-reading.md。下一切片先复用工具进度补采集证据，再推进CM-1；不重跑已判定前两题或留出集。CM-0未整体完成，本轮仅评审和文档，未改生产代码/跑模型/测试/提交。
+
+2026-09-23 恢复场景基线：用户WSL resume-dev三轮PASS，报告run-20260923T083944Z-65615.json。助手按expect复核通过：重建Harness后保留目标/约束/下一步，第二轮79字符；项目编号正确且未编造上线日期。实报输入7579/输出458，4次主调用均有usage；第三轮含工具反馈的两个逻辑步骤，累计输入4021。报告未存工具名/正文，不凭模型自述认定检索范围。仅同进程重建，非真实时间间隔/进程重启/零缓存验证；费用缓存仍未知。评审见test/contextbaseline/review-20260923-resume.md。下一步evidence-dev/reading-dev；CM-0未整体完成，未改生产代码、未本地跑测试或模型、未提交/push。
+
+2026-09-23 最新验收与首份完整基线：用户WSL ApprovalClaim定向5/全量198通过、0跳过，覆盖过期测试前提修正。continuity-dev真实3轮采集PASS，报告run-20260923T083801Z-65467.json；助手逐项复核既定expect通过（末轮51字符），非独立人工复核，原quality=unreviewed保留。实报输入5463/输出388，主调用3次均有usage，无子/摘要调用；费用缓存未知。每轮系统+工具估算1533，短对话固定开销占主导，不证明已节省。详见test/contextbaseline/review-20260923-continuity.md；下一步resume-dev，再补来源及长工具场景。CM-0仍未整体完成。本轮仅读报告/更新文档，未本地运行测试或模型、未提交/push。
+
+2026-09-23 审批过期测试前提纠错（未提交）：用户ContextBaseline定向3通过、全量197通过/1失败/0跳过；唯一失败仍为ApprovalClaimChecksExpiryAtConsumption。新增诊断证明deadline=16:34:44.622，应用=44.553、Redis=44.553，断言时两端均未到期；此前两端时差假设不能解释本次失败。固定Sleep依赖单调时钟，不能证明JSON持久化期限对应的墙钟已越界（具体时钟调整原因未确认）。现原用例轮询应用和Redis墙钟，均超过期限10ms再断言，单调时间5秒上限，未满足前提单独报错；保留真实读取快照及无执行记录/未消费断言，不改生产代码、不新增顶层用例。go vet三标签及差异检查通过，WSL ApprovalClaim定向5/全量198待重验；基线身份修复的定向回归已验，真实采集未重跑。未本地运行测试、未提交/push。
+
+2026-09-23 真实基线入口纠错（未提交）：用户continuity-dev首次采集失败，部分报告run-20260923T082823Z-63557.json仅1轮，轮耗时6ms、SDK尝试0。采集入口遗漏CLI所需user_id上下文，Runtime在模型调用前失败；旧回归自带身份掩盖该遗漏。现采集Run显式接收owner并注入身份，Harness回归改从空白上下文启动，报告新增安全error_code且不存原始错误。go vet含knowledgeintegration/rageval/contexteval及差异检查通过；修复后WSL定向3/全量198和真实三轮采集待重验，此前198通过不覆盖本修复。失败报告保留，不计作质量/费用基线；未运行本地测试或真实模型、未提交/push。
+
+2026-09-23 最新验收：用户WSL ApprovalClaim定向5项、带knowledgeintegration全量198项通过，均0跳过，覆盖审批过期修复及CM-0c采集器的常规回归；此前ContextBaseline定向3项通过。真实模型采集尚无报告，不能据此声称质量/费用基线完成。仅记录用户证据，未重跑测试、未提交/push。下一步用户在WSL显式采集continuity-dev三轮，助手再读取报告分析。
+
+2026-09-23 审批过期纠错（修复待WSL）：用户ContextBaseline定向3项通过、0跳过；全量日志197通过/1失败/0跳过，失败为TestApprovalClaimChecksExpiryAtConsumption（expiry claim: <nil>），不能标198全绿。发现应用时间生成/读取期限、Redis时间消费的口径差异，现Lua在原快照校验后同时检查Redis时间与调用时应用时间，任一到期拒绝。时钟偏差符合故障但用户日志未测量实际差值，不声称已复现。原用例加强无执行记录/未消费及双时钟诊断，无新增顶层用例。go vet含knowledgeintegration/rageval/contexteval与固定CLI构建通过，用户WSL重跑待验；未运行本地测试、未提交/push。真实基线尚未提供。
+
+2026-09-23 CM-0c基线采集（运行待验）：固定4开发/2留出场景，test/contextbaseline复用Harness采集逐轮回答、输入组成、主/子/摘要用量与时间；scripts/context-baseline.sh显式--real一次一题，独立contexteval标签不进日常回归，随机隔离owner及合成文件工具根。新增ContextBaseline三项常规回归，预计定向3/全量198待WSL；真实模型尚未执行，质量固定unreviewed、缓存/费用null。说明见 [基线流程](contextbaseline/README.md)。生产Harness未修改，未提交/push。
+
+2026-09-23 CM-0b最新验收：用户提供WSL ModelAccounting|ContextObservation|CLIToolProgress|RuntimeHarnessAssembly定向8项、带knowledgeintegration全量195项通过，均0跳过，覆盖此前CM-0b待验记录。调用计量回归已验；真实基线、缓存字段存在性、费率及完整费用仍未完成，未证明实际节省效果。未提供-race结果，不宣称已通过竞争检测。仅记录用户日志，未重跑测试、未提交/push。
+
+2026-09-23 CM-0b调用计量（运行待验）：新增ModelAccounting三项及CLI既有用例断言，守住主/子/摘要/重试归属、流累计usage去重、断流保留、并发和跨轮隔离。go vet含knowledgeintegration/rageval与固定CLI构建通过；用户WSL定向预计8/全量195，命令和限制见 [输入观测](context-observation.md)。未运行本地测试/程序或真实模型，未提交/push；192通过仅为前批证据。
+
+2026-09-23 CM-0a回归已验：用户提供WSL定向7项、带knowledgeintegration全量192项通过，均0跳过。覆盖新增3项输入观测回归及加强的CLIToolProgress，详见 [用例表与统计边界](context-observation.md)。仅记录用户日志，未重跑、未提交/push；真实模型基线、完整费用和节省效果尚未验证。
+
 2026-09-22 累计回归最新验收：用户提供WSL `bash scripts/test-fast.sh -tags knowledgeintegration` 结果，189个顶层用例通过、0跳过，覆盖此前工作区读取/搜索上下文、工具诊断分类、模型输入证据、步数默认20及显式/paste改动的回归待验记录。真实模型对话可见8次调用及定点补读，但引用完整性和300字约束仍有不足，不将模型自述当执行证据。自动多行粘贴与输入编辑优化按用户要求后置，真实终端/paste及运行中取消仍待交互验收。本轮仅记录用户测试证据，未重跑测试、未提交或push。
 
 2026-09-22 CLI多行粘贴（未提交）：逐行Scanner会把多段粘贴排成多轮，新增显式/paste收集、独立行/send提交、/cancel丢弃；保留空行，粘贴正文不走CLI/审批命令分派，EOF/Ctrl+C退出不提交未完成正文，64KiB累计上限。普通模式仍逐行提交，未实现自动粘贴识别。新增TestCLIPaste覆盖多段CRLF、命令正文、取消、空提交、EOF及超限；go vet含tag与CLI构建通过，用户WSL定向及全量待验，未运行本地测试。

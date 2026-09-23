@@ -69,6 +69,12 @@ func TestCLIToolProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := output.String()
+	if !strings.Contains(text, "Model attempts (main): 2 |") || !strings.Contains(text, "usage=2/2 input=") {
+		t.Fatalf("missing per-attempt SDK accounting: %s", text)
+	}
+	if !strings.Contains(text, "Input estimate (main loop):") || !strings.Contains(text, "Usage (reported steps 2/2): input=") || !strings.Contains(text, "cache=unknown") {
+		t.Fatalf("missing SDK input/usage accounting: %s", text)
+	}
 	if strings.Count(text, "Tools: 1 calls") != 1 || strings.Contains(text, "Tool   running") || strings.Contains(text, "Tool   returned") || strings.Contains(text, "Model  processing") {
 		t.Fatalf("expected compact progress summary: %s", text)
 	}

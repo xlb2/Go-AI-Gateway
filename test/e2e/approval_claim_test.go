@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -149,9 +150,34 @@ func TestApprovalClaimChecksExpiryAtConsumption(t *testing.T) {
 	if err != nil || p == nil {
 		t.Fatalf("read pending: %v", err)
 	}
-	time.Sleep(time.Until(deadline) + 10*time.Millisecond)
+	// ExpiresAt loses its monotonic component when persisted as JSON. A
+	// single monotonic sleep does not prove that either wall clock passed it
+	// (for example after a WSL clock adjustment). Observe both clocks, with
+	// a monotonic timeout, before asserting the expired-consumption branch.
+	waitStarted := time.Now()
+	var clientNow, redisNow time.Time
+	for {
+		clientNow = time.Now()
+		redisNow, err = e.redis.Time(e.ctx()).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if clientNow.UnixMilli() >= p.ExpiresAt.UnixMilli()+10 && redisNow.UnixMilli() >= p.ExpiresAt.UnixMilli()+10 {
+			break
+		}
+		if time.Since(waitStarted) >= 5*time.Second {
+			t.Fatalf("expiry precondition not reached: deadline=%s client=%s redis=%s", p.ExpiresAt.Format(time.RFC3339Nano), clientNow.Format(time.RFC3339Nano), redisNow.Format(time.RFC3339Nano))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if _, err := s.ClaimPending(e.ctx(), e.uid, *p); !errors.Is(err, approval.ErrExpired) {
-		t.Fatalf("expiry claim: %v", err)
+		t.Fatalf("expiry claim: %v; deadline=%s client=%s redis=%s", err, deadline.Format(time.RFC3339Nano), clientNow.Format(time.RFC3339Nano), redisNow.Format(time.RFC3339Nano))
+	}
+	if record, err := s.GetExecution(e.ctx(), e.uid, p.ID); err != nil || record != nil {
+		t.Fatalf("expired proposal acquired execution record: %+v err=%v", record, err)
+	}
+	if exists, err := e.redis.Exists(e.ctx(), fmt.Sprintf("agent:pending:%d", e.uid)).Result(); err != nil || exists != 1 {
+		t.Fatalf("expired proposal consumed: exists=%d err=%v", exists, err)
 	}
 }
 

@@ -57,6 +57,7 @@ func TestConfiguredLoopsKeepDependenciesSeparate(t *testing.T) {
 			t.Fatalf("missing tool diagnostics: %+v", progress)
 		}
 		progress[2].Observation = nil
+		progress[0].Input, progress[3].Input = nil, nil
 		if !reflect.DeepEqual(progress, want) {
 			t.Fatalf("unexpected progress: %+v", progress)
 		}

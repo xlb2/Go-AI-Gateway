@@ -1,0 +1,53 @@
+{
+  "version": "context-baseline-v1",
+  "cases": [
+    {
+      "id": "continuity-dev", "split": "dev", "rhythm": "continuous",
+      "turns": [
+        {"input": "这是测试项目：星舟，编号XZ-4827。当前做历史原文分页读取，Web优化暂停。请用中文先给结论，暂不查文件，简短确认。", "expect": ["确认项目与目标，不新增任务"]},
+        {"input": "定位方案改为按事件seq，不再用压缩后列表下标。未完成项是长消息中部和末尾的分页验证。请简短确认。", "expect": ["最新决定为seq，未完成项仍是分页验证"]},
+        {"input": "下一步是什么？不超过100字。", "expect": ["验证长消息中部与末尾可读", "沿用事件seq定位", "不恢复Web优化", "中文且不超过100字"]}
+      ]
+    },
+    {
+      "id": "resume-dev", "split": "dev", "rhythm": "harness-recreation-not-real-time-gap",
+      "turns": [
+        {"input": "测试项目海棠，编号HT-7306。当前目标是降低历史输入token，但必须保留用户约束。下一步先测历史正文占比。只做CLI，Web暂停。请简短确认。", "expect": ["记住目标、约束与下一步"]},
+        {"input": "继续。先说当前目标和下一步，不超过100字。", "restart_before": true, "expect": ["目标是降低历史输入token", "仍要保留用户约束", "下一步测历史正文占比", "不恢复Web任务"]},
+        {"input": "这个项目的编号和上线日期是什么？", "expect": ["编号HT-7306", "上线日期未提供，不编造"]}
+      ]
+    },
+    {
+      "id": "evidence-dev", "split": "dev", "rhythm": "continuous",
+      "turns": [
+        {"input": "读取project.md，告诉我项目编号、当前定位决定、未完成项。给每项附上文件名和行号，不超过200字。", "expect": ["XZ-4827", "按事件seq定位", "验证长消息中部与末尾可读", "每项引用行号支持对应陈述"]},
+        {"input": "为什么不继续用列表下标？区分资料明确说过的内容和你的解释，不超过150字。", "expect": ["资料说旧方案已被替代", "推断不得冒充原文结论", "不把旧方案当现行决定"]},
+        {"input": "现在换个话题：只解释turn与step的区别，不要继续项目任务。100字以内。", "expect": ["区分用户一轮与轮内模型调用步骤", "不继续星舟任务", "100字以内"]}
+      ]
+    },
+    {
+      "id": "reading-dev", "split": "dev", "rhythm": "continuous-long-tool-results",
+      "turns": [
+        {"input": "用read_file从reading.md第1行开始读取70行，不使用搜索。只概述实际读取范围、是否完整、是否还有后续页，不超过100字。", "expect": ["实际返回范围与工具证据一致", "识别截断或分页，不假称读完全部100行"]},
+        {"input": "接着用read_file分别读取reading.md第45到55行、第90到100行。告诉我中部和尾部验收码，每项引用正确行号，不超过100字。", "expect": ["MID-3709，reading.md:48", "PAGE-6248，reading.md:96", "确实补读原文"]},
+        {"input": "根据刚才资料，下一步做什么，上线日期是什么？附来源，不超过100字。", "expect": ["先验证来源定位和分页，再考虑向量", "上线日期未提供", "reading.md:96支持结论"]}
+      ]
+    },
+    {
+      "id": "continuity-holdout", "split": "holdout", "rhythm": "continuous",
+      "turns": [
+        {"input": "测试项目青禾QH-9153。只建设CLI，当前先做历史关键词搜索；交流用中文，先结论。请简短确认。", "expect": ["确认QH-9153与关键词搜索目标"]},
+        {"input": "纠正：下一步先做来源ID和原文回读，关键词搜索随后再做。向量检索暂时不做。请简短确认。", "expect": ["来源ID和回读优先于搜索", "向量后置"]},
+        {"input": "QH-9153该先干什么？给一句话。", "expect": ["先来源ID和原文回读", "不把关键词搜索或向量列为第一步"]}
+      ]
+    },
+    {
+      "id": "resume-holdout", "split": "holdout", "rhythm": "harness-recreation-not-real-time-gap",
+      "turns": [
+        {"input": "测试项目云帆YF-6082，任务是日志来源定位，决定使用日志身份加代次加seq。未完成项是重启后来源ID稳定性验证。不做界面。请简短确认。", "expect": ["来源定位规则及未完成项明确"]},
+        {"input": "接着上次的做，先概述下一步。80字以内。", "restart_before": true, "expect": ["验证重启后来源ID稳定", "沿用身份加代次加seq", "不建设界面"]},
+        {"input": "上线时间定在哪一天？", "expect": ["说明未提供或未确定，不能捏造日期"]}
+      ]
+    }
+  ]
+}
