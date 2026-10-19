@@ -1,5 +1,53 @@
 # test/ — 假模型与端到端测试
 
+2026-10-19 仓库同步整理：RAG 的 18 份固定语料已收录到 `test/rag/corpus/`，两个显式评测入口改读仓库内副本；SHA256 全部匹配既有 `manifest.json`，未改题集和语料清单、未运行 holdout。下方用例表中 `TestRAGDevelopmentEvaluation` 与 `TestRAGRetrievalComparison` 的语料现可随单独克隆复现。Windows/Linux 目标三标签 `go vet`、固定 CLI 构建与差异检查通过，未运行程序或测试。普通回归不启用 `rageval`，也不调用真实 embedding。用户于 2026-10-19 在 WSL 运行 `bash scripts/test-fast.sh -tags knowledgeintegration`：241 个顶层用例通过、0 跳过；`bash scripts/eval-rag.sh` 执行通过，验证副本读取（仅关键词、无真实模型调用）：dev 20 题、17 可答、recall@5=0.765、完整召回12/17、无答案有候选3/3。Q02/Q11/Q12/Q15/Q17 仍有来源漏检；未重跑向量/混合评测，未运行 holdout-2。
+
+2026-09-24 CM-3k/reading-dev 4000重复A/B复核：两份报告3轮完成且配置匹配。候选组长度101/79/48，第1轮超1字；应用组59/81/80、语义与长度门槛均通过。应用组仅第3轮实际裁剪4条消息，估算4019→3864（155 token，约该运行估算总输入0.9%）；前两轮续接都回退全量。Prompt 17055/17012、Completion 641/1004且usage均5/5，差额不能归因，费用/缓存未知。与前一对应用组两轮超长合并看，长度质量表现混合，不宣称稳定通过；保留失败后转测resume-dev/4000，不切默认。详情见 `test/contextbaseline/review-20260924-reading-shadow-ab.md`。未本机跑Go测试/模型，未提交/push。
+
+历史记录（reading-dev首次4000真实A/B）：用户WSL两组3轮均完整。事实/分页核对通过；按题面与人工规则检查长度后，应用组第1、2轮133/189字符，超过100限制，完整质量门槛失败（候选组67/95/76，应用第3轮90）。实际在两次调用中各丢弃4条旧消息，候选估算4073→3900、4082→3909（合计346估算token，约2%总输入估算）；首轮一次mandatory_over_budget回退全量。Provider Prompt 17060→16734、Completion 723→621，但模型回复/后续历史不同，不能将总差额归因于裁剪；费用/缓存未知。详情见 `test/contextbaseline/review-20260924-reading-shadow-ab.md`。当时计划重复reading-dev/4000核对质量失败是否复现。未本机跑Go测试/模型，未提交/push。
+
+历史记录：2026-09-24 CM-3k WSL回归与首对真实A/B复核：定向5项和knowledgeintegration全量228项通过、0跳过。`-run` 未匹配包的 `no tests to run` 是预期提示。reading-dev/8000两组答案的固定期望均通过，但应用报告实际删消息数为0，不能视为节省证据；prompt/completion差异不归因于策略，费用及缓存未知。详见 `test/contextbaseline/review-20260924-reading-shadow-ab.md`。修复后的本机三标签 `go vet ./...`、差异检查通过，未本机运行Go测试/真实模型，未提交/push。当时下一次诊断配对计划使用4000；此前把e2e候选估算6790误称为必需下限，已纠正。
+
+2026-09-24 CM-3j验收：首轮失败来自旧 `harness.New()` 测试夹具没有Runtime装配的来源读取/搜索工具，假模型返回未知工具结果，负向用例也可能被掩盖。修正为 `harness.NewFromEnv` 后，正向断言实际读取正文，负向断言实际搜索/读取结果。用户WSL `bash scripts/test-fast.sh -tags knowledgeintegration` 报告20项与223项全部通过、0跳过。带三标签 `go vet` 退出码0、差异检查通过；本机未跑测试/`go run`。下一步按计划做隔离质量/成本对照，不切生产输入。
+
+2026-09-24 CM-3i验收：用户WSL运行 `bash scripts/test-fast.sh -tags knowledgeintegration`，输出17项与220项均通过、0跳过。批准/拒绝/执行失败三条审批续答都保留显式用户来源和完整连续候选后缀，预算不足诊断明确，实际输入及执行语义未变。下一切片为旧来源检索证据的影子预算选择，尚未接管模型输入。
+
+2026-09-24 CM-3h验收：用户WSL定向17项、knowledgeintegration全量220项均通过、0跳过。ResumeTurn显式指定用户来源后，影子候选标为required/kept且实际SDK输入不变，已派发工具不重放。新审批续答断言仍待本批验证。
+
+2026-09-24 CM-3h恢复入口约束回归（待WSL验）：增强既有TestResumeTurnContinuesWithoutReplayingTool，验证显式指定的未中断用户来源在ResumeTurn影子候选中required/kept、无未解决约束，同时SDK实际输入保留该用户消息，已派发工具不重放。未增加顶层测试数、未改生产代码。WSL定向仍为17项、knowledgeintegration全量220项，待重验；本地未运行Go命令。
+
+2026-09-24 CM-3g WSL验收：用户运行 `bash scripts/test-fast.sh -run 'HistorySnapshot|ProjectionSource|ContextShadow|ContextBaseline|ResumeTurn'`，17项通过、0跳过；随后 `bash scripts/test-fast.sh -tags knowledgeintegration`，220项通过、0跳过。显式来源约束与对象映射修复已验。影子选择仍仅诊断，不改变SDK输入。下一切片覆盖ResumeTurn显式约束；本轮不代表恢复入口新断言已通过。
+
+2026-09-24 CM-3g来源约束映射修复（待WSL复验）：用户重跑后定向和knowledgeintegration全量均在TestContextShadowRetainsRequiredUserSource/present断言失败，missing/assistant对照通过。根因是来源快照消息与Harness历史消息为不同指针；值相等但约束被写入快照对象，影子按Harness对象查找时漏掉标记。现改为按已验证相同下标绑定Harness历史对象，实际模型输入不变。此前两条命令均失败，本批未在Windows侧跑Go验证；WSL定向17/全量220待复验，未提交/push。
+
+2026-09-24 CM-3g首轮WSL回归失败与修复（待重跑）：用户执行定向与knowledgeintegration全量时，均在TestContextShadowRetainsRequiredUserSource/present因newEnv未构造Harness而nil panic；根因为测试fixture漏设e.h，非生产路径失败。已在用例显式调用e.newHarness(&recordingExecutor{})修复，未重跑；15/218是前一CM-3f批结果，不代表本批通过。新回归仍待定向17/全量220确认，未本地测试/模型、未提交/push。
+
+2026-09-24 CM-3g显式来源约束（未提交、待WSL验）：基于已验CM-3f来源映射，新增WithRequiredHistorySources供可信调用方显式传入最多16个来源ID；仅完整、未中断的EventUserMessage可成为必留约束。影子候选保留该用户消息至当前轮的连续后缀，预算不足报告required_over_budget；缺失/助手来源/超额ID记未解决并要求复核。实际SDK输入未变，没有自动提取、CLI pin命令或持久pin状态。新增ContextShadowExplicitConstraintSelection与ContextShadowRetainsRequiredUserSource（缺失/助手对照）；三标签go vet通过，WSL定向预计17/全量220待验。此前15/218只覆盖CM-3f，不覆盖本批。未本地go test/go run、未提交/push。
+
+2026-09-24 CM-3f验收与CM-3g显式约束边界（未提交）：用户WSL定向15、全量218通过0跳过，覆盖普通/恢复/审批三入口来源观察。下一步只处理显式用户指定的历史来源如何在影子候选中被强制保留；不做模型自动提取或把助手答案升格为用户约束。CM-3f静态检查通过；CM-3g待实现和WSL复验。CM-3仍未完成，未本地测试/模型、未提交/push。
+
+2026-09-23 CM-3f Harness来源观察（未提交）：用户定向13/全量217通过0跳过。普通对话、恢复续跑和审批续答仅在影子开启时额外读取来源快照，整组角色/正文/工具元数据一致才绑定实际消息对象；失败/不支持/不一致只记状态，不替换输入。影子报告新增来源ID、输入位置、候选保留、摘要/中断标志及未映射数量，本轮新生成消息不猜ID。新增SourceDiagnostics一项并加强基线/审批/恢复既有用例，三标签go vet通过，WSL含ResumeTurn定向15/全量218待验。额外读取有成本，matched只证明快照投影一致，不证明两次读取原子或真实质量/token节省。下一步显式约束层与候选检索组装，CM-3未完成。未本地测试/模型、未提交/push。
+
+2026-09-23 CM-3e活跃尾部快照（未提交）：用户快照/投影/影子/基线定向11、全量215通过0跳过。GetHistorySources在同一Lua快照内核对折叠水位及尾部摘要覆盖证据，有证据才读活跃尾部，缺失/非法/旧位置/重建残留水位无证据则回退完整日志；返回原始base保持来源seq稳定。新增VerifiedFold/UnprovenFoldFallback两项，三标签go vet通过，WSL合并定向13/全量217待验。已覆盖前缀不再读取或校验，活动区坏数据仍拒绝；无读取字节上限、无性能数字或并发压力验收。未替换默认GetHistory/接Harness影子，下一步接真实调用链来源观察与约束层，CM-3未完成。未本地测试/模型、未提交/push。
+
+2026-09-23 CM-3d快照来源与裁剪（未提交）：用户定向9、全量213通过0跳过。新增显式GetHistorySources，Lua一次读取代次与完整日志，投影后复用既有硬预算裁剪，来源绑定owner/代次/seq，可由ReadSource回读。新增HistorySnapshot两项，覆盖重复正文、工具边界、摘要、中断、追加/重建、跨owner与坏数据/未来版本拒绝。三标签go vet通过，WSL合并定向11/全量215待验。当前全日志读取且严格拒绝坏数据，未替换默认GetHistory或接影子报告；后续需活跃尾部快照优化与Harness接入，再做约束层，CM-3未完成。未本地测试/模型、未提交/push。
+
+2026-09-23 CM-3c投影来源基础（未提交）：用户影子/基线定向7、全量211通过0跳过，覆盖CM-3b待验。现有历史投影同步记录原始事件seq，摘要指向自身并另存覆盖范围，保留中断信息，工具配对过滤与原路径共用实现。新增ProjectionSource两项，三标签go vet通过，WSL合并定向9/全量213待验。当前仅快照内映射，尚未绑定owner/日志代次或接入预算裁剪；不能作为稳定回读ID，也未改变实际模型输入。下一步接存储快照与裁剪来源对齐，再推进约束层，CM-3未完成。未本地测试/模型、未提交/push。
+
+2026-09-23 CM-3b影子入口及审批验证（未提交）：用户影子/基线定向6、全量210通过0跳过。真实基线新增显式CONTEXT_BASELINE_SHADOW_BUDGET正整数开关，报告标记未应用实际输入；无CLI默认预算。新增ContextShadowApprovalEvidence覆盖批准/拒绝/执行失败，核对影子超预算与实际SDK原历史/结果仍在，不改生产输入或执行次数。三标签go vet通过，WSL合并定向7/全量211待验；本轮无需付费采集，约束层/来源映射与检索组装尚待实现。未本地测试/模型、未提交/push。
+
+2026-09-23 CM-3a影子计算（未提交）：用户检索合并定向10/全量208通过0跳过。新增显式context启用的影子预算计算，系统+当前轮必留、历史整轮按近到远加入，超预算/未知工具定义明确状态，省略历史标needs_constraint_review。仅Progress与基线helper记录候选统计，不改变实际模型输入，默认关闭、无CLI默认预算。新增ContextShadow两项并加强基线SDK历史不变断言，三标签go vet通过，WSL ContextShadow|ContextBaseline预计6/全量210待验。test/context-shadow.md明确未做约束层/来源映射/检索组装及审批专项；非CM-3完成。未本地测试/真实模型、未提交/push。
+
+2026-09-23 CM-2a字面检索（未提交）：用户定向8/全量206通过0跳过。新增SearchSources/search_history_sources，支持中文与标识符精确匹配，50事件扫描/5命中/200码点预览，携带来源ID和稳定向前游标；标明结构化外存未搜索数量，无命中不等于查遍历史。未搜索外存正文、无向量/索引/语义排序、不改旧搜索或默认上下文；50条非字节预算。新增SearchPaging/SearchToolAndCoverage两项，默认装配已同步，三标签go vet通过，WSL合并定向10/全量208待验。边界见test/history-source.md。未本地测试/真实模型、未提交/push。
+
+2026-09-23 CM-1d来源发现（未提交）：用户默认装配1/全量204通过0跳过。新增ListSources同代次按原seq倒序游标分页，最多5条/每条200码点；追加不漂移、重建游标失效。browse_history_sources可发现ID或读锚点前后各2事件，配合read_history_source；仅原始事件浏览非关键词搜索，不改上下文默认策略。新增BrowseCursor/BrowseTool两项，默认装配集合已同步，三标签go vet通过；WSL合并定向8/全量206待验。详情test/history-source.md。未本地测试/真实模型、未提交/push。
+
+2026-09-23 CM-1c装配断言纠错（未提交）：用户定向5通过；全量203通过/1失败/0跳过，唯一失败RuntimeDefaultAssembly仍硬编码6工具，新read_history_source使默认为7。现断言完整工具名称集合并拒重复，覆盖父/子/父请求，不修改生产逻辑、不新增顶层用例。三标签go vet通过，WSL RuntimeDefaultAssembly定向1/全量204待重验。未本地测试/真实模型、未提交/push。
+
+2026-09-23 CM-1c已知来源工具（未提交）：用户CM-1b定向4/全量203通过0跳过。自动外存成功新增结构化spill_locator，来源页携带引用；支持ReadSource的存储新增read_history_source工具，按当前owner读取正文或显式外存分页，缺引用/外存丢失明确失败，不解析旧提示。新增HistorySourceToolSpill一项，三标签go vet通过，WSL定向5/全量204待验。来源发现、邻居工具和旧load_large_content路径仍待后续；新增schema有输入开销，不能沿用旧基线固定量。未本地测试/真实模型、未提交/push。
+
+2026-09-23 CM-1b读取基础（未提交）：新增SourceNeighbors同代次原子读取前后各最多5条原始事件，200码点预览及来源续读；新增spill.ReadPage显式owner校验与Unicode分页，缺失内容报错。相邻事件不等于相邻用户消息；旧LoadText/模型工具未切换，历史提示尚无结构化外存引用，不宣称旧路径已加固。新增HistorySourceNeighbors/SpillOwnedPages两项，go vet三标签通过，WSL定向4/全量203待验。文档test/history-source.md；下一步结构化引用、来源发现和模型工具接入，CM-1未完成。未本地测试/真实模型、未提交/push。
+
 2026-09-23 CM-1a验收与README重构：用户WSL HistorySource定向2/knowledgeintegration全量201通过、0跳过，覆盖此前CM-1a待验。按用户要求重构仓库首页为CLI Harness定位、最小启动、能力表、上下文路线及明确边界；删除首页历史交接堆叠，核对仓库内相对链接和差异格式。仅文档更新，未重跑测试、未提交/push；CM-1相邻消息/外存/工具接入仍待后续。
 
 2026-09-23 CM-1a存储基础（未提交）：新增SourceAt/ReadSource，来源绑定owner+随机日志代次+原始seq，Unicode正文分页上限2000；单条/批量写入口用Lua管理代次并追加，读取原子核对代次，重建或代次丢失拒绝旧ID。兼容旧日志仅补元数据不改原文；保留type/role/interrupted。新增HistorySource两项回归，go vet三标签通过，WSL定向2/全量201待验。契约test/history-source.md：仅主user日志，尚无项目空间/相邻消息/外存展开/模型工具，不改历史选择；CM-1未完成。未本地运行测试/真实模型、未提交/push。
@@ -113,6 +161,36 @@ K-0评测增量（2026-09-21，WSL待验）：`TestRAGEvaluationQueriesAndRankin
 | TestKnowledgeChatHTTPIsolationAndStream | MySQL 归属过滤、模型收到附件、流式结束、错误脱敏及释放名额、无旧历史混入 |
 
 K-1 第一批：新增 knowledge/ 三项无数据库测试与两项显式 `knowledgeintegration` MySQL 集成测试，详见 [knowledge/README.md](knowledge/README.md)。静态检查通过，WSL 未运行；`scripts/test-fast.sh -tags knowledgeintegration -run Knowledge` 预计 5 项，全量带 tag 预计 139 项。普通快速回归不包含两个 MySQL 用例，不据此宣称数据库通过。
+
+### K-2 向量索引与召回（2026-10 切片2，待 WSL）
+
+| 用例 | 守护的不变量 |
+|---|---|
+| TestEmbedderFromEnv | 全空=明确未启用；半配置=报错，不静默退回关键词 |
+| TestRemoteEmbedderBatchesAndOrders | 按批次（≤10 条）调用、按响应 index 归位、从响应学习维度并生成稳定指纹 |
+| TestRemoteEmbedderRejectsBadResponse | 条数不符 / 非 200 明确报错，不静默接受坏数据 |
+| TestKnowledgeVectorIndexAndSearch（knowledgeintegration） | 幂等重建、原文可召回、跨用户拒绝、规则不匹配降级为 indexed=false、换规则后旧向量不可达、空库 indexed=false |
+
+`TestKnowledgeVectorIndexAndSearch` 用确定性假 embedder（不联网），只验证机制，不代表语义质量；真实 embedding 质量由 `rageval` 三路对照报告评估。本轮 schema 迁移到 v5（`knowledge_chunk_embeddings` / `knowledge_embedding_indexes`），契约见 [knowledge/vector.md](knowledge/vector.md)，选型见 [rag/vector-retrieval-design.md](rag/vector-retrieval-design.md)。
+
+### K-2 混合召回（2026-10 切片3，待 WSL）
+
+| 用例 | 守护的不变量 |
+|---|---|
+| TestKnowledgeQueryTerms | 关键词侧抽词：标识符 + 汉字双字词、去重、上限 32，与评测同口径 |
+| TestKnowledgeHybridSearchFusion（knowledgeintegration） | RRF 融合两路、新进程不假降级、跨用户拒绝、无向量索引时 VectorIndexed=false 并退化为仅关键词 |
+| TestKnowledgeHybridToolScope（knowledgeintegration） | 不传 embedder 时仍 3 个工具（search_sources 契约不变）；传 embedder 追加第 4 个 `search_sources_hybrid`；工具仍按 owner/library 授权 |
+| TestKnowledgeHybridKeywordMultiPage（knowledgeintegration） | 关键词侧候选超过单页 10 份时翻页收齐（12 份全命中），不静默截断第一页；nil embedder 时 VectorIndexed=false |
+
+混合检索停在 source 粒度、保留两侧坐标供 `read_source` 定位；工具独立、不改 `search_sources`。契约见 [knowledge/hybrid.md](knowledge/hybrid.md)。
+
+### K-3 三路对照评测（2026-10 切片4，待 WSL + 真实 embedding）
+
+| 用例 | 守护的不变量 |
+|---|---|
+| TestRAGRetrievalComparison（knowledgeintegration,rageval） | 同一题集/语料/分段规则下产出 关键词 vs 向量 vs 混合 的 source-level recall@5 对照；报告记录语料/实现文件 SHA256、embedding 模型与规则、语料与查询用量；holdout 仅最终跑一次 |
+
+该测试**真实调用远端 embedding API**（WSL 里需 `export EMBEDDING_*`），报告写入 `test/rag/results/`（不入库，不覆盖旧报告）。脚本 `scripts/eval-rag-compare.sh`，说明见 [rag/README.md](rag/README.md)。`eval-rag.sh` 的关键词基线仍不调用模型。
 
 最新验收（2026-09-21）：用户在 Redis PONG 后运行 JWT|LegacyWS|F3Boundary 定向 8、全量 134 项，均通过、0 跳过。覆盖下方 JWT 待验与此前 Redis 不可用时的跳过结果；不代表真实 API 启动或生产部署已验证。未提交。
 
@@ -349,13 +427,19 @@ scripts/reset-state.sh 3      # 只清 UserID 3
 
 ## 测试覆盖了什么
 
-**纯函数（不需要 Redis / 模型，永远跑）**
+**快速单元与装配层（不需要 Redis / 真实模型，默认参与回归）**
 
 另有 `internal/harness/agent/loop_test.go` 的假模型循环测试（文本、工具回灌、建流错误、取消、断流），以及 `guard/pipeline_test.go` 的工具策略测试（外部 Ask、内置执行、无审批处理器拒绝）。这里只确认代码存在，当前执行结果待 WSL 验证。
 
 | 用例 | 守住的不变量 |
 |---|---|
 | `TestProjectMessagesPairOrDrop` | 悬空的 `tool/result` 不进投影（pair-or-drop） |
+| `TestContextShadowExplicitConstraintSelection` | 显式用户来源去重并保留连续后缀；无效位置不能伪装成已满足约束 |
+| `TestContextShadowSelectsRetrievedWholeTurnBeforeRecentHistory` | 成功回读来源优先于普通近期轮；按完整轮加入，超预算省略而不裁半轮 |
+| `TestContextShadowVariantSelectsOnlyValidWholeHistory` | 评测候选只保留完整旧轮、系统消息与当前轮，并保持原消息对象和源切片；质量复核标记不阻止本次隔离应用 |
+| `TestContextShadowVariantFailsClosed` | 来源不匹配、必留约束/回读未解、缺当前轮、非法索引、计数漂移或切半轮时回退全量 |
+| `TestShadowApplyingModelUsesCurrentCandidateAcrossRetries` | 适配器收到候选消息；建流重试复用同一候选，新逻辑请求使用新候选并记录估算 |
+| `TestShadowModelWrapperIsInertWithoutEvaluationState` | 未显式启用评测应用态时模型不被包装 |
 | `TestCompactionProjectionPreservesTailWithLegacyCheckpoint` | 摘要先于近期原文；旧 checkpoint 不能遮蔽未摘要尾部，全量与偏移投影一致 |
 | `TestProjectMessagesHonoursBaseSeq` | 折叠后数组下标 ≠ seq，遮蔽区间必须加偏移 |
 | `tokenmeter` 包的 6 个用例 | 中英文分档估算、工具参数也算进成本、预算自相矛盾会被修正、校准系数会移动且被夹住、裁剪不会把工具配对从中间切断 |
@@ -384,9 +468,17 @@ scripts/reset-state.sh 3      # 只清 UserID 3
 | `TestRepairClosesOpenTurn` | 崩溃留下的开放轮次要被认出并补**合成**收尾；幂等；不动历史 |
 | `TestRepairClosesOpenStepAndDanglingToolCall` | 崩溃留下的**开放 step** 与**悬空 tool/call** 也要补掉（合成 step/end + "结果未知"的 result），幂等且不改历史 |
 | `TestResumePointReportsLastClosedStep` | `ResumePoint` 能报告"续跑到哪"（闭合 step 数 + 末尾是否还有开放轮次） |
-| `TestResumeTurnContinuesWithoutReplayingTool` | 崩溃后 `ResumeTurn` 从**投影历史**接着跑：**不重放已派发的工具**（`tool/call` 数不增），且正常收尾、不留开放轮次 |
+| `TestResumeTurnContinuesWithoutReplayingTool` | 崩溃后 `ResumeTurn` 不重放已派发工具，显式用户来源仍映射到候选且原输入保留，并正常收尾 |
+| `TestContextShadowRetainsRequiredUserSource` | 显式来源约束绑定到实际Harness历史对象；缺失/助手来源 unresolved，SDK输入仍不被替换 |
+| `TestContextShadowApprovalEvidence` | 批准/拒绝/执行失败续答均保留显式用户来源及后续完整连续区间；预算不足如实诊断，实际输入和工具执行语义不变 |
+| `TestContextShadowUsesSuccessfulReadbackAsEvidence` | 成功读取并映射的来源进入影子候选；较新无关轮不替代该证据轮，SDK实际历史仍保留 |
+| `TestContextShadowDoesNotPromoteSearchOrFailedReadback` | 搜索预览及读取失败不计为已读证据 |
+| `TestContextBaselineShadowApplicationChangesOnlyEvaluationInput` | 真Harness接入评测包装器后，仅真实模型适配器输入裁掉安全候选里的旧整轮，当前输入保留并与应用报告消息数一致 |
 | `TestNestedAgentDoesNotPolluteParentStepLog` | 子 agent 的 step 事件**不写进父会话日志**：父日志 step 成对、序列校验干净（防止交错日志骗 `Repair` 反复补事件） |
 | `TestInterruptedStreamIsMarked` | 流被切断的回复标 `interrupted`（不写 `completed` 收尾）、投影里带说明、下一轮 Repair 能补上 |
+| `TestCanceledTurnPersistsPartialReply` | 用户取消后保存已输出的部分回答并标 `interrupted`，不写 `completed`，Repair可补中断收尾 |
+| `TestCLIInteractiveInputEditing` | Linux/WSL PTY下单行/多行编辑有效；输入区显示上下横线且不显示 `You`；终端从80列缩至60列后上下横线即时适配；bracketed paste在Enter前不提交、提交一次且命令样式正文不执行；`/paste`边界、空闲Ctrl+C和终端状态恢复正确 |
+| `TestCLIUsesLineReaderWhenInputIsNotTerminal` | 输出连接终端而输入来自管道时，仍走逐行读取，不错误启用raw mode |
 | `TestLLMRetryRecoversFromRateLimit` | 429 两次后重试成功；留下 2 条 `llm/retry` 且写明原因；这一轮仍正常收尾 |
 | `TestNonRetryableErrorFailsFast` | 400 参数错**立刻失败**，一条 `llm/retry` 都不许留 |
 | `TestWriteInvariantsRejectDirtyEvents` | 缺 `ToolCallID` 的 `tool/result` 被**拒绝写入**（不是写进去再靠投影丢），合法事件照常放行 |

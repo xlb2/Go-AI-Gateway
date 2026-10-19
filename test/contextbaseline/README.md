@@ -1,5 +1,40 @@
 # 上下文成本基线 v1
 
+2026-09-24 CM-3k/reading-dev 4000重复配对：用户WSL候选/应用两份报告均完成3轮，配置哈希、模型和环境匹配。候选回答长度101/79/48，第1轮超限1字；应用组59/81/80，三轮语义与100字约束通过。只有第3轮一次模型调用实际裁剪4条消息，估算4019→3864（155 token，约整轮估算0.9%）；前两轮续接调用均因mandatory_over_budget回退。Provider Prompt 17055/17012、Completion 641/1004，usage均5/5；回复/历史不同，差额不能归因，费用/缓存未知。结合首对应用组133/189/90，应用输出长度一对失败、一对通过，现有小样本不支持稳定质量结论。见[人工评审](review-20260924-reading-shadow-ab.md)。保留失败记录；下一步转测resume-dev/4000，不切默认策略。未本机跑测试或真实模型，未提交/push。
+
+历史记录（reading-dev首次4000诊断配对）：用户WSL两次真实采集均完成3轮，报告run-20260924T091518Z-15629（候选）与run-20260924T091530Z-15730（应用）的语料/源码哈希、模型和运行环境匹配。事实、来源和分页语义核对通过；但按人工判定规则计字符后，候选组回答为67/95/76字，应用组为133/189/90字，应用第1、2轮违反题面100字限制，故此应用组未通过完整质量门槛。应用报告在第2、3轮各一次调用中丢弃4条旧消息，估算4073→3900、4082→3909，共减少346估算token；第1轮因mandatory_over_budget回退全量。Provider Prompt为17060→16734、Completion为723→621，均5/5次usage覆盖，但回答/历史不同，差额不能归因于策略；费用和缓存未知。总估算降幅约2%，不足以支持默认切换。详情见[人工评审](review-20260924-reading-shadow-ab.md)。报告quality仍为unreviewed；当时计划重复此配对复核长度门槛。
+
+历史记录：2026-09-24 CM-3k与reading-dev首对A/B复核：定向5项、knowledgeintegration全量228项通过、0跳过。reading-dev两份8000预算报告的语料/源码哈希、模型和环境一致，三轮固定期望均通过人工核对；但应用报告5/5次 `applied=true` 且 `dropped_messages=0`，发送估算与原估算相等，因此这是质量检查，不是有效节省对照。Prompt 17044/16974、Completion 618/508，费用/缓存未知，差异不能归因于策略。人工评审见[review-20260924-reading-shadow-ab.md](review-20260924-reading-shadow-ab.md)，生成报告的 `quality` 保持 `unreviewed`。此前把e2e候选估算6790误称为必需输入下限，现已纠正；当时下一对计划以4000作诊断预算。未本机运行测试或真实模型，未提交/push。
+
+设置正整数 `CONTEXT_BASELINE_SHADOW_BUDGET` 时只计算候选；默认真实模型仍收到原输入，报告 `context_shadow_application=candidate_only`。只有显式 `--apply-shadow` 才让评测主循环的模型适配器收到通过校验的候选，其余候选回退全量；摘要与子 agent 保持原工厂。普通 Harness、CLI 和服务默认行为不变。预算及边界见[影子上下文](../context-shadow.md)。
+
+元数据的 `context_shadow_application=apply_candidates` 仅表示启用了评测应用模式；每个 SDK 调用是否真的裁剪，以 `shadow_input_applications[].applied` 为准。
+
+`needs_constraint_review` 是答案质量复核信号，不是评测应用开关：普通旧历史被裁剪时它也会为真，隔离 A/B 仍应把结构合法、来源匹配的候选实际送入模型以测量质量影响。未解决的显式约束或回读来源仍回退原输入；被省略的已读证据可以进入 A/B，须在答案评审时核对。
+
+## 隔离对照
+
+实现变更先在WSL跑本批定向与全量回归，并解析评测脚本语法；以下真实模型对照需等回归通过后再启动：
+
+```bash
+bash scripts/test-fast.sh -run 'ContextShadowVariant|ShadowApplyingModel|ShadowModelWrapper|ContextBaselineShadowApplication'
+bash scripts/test-fast.sh -tags knowledgeintegration
+bash -n scripts/context-baseline.sh
+```
+
+reading-dev 的4000重复配对里，应用组长度限制通过，但前一对未通过；当前小样本不能证明稳定质量。下一组测 `resume-dev` 的目标与约束续接，属于同进程 Harness 重建，不等同真实长时间间隔。下面两条命令会调用真实模型并产生费用：
+
+```bash
+CONTEXT_BASELINE_SHADOW_BUDGET=4000 bash scripts/context-baseline.sh --real resume-dev
+CONTEXT_BASELINE_SHADOW_BUDGET=4000 bash scripts/context-baseline.sh --real resume-dev --apply-shadow
+```
+
+`4000` 仍是诊断预算，不是生产默认或最终推荐值。reading-dev首个应用组发生过两轮超长，重复组没有复现；候选控制组重复时第1轮又超限1字。只有两个应用组都满足语义expect和可见回答Unicode字符数上限，且发生真实裁剪，才可称该场景重复验收通过；当前长度结果混合，尚未达到。对新场景同样要检查 `corpus_sha256`、`source_sha256`、模型、运行环境及 `WithUsage` 覆盖。Provider总Prompt差异受模型回复改变的后续历史影响，费用和缓存未知，报告的 `quality` 保持 `unreviewed`。
+
+8000和4000两组reading-dev配对的逐轮人工核对与usage口径见[评审记录](review-20260924-reading-shadow-ab.md)。其中e2e候选估算6790是保留了部分历史后的候选，不是必需输入下限。
+
+`shadow_input_applications` 每行对应一次传给模型适配器的调用（包括建流重试），记录候选状态、是否应用、回退原因、消息数及原/候选/实际适配器输入的估算。`logical_main_inputs` 与 `sdk_attempts.Main.EstimatedInput` 在包装器外测量，仍表示原始逻辑输入；比较实际请求优先看 provider 返回的 `sdk_attempts.Main.Prompt`，同时检查 `WithUsage` 覆盖。`sent_estimate_tokens` 是项目估算，不是供应商精确token或HTTP线级证据；`fees` 与 `cached_tokens` 仍为未知。
+
 2026-09-23 工具证据最新验收：用户WSL ContextBaseline定向4/knowledgeintegration全量199通过、0跳过。reading-dev补采run-20260923T084722Z-66816.json三轮PASS，工具证据确认1–27截断且有后续，45–55完整但有后续，90–100完整且无后续；回答82/77/68字符，助手复核本题通过。实报输入13894/输出349、5次主调用均有usage；未改模型策略，不把与旧报告差异当节省或质量修复。评审见test/contextbaseline/review-20260923-reading-evidence.md，原失败和quality=unreviewed保留。停止重复补采，下一工程切片CM-1稳定来源/分页回读；费用缓存及旧evidence问题仍未完成。仅更新文档，未本地测试/调用模型、未提交/push。
 
 2026-09-23 CM-0工具证据补齐（未提交）：采集器逐轮保存主循环工具返回/失败事件，复用ToolObservation名称/参数哈希/耗时/实际行范围及分页截断标志，复制快照，不保存原始参数或结果正文；缺观察值保留null。新增ContextBaselineToolEvidence真Harness/文件工具回归，覆盖中部has_more与末尾无后续、跨轮隔离及正文不泄漏。生产循环不变，无额外模型调用；go vet三标签通过，WSL ContextBaseline预计4/全量199待验。回归通过后仅重采reading-dev核对分页证据；不覆盖旧报告或宣称修正了模型质量，CM-1尚未开始。未本地跑测试/真实模型、未提交/push。

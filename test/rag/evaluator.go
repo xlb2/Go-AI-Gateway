@@ -87,21 +87,34 @@ type CaseResult struct {
 	Retrieved []string `json:"retrieved_sources"`
 	Missing   []string `json:"missing_sources"`
 	Recall    *float64 `json:"recall_at_5,omitempty"`
+	// RecallAt1 只看排名第一的来源是否命中：语料小、来源少时 recall@5 会饱和，
+	// 需要它来区分排序质量。
+	RecallAt1 *float64 `json:"recall_at_1,omitempty"`
 }
 type Scores struct {
 	Answerable             int          `json:"answerable_cases"`
 	MeanRecall             float64      `json:"macro_source_recall_at_5"`
+	MeanRecallAt1          float64      `json:"macro_source_recall_at_1"`
 	Complete               int          `json:"all_expected_sources_found"`
 	NoAnswer               int          `json:"unanswerable_cases"`
 	NoAnswerWithCandidates int          `json:"unanswerable_with_candidates"`
 	Cases                  []CaseResult `json:"cases"`
 }
 
+// Evaluate 在开发集（dev）上评分，保持既有调用不变。
 func Evaluate(ctx context.Context, cases []Case, retrieve func(context.Context, string) ([]string, error)) (Scores, error) {
+	return EvaluateSplit(ctx, cases, "dev", retrieve)
+}
+
+// EvaluateSplit 在指定划分（dev/holdout）上评分。holdout 只应在最终验收时跑一次。
+func EvaluateSplit(ctx context.Context, cases []Case, split string, retrieve func(context.Context, string) ([]string, error)) (Scores, error) {
+	if split == "" {
+		split = "dev"
+	}
 	result := Scores{Cases: []CaseResult{}}
 	seen := map[string]bool{}
 	for _, c := range cases {
-		if c.Split != "dev" {
+		if c.Split != split {
 			continue
 		}
 		if c.ID == "" || c.Question == "" || seen[c.ID] {
@@ -139,8 +152,14 @@ func Evaluate(ctx context.Context, cases []Case, retrieve func(context.Context, 
 			sort.Strings(row.Missing)
 			recall := float64(len(gold)-len(row.Missing)) / float64(len(gold))
 			row.Recall = &recall
+			r1 := 0.0
+			if len(unique) > 0 && gold[unique[0]] {
+				r1 = 1
+			}
+			row.RecallAt1 = &r1
 			result.Answerable++
 			result.MeanRecall += recall
+			result.MeanRecallAt1 += r1
 			if len(row.Missing) == 0 {
 				result.Complete++
 			}
@@ -148,10 +167,11 @@ func Evaluate(ctx context.Context, cases []Case, retrieve func(context.Context, 
 		result.Cases = append(result.Cases, row)
 	}
 	if len(result.Cases) == 0 {
-		return Scores{}, fmt.Errorf("no development cases")
+		return Scores{}, fmt.Errorf("no %s cases", split)
 	}
 	if result.Answerable > 0 {
 		result.MeanRecall /= float64(result.Answerable)
+		result.MeanRecallAt1 /= float64(result.Answerable)
 	}
 	return result, nil
 }

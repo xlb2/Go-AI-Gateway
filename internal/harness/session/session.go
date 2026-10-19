@@ -239,6 +239,7 @@ type ToolCallData struct {
 
 // MemoryDTO 持久化在日志里的一条事件（自研纯净 DTO，避开第三方结构体反序列化陷阱）。
 type MemoryDTO struct {
+	SpillLocator   string         `json:"spill_locator,omitempty"` // Structured reference; never infer it from Content.
 	Run            *runstate.Ref  `json:"run,omitempty"`
 	Type           string         `json:"type"`
 	Role           string         `json:"role"`
@@ -980,6 +981,10 @@ func (RedisStore) Compact(ctx context.Context, userID uint, summarize CompactSum
 // 窗口大小是预算的事（见 Compact 与 GetHistory 的 TrimToBudget）。
 // 两者混在一起正是原来"按条数截断"的病根。
 func ProjectMessagesFrom(dtos []MemoryDTO, baseSeq int) []*schema.Message {
+	return projectMessagesFrom(dtos, baseSeq, nil)
+}
+
+func projectMessagesFrom(dtos []MemoryDTO, baseSeq int, emitted func(*schema.Message, int)) []*schema.Message {
 	// 预扫描压缩摘要：
 	//  1. 被遮蔽的旧消息下标直接跳过（压缩后日志只追加、不删旧事件）
 	//  2. 摘要之间是"后者取代前者"的滚动语义：只有覆盖范围最大的那条进投影。
@@ -1002,21 +1007,32 @@ func ProjectMessagesFrom(dtos []MemoryDTO, baseSeq int) []*schema.Message {
 	}
 
 	history := make([]*schema.Message, 0, len(dtos))
+	appendMessage := func(msg *schema.Message, index int) {
+		history = append(history, msg)
+		if emitted != nil {
+			emitted(msg, index)
+		}
+	}
 	if activeSummary >= 0 {
 		// 写入顺序是尾部在前、摘要在后；模型顺序必须是摘要在前、尾部在后。
-		history = append(history, schema.UserMessage("【早期对话摘要】"+dtos[activeSummary].Content))
+		appendMessage(schema.UserMessage("【早期对话摘要】"+dtos[activeSummary].Content), activeSummary)
 	}
 
 	var pending *MemoryDTO
+	pendingIndex := -1
 	open := map[string]bool{}
 	var pendingResults []*schema.Message
+	var pendingIndices []int
 	flushPair := func() {
 		if pending == nil || len(open) > 0 {
 			return
 		}
-		history = append(history, assistantMsgFromToolCall(pending))
-		history = append(history, pendingResults...)
+		appendMessage(assistantMsgFromToolCall(pending), pendingIndex)
+		for i, msg := range pendingResults {
+			appendMessage(msg, pendingIndices[i])
+		}
 		pending, open, pendingResults = nil, map[string]bool{}, nil
+		pendingIndices = nil
 	}
 
 	for i := range dtos {
@@ -1036,17 +1052,20 @@ func ProjectMessagesFrom(dtos []MemoryDTO, baseSeq int) []*schema.Message {
 		case EventToolCall:
 			flushPair()
 			pending = &dto
+			pendingIndex = i
 			open = map[string]bool{}
 			for _, tc := range dto.ToolCalls {
 				open[tc.ID] = true
 			}
 			pendingResults = nil
+			pendingIndices = nil
 		case EventToolResult:
 			if pending == nil || !open[dto.ToolCallID] {
 				continue // 悬空结果：没有配对的 call，丢弃
 			}
 			delete(open, dto.ToolCallID)
 			pendingResults = append(pendingResults, toolMsgFromToolResult(&dto))
+			pendingIndices = append(pendingIndices, i)
 			if len(open) == 0 {
 				flushPair()
 			}
@@ -1058,10 +1077,10 @@ func ProjectMessagesFrom(dtos []MemoryDTO, baseSeq int) []*schema.Message {
 			if typ == EventAssistantMessage && dto.Interrupted {
 				content = "【上一轮回复被中断，以下是已生成的部分】" + content
 			}
-			history = append(history, &schema.Message{
+			appendMessage(&schema.Message{
 				Role:    schema.RoleType(dto.Role),
 				Content: content,
-			})
+			}, i)
 		}
 	}
 	flushPair()

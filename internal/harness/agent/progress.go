@@ -18,6 +18,7 @@ type Progress struct {
 	Observation *ToolObservation
 	Input       *InputObservation
 	Usage       *ModelUsage
+	Shadow      *ContextShadow
 }
 
 // ToolObservation contains bounded diagnostics, never arguments or result bodies.

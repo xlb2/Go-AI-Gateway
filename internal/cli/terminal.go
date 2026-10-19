@@ -31,66 +31,94 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 	}
 	ctx = context.WithValue(ctx, "user_id", userID)
 	display := newDisplay(output)
+	editor := newLineEditor(input, output, display.terminal)
 	showReasoning := true
 	pasteMode := false
 	var paste strings.Builder
 	readCtx, stopReading := context.WithCancel(ctx)
 	defer stopReading()
 	type line struct {
-		text string
-		err  error
+		text   string
+		pasted bool
+		err    error
 	}
-	lines := make(chan line)
-	go func() {
-		defer close(lines)
-		scanner := bufio.NewScanner(input)
-		scanner.Buffer(make([]byte, 4096), 64*1024)
-		for scanner.Scan() {
-			select {
-			case lines <- line{text: scanner.Text()}:
-			case <-readCtx.Done():
-				return
+	var lines <-chan line
+	if editor == nil {
+		inputLines := make(chan line)
+		lines = inputLines
+		go func() {
+			defer close(inputLines)
+			scanner := bufio.NewScanner(input)
+			scanner.Buffer(make([]byte, 4096), 64*1024)
+			for scanner.Scan() {
+				select {
+				case inputLines <- line{text: scanner.Text()}:
+				case <-readCtx.Done():
+					return
+				}
 			}
-		}
-		if err := scanner.Err(); err != nil {
-			select {
-			case lines <- line{err: err}:
-			case <-readCtx.Done():
+			if err := scanner.Err(); err != nil {
+				select {
+				case inputLines <- line{err: err}:
+				case <-readCtx.Done():
+				}
 			}
-		}
-	}()
+		}()
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if pasteMode {
+		if editor == nil && pasteMode {
 			if _, err := io.WriteString(output, "... "); err != nil {
 				return err
 			}
-		} else {
+		} else if editor == nil && !pasteMode {
 			if err := display.prompt(); err != nil {
 				return err
 			}
 		}
 		var next line
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-interrupts:
-			return nil
-		case value, ok := <-lines:
-			if !ok {
+		if editor != nil {
+			prefix := "> "
+			if pasteMode {
+				prefix = "... "
+			}
+			edited, interrupted, err := editor.readLine(ctx, prefix, interrupts, !pasteMode)
+			if interrupted {
 				return nil
 			}
-			next = value
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("read input: %w", err)
+			}
+			next.text = edited.text
+			next.pasted = edited.pasted
+		} else {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-interrupts:
+				return nil
+			case value, ok := <-lines:
+				if !ok {
+					return nil
+				}
+				next = value
+			}
 		}
 		if next.err != nil {
 			return fmt.Errorf("read input: %w", next.err)
 		}
-		text := strings.TrimSpace(next.text)
-		pasted := false
+		text := next.text
+		if !next.pasted {
+			text = strings.TrimSpace(text)
+		}
+		pasteSubmission := false
 		if pasteMode {
-			switch text {
+			switch strings.TrimSpace(next.text) {
 			case "/cancel":
 				paste.Reset()
 				pasteMode = false
@@ -99,7 +127,7 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 				text = strings.TrimSuffix(paste.String(), "\n")
 				paste.Reset()
 				pasteMode = false
-				pasted = true
+				pasteSubmission = true
 			default:
 				if paste.Len()+len(next.text)+1 > 64*1024 {
 					return fmt.Errorf("paste exceeds 64 KiB; nothing sent")
@@ -112,7 +140,8 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 		if strings.TrimSpace(text) == "" {
 			continue
 		}
-		if !pasted {
+		pasteAsMessage := next.pasted || pasteSubmission
+		if !pasteAsMessage {
 			switch text {
 			case "/paste":
 				pasteMode = true
@@ -260,7 +289,7 @@ func Run(ctx context.Context, runner Runner, userID uint, input io.ReadCloser, o
 			// Pasted commands are message content, never approval actions.
 			var handled bool
 			var reply string
-			if !pasted {
+			if !pasteAsMessage {
 				handled, reply = runner.HandleApprovalCommand(runCtx, userID, text)
 			}
 			var err error

@@ -7,13 +7,33 @@ case "$(uname -s)" in
 esac
 case "${1:-}" in
   --real) shift ;;
-  *) printf '%s\n' 'Usage: bash scripts/context-baseline.sh --real [case-id] [--holdout]' >&2; exit 2 ;;
+  *) printf '%s\n' 'Usage: bash scripts/context-baseline.sh --real [case-id] [--holdout] [--apply-shadow]' >&2; exit 2 ;;
 esac
-export CONTEXT_BASELINE_CASE="${1:-continuity-dev}"
-if (($#)); then shift; fi
 export CONTEXT_BASELINE_HOLDOUT=0
-if [[ "${1:-}" == '--holdout' ]]; then CONTEXT_BASELINE_HOLDOUT=1; shift; fi
-if (($#)); then printf '%s\n' 'Unexpected arguments.' >&2; exit 2; fi
+export CONTEXT_BASELINE_APPLY_SHADOW=0
+case_id=continuity-dev
+case_set=0
+while (($#)); do
+  case "$1" in
+    --holdout) CONTEXT_BASELINE_HOLDOUT=1 ;;
+    --apply-shadow) CONTEXT_BASELINE_APPLY_SHADOW=1 ;;
+    --*) printf '%s\n' "Unexpected option: $1" >&2; exit 2 ;;
+    *)
+      if ((case_set)); then printf '%s\n' 'Only one case-id is allowed.' >&2; exit 2; fi
+      case_id="$1"
+      case_set=1
+      ;;
+  esac
+  shift
+done
+export CONTEXT_BASELINE_CASE="$case_id"
+if [[ "$CONTEXT_BASELINE_APPLY_SHADOW" == 1 ]]; then
+  budget="${CONTEXT_BASELINE_SHADOW_BUDGET:-}"
+  if [[ ! "$budget" =~ ^[0-9]+$ || ! "$budget" =~ [1-9] ]]; then
+    printf '%s\n' '--apply-shadow requires CONTEXT_BASELINE_SHADOW_BUDGET to be a positive integer.' >&2
+    exit 2
+  fi
+fi
 mkdir -p test/contextbaseline/results
 export CONTEXT_BASELINE_REPORT="$(pwd)/test/contextbaseline/results/run-$(date -u +%Y%m%dT%H%M%SZ)-$$.json"
 export CONTEXT_BASELINE_REAL=1

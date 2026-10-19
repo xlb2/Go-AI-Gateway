@@ -446,6 +446,7 @@ func (h *Harness) RunAgentTurn(ctx context.Context, userID uint, content string,
 	if err != nil {
 		return "", fmt.Errorf("读取记忆失败: %v", err)
 	}
+	ctx = agent.ObserveHistorySources(ctx, h.Sessions, userID, history)
 	if err := h.Sessions.SaveMessage(ctx, userID, usrMsg); err != nil {
 		return "", err
 	}
@@ -497,6 +498,12 @@ func (h *Harness) runLoop(ctx context.Context, userID uint, fullMessages []*sche
 	var streamErr error
 	for {
 		msg, err := responseStream.Recv()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			streamErr = ctxErr
+			interrupted = true
+			metrics.Default.Inc("turns_interrupted_total")
+			break
+		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
 				streamErr = err
@@ -523,6 +530,10 @@ func (h *Harness) runLoop(ctx context.Context, userID uint, fullMessages []*sche
 			}
 		}
 	}
+	// Cancellation stops model work, but it must not cancel bounded final writes
+	// for content and events already produced.
+	persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelPersist()
 	// 记用量：这是预算判断的唯一真实依据（估算只是估算）。
 	// 校准必须是"同一份内容"的估算 vs 实际 —— 所以配 firstPrompt（首步的输入正是 fullMessages），
 	// 而不是配 lastPrompt（那是累加了历史之后更大的一份，拿它校准会让系数一路偏大）。
@@ -539,7 +550,7 @@ func (h *Harness) runLoop(ctx context.Context, userID uint, fullMessages []*sche
 			"calibration_ratio":   ratio,
 			"calibration_n":       samples,
 		})
-		_ = h.Sessions.AppendEvent(ctx, userID, session.MemoryDTO{
+		_ = h.Sessions.AppendEvent(persistCtx, userID, session.MemoryDTO{
 			Type: session.EventUsage, Role: "system", Content: string(payload),
 		})
 		metrics.Default.Add("prompt_tokens_total", float64(promptTotal))
@@ -552,12 +563,12 @@ func (h *Harness) runLoop(ctx context.Context, userID uint, fullMessages []*sche
 	// 让日志如实保留"这一轮没闭合"，下一轮的 Repair 才能认出它是断的（而不是模型没回）。
 	reply := aiFullResponse.String()
 	if reply != "" {
-		if err := h.Sessions.SaveReply(ctx, userID, reply, interrupted); err != nil {
+		if err := h.Sessions.SaveReply(persistCtx, userID, reply, interrupted); err != nil {
 			return reply, errors.Join(streamErr, err)
 		}
 	}
 	if !interrupted {
-		_ = h.Sessions.AppendEvent(ctx, userID, session.MemoryDTO{
+		_ = h.Sessions.AppendEvent(persistCtx, userID, session.MemoryDTO{
 			Type: session.EventTurnEnd, Role: "system",
 			Content: session.TurnEndContent(session.TurnCompleted, ""),
 		})
@@ -602,6 +613,7 @@ func (h *Harness) ResumeTurn(ctx context.Context, userID uint, emit func(chunk s
 		return "", false, fmt.Errorf("读取记忆失败: %v", err)
 	}
 	fullMessages := make([]*schema.Message, 0, len(history)+1)
+	ctx = agent.ObserveHistorySources(ctx, h.Sessions, userID, history)
 	fullMessages = append(fullMessages, sysMsg)
 	fullMessages = append(fullMessages, history...)
 

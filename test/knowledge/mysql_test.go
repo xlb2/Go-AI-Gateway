@@ -75,7 +75,7 @@ func database(t *testing.T) *gorm.DB {
 		if err := db.Table("knowledge_schema_versions").Order("version ASC").Pluck("version", &versions).Error; err != nil {
 			t.Fatal(err)
 		}
-		if len(versions) != 4 || versions[0] != 1 || versions[1] != 2 || versions[2] != 3 || versions[3] != 4 {
+		if len(versions) != 5 || versions[0] != 1 || versions[1] != 2 || versions[2] != 3 || versions[3] != 4 || versions[4] != 5 {
 			t.Fatalf("migration pass %d: unexpected versions %v", i+1, versions)
 		}
 	}

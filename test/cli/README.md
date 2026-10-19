@@ -1,6 +1,27 @@
 # CLI 首批验收
 
-最新验收：用户WSL带knowledgeintegration全量189项通过、0跳过，包含CLI与CLIPaste回归。真实终端粘贴与运行中取消仍待交互验证；自动多行粘贴和输入编辑按用户要求后置。
+当前状态（2026-09-29，WSL自动回归及Windows Terminal手测通过）：交互输入已移除 `You` 标签并在内容上下绘制横线；PTY用例覆盖80列缩至60列后两条横线更新。编辑器监听 `SIGWINCH` 并按输出终端宽度重绘整框。用户WSL重跑编辑器定向1项、`CLI|CanceledTurn`定向13项及knowledgeintegration全量231项，均通过、0跳过。用户重装最新 `gwagent` 后确认实际终端缩放正常；首次运行仍使用旧安装二进制。用户确认桌面快捷方式可启动独立Windows Terminal/WSL CLI、右键多行粘贴无shell警告、长文本显示和光标编辑正常。前两次回归的测试辅助函数问题已通过精确横线段计数修复。Linux目标 `go vet` 通过；本机未运行Go测试或程序。
+
+验收状态（2026-09-28）：用户WSL `-run CLI` 定向10项及原knowledgeintegration全量228项通过，均0跳过。真实 CLI 在隔离 user `9280928` 下可跨 `/exit` 重启回忆标记。用户实测 `/paste` 中 PASTE-A/B/C 只提交一次；运行中 Ctrl+C 后回到提示符并继续对话，空闲 Ctrl+C 返回 shell。取消持久化回归经用户重跑 `-run CanceledTurn` 1项、knowledgeintegration全量229项通过，均0跳过。真实 CLI 长回复中 Ctrl+C 后未见记忆落盘失败提示，随后一轮仍可正常对话；本次未重启核对部分回答是否可恢复。当前多行输入编辑器回归也已通过：用户报告编辑器定向1项、`CLI|CanceledTurn`定向13项、knowledgeintegration全量231项，均0跳过。首次PTY测试因ANSI颜色码隔开换行和提示文本而超时，改用提示文本匹配后复验通过。用户已成功运行安装脚本并从 `gwagent -user 9280928` 启动，并确认方向键、Home/End、Backspace/Delete、Up/Down历史、`/help`、`/exit`与空闲Ctrl+C均正常。桌面快捷方式已创建并回读核对目标参数，尚未由用户双击验收。Windows Terminal右键多行粘贴无警告、窄窗口/尺寸调整和受控剪贴板验收仍待做。
+
+2026-09-28 单行输入编辑器的历史验收记录：Linux/WSL TTY模式此前新增单行编辑与进程内历史；支持左右/Home/End、Backspace/Delete及上下浏览，raw mode只在等待输入时开启。用户WSL定向1项、合并13项和knowledgeintegration全量231项通过、0跳过，真实终端确认既有按键可用。此前结果不覆盖新增多行粘贴改动；本批 bracketed-paste PTY回归已通过，Windows Terminal手测见上方当前状态。
+
+当前终端实现更新：raw mode 与 bracketed paste 只在等待输入时开启，提交或退出后恢复；Windows、重定向及管道输入继续逐行读取。交互输入区显示上下横线，不显示 `You`；收到 `SIGWINCH` 时读取输出终端宽度并重绘边框，PTY用例覆盖80列缩至60列时上下线同时更新，用户WSL定向及全量回归已通过。用户重装最新 `gwagent` 后确认实际终端缩放正常。`TestCLIInteractiveInputEditing` 还覆盖Enter前不提交、按Enter只提交一次、粘贴 `/exit` 作为正文、Up键在多行中移动光标及模式/termios恢复；`TestCLIUsesLineReaderWhenInputIsNotTerminal` 继续覆盖管道回退。用户已在Windows Terminal实测桌面快捷方式启动、右键多行粘贴、长文本显示和光标编辑正常。
+
+在WSL验收：
+
+```bash
+bash scripts/test-fast.sh -run TestCLIInteractiveInputEditing
+bash scripts/test-fast.sh -run 'CLI|CanceledTurn'
+bash scripts/test-fast.sh -tags knowledgeintegration
+bash scripts/install-agent.sh
+export PATH="$HOME/.local/bin:$PATH"
+gwagent -user 9280928
+```
+
+WSL 测试通过后，在 Windows Terminal 启动 CLI，右键粘贴包含三行和空行的文本。粘贴时不应弹出多行 shell 粘贴警告；文本应留在同一编辑区，按 Enter 前不触发模型请求，按 Enter 后只发起一轮。再单独粘贴 `/exit` 并按 Enter，测试它作为正文发送且 CLI 不退出。该手测会实际调用模型，使用隔离测试账号和无敏感内容。
+
+按键名操作时要按键盘上的物理按键，不要在提示里输入 `/home`、`/left` 等文字；斜杠开头会作为CLI命令处理。可以用本地命令低成本验证 Home/End：输入 `xit`，按键盘上的 Home，输入 `/e`，再按 End；提示行应变成 `/exit`，按 Enter 后直接退出而不调用模型。重新启动后输入 `/exiXt`，按 Left 两次再按 Delete，提示行也应变成 `/exit`；按 Enter退出。历史键可用 `/help` 建立一条本地历史，然后在下一行输入临时草稿，按 Up 回看 `/help`、按 Down 恢复草稿，最后按空闲 Ctrl+C 退出。按键验证后可再观察窄窗口、调整窗口尺寸和终端模拟器的复制粘贴行为；退出后终端应恢复正常回显。
 
 2026-09-22 CLI多行粘贴（未提交）：逐行Scanner会把多段粘贴排成多轮，新增显式/paste收集、独立行/send提交、/cancel丢弃；保留空行，粘贴正文不走CLI/审批命令分派，EOF/Ctrl+C退出不提交未完成正文，64KiB累计上限。普通模式仍逐行提交，未实现自动粘贴识别。新增TestCLIPaste覆盖多段CRLF、命令正文、取消、空提交、EOF及超限；go vet含tag与CLI构建通过，用户WSL定向及全量待验，未运行本地测试。
 
@@ -39,21 +60,24 @@
 | TestCLIErrorAndCommands | 错误与半截回复可见，下一轮仍可输入；本地命令不提交模型 |
 | TestCLICancelWaitsBeforeNextTurn | Ctrl+C 传播取消，调用返回前不开始下一轮，取消后仍可交互 |
 | TestCLIInputAndOutputFailures | 输入过大、输出失败显式返回；空闲中断可退出 |
+| TestCLIInteractiveInputEditing（Linux/WSL） | 单行/多行编辑；bracketed paste不提前提交、Enter仅提交一次、命令样式正文不执行；`/paste`边界、空闲Ctrl+C及终端状态恢复 |
+| TestCLIUsesLineReaderWhenInputIsNotTerminal（Linux/WSL） | 输出虽为终端但标准输入为管道时，回退Scanner而不尝试raw mode |
 | TestCLIHarnessHistory（test/e2e/） | 假模型与真Redis下，CLI经过完整Harness保存两轮历史和step/turn事件 |
+| TestCanceledTurnPersistsPartialReply（test/e2e/） | 收到部分输出后取消仍将其标记为interrupted持久化，不写completed，Repair可补中断收尾 |
 
 ```bash
 cd "/mnt/e/agent study/Go-AI-Gateway"
 bash scripts/test-fast.sh -run CLI
 bash scripts/test-fast.sh -tags knowledgeintegration
-bash scripts/run-agent.sh -user 1
+bash scripts/run-agent.sh -user 9280928
 ```
 
-定向5项、带 knowledgeintegration 全量172项已由用户验证，均0跳过。后续实际终端验收：连续问答两轮；运行中Ctrl+C取消后继续输入；空闲Ctrl+C或/exit退出；重新启动同一user后核对历史延续。审批输入沿用auth:approve（先展示确认码）、auth:approve <码>、auth:reject、auth:status <提案ID>，不自动批准。真实模型/真实终端信号行为尚未验证。
+此前已验证：使用未用于日常对话的正整数user ID，标记跨进程重启后可回忆；显式 `/paste` 三项只提交一次；运行中 Ctrl+C 后可继续，空闲 Ctrl+C 可退出；取消持久化回归与knowledgeintegration全量已通过。真实 CLI 长回复中 Ctrl+C 后未见 `记忆落盘失败: context canceled`，并能继续对话；本次未重启核对部分回答是否可恢复。输入编辑器自动回归已通过（定向1项、合并13项、全量231项均0跳过），用户已完成安装及Windows Terminal手测：快捷方式启动、窗口缩放、右键多行粘贴、长文本显示和光标编辑正常。bracketed paste协议支持的自动多行接收已实现；没有该协议标记时的启发式识别仍后置。审批输入沿用auth:approve（先展示确认码）、auth:approve <码>、auth:reject、auth:status <提案ID>，不自动批准。
 
 调用链：cmd/agent → harness.NewFromEnv → cli.Run → HandleApprovalCommand / RunAgentTurn → Runtime.NewLoop → ownLoop。CLI负责读行、显示、信号；历史、工具执行、审批和日志由原Harness处理。
 
 CLI只需Redis和模型配置，可读取仓库根目录.env；不启动API/MySQL/RabbitMQ，不要求JWT_SECRET。MCP仅在配置时连接；连接失败明确退出。可执行文件先构建到bin/gwagent，Windows为bin/gwagent.exe，不使用go run。
 
-边界：默认user=1是本地存储身份，不是登录认证；应在自己的开发环境使用。同user复用旧Redis历史/审批，Web的MySQL对话不迁移也不自动导入。当前运行互斥仅在同一Harness实例内，不能用同user同时开多个CLI或与API并发运行。取消等待Harness入口返回，不承诺强制终止忽略context的工具。常规过程打印已删除，异常诊断保留，不提供新的结构化工具面板。单行输入，无全屏TUI、多行编辑、多会话选择；不新增通用文件或shell工具。
+边界：默认user=1是本地存储身份，不是登录认证；应在自己的开发环境使用。同user复用旧Redis历史/审批，Web的MySQL对话不迁移也不自动导入。当前运行互斥仅在同一Harness实例内，不能用同user同时开多个CLI或与API并发运行。取消等待Harness入口返回，不承诺强制终止忽略context的工具。常规过程打印已删除，异常诊断保留，不提供新的结构化工具面板。Linux/WSL TTY提供单行编辑和进程内历史；bracketed paste协议可将多行粘贴作为一次可编辑输入，不支持该协议的终端仍可使用显式`/paste`；仍无全屏TUI、无多会话选择。不新增通用文件或shell工具。
 
 Web保留原代码和路由，暂停开发；CLI启动不启动Web。资料业务代码和数据保留，后续按实际需要复用，不能把未接入的knowledge工具宣称为CLI现有能力。

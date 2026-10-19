@@ -63,16 +63,17 @@ return {gen, event}
 // SourcePage contains only persisted Content, not expanded spill text or tool
 // arguments. Offsets count Unicode code points. Event type/status stay visible.
 type SourcePage struct {
-	ID          string `json:"source_id"`
-	Seq         int64  `json:"seq"`
-	Type        string `json:"type"`
-	Role        string `json:"role"`
-	Interrupted bool   `json:"interrupted"`
-	Text        string `json:"text"`
-	Offset      int    `json:"offset"`
-	Next        int    `json:"next"`
-	Total       int    `json:"total"`
-	HasMore     bool   `json:"has_more"`
+	SpillLocator string `json:"spill_locator,omitempty"`
+	ID           string `json:"source_id"`
+	Seq          int64  `json:"seq"`
+	Type         string `json:"type"`
+	Role         string `json:"role"`
+	Interrupted  bool   `json:"interrupted"`
+	Text         string `json:"text"`
+	Offset       int    `json:"offset"`
+	Next         int    `json:"next"`
+	Total        int    `json:"total"`
+	HasMore      bool   `json:"has_more"`
 }
 
 // SourceAt is a trusted storage discovery API, not a model-facing tool. The
@@ -82,19 +83,72 @@ func (RedisStore) SourceAt(ctx context.Context, owner uint, seq int64, offset, l
 }
 
 func (RedisStore) ReadSource(ctx context.Context, owner uint, id string, offset, limit int) (SourcePage, error) {
+	gen, seq, err := parseSource(owner, id)
+	if err != nil {
+		return SourcePage{}, err
+	}
+	return readSource(ctx, owner, gen, seq, offset, limit)
+}
+
+func parseSource(owner uint, id string) (string, int64, error) {
 	parts := strings.Split(id, ":")
 	if len(parts) != 5 || parts[0] != "history" || parts[1] != "v1" || parts[2] != strconv.FormatUint(uint64(owner), 10) {
-		return SourcePage{}, ErrSourceUnavailable
+		return "", 0, ErrSourceUnavailable
 	}
 	b, err := hex.DecodeString(parts[3])
 	if err != nil || len(b) != 16 {
-		return SourcePage{}, ErrSourceUnavailable
+		return "", 0, ErrSourceUnavailable
 	}
 	seq, err := strconv.ParseInt(parts[4], 10, 64)
 	if err != nil || seq < 0 {
-		return SourcePage{}, ErrSourceUnavailable
+		return "", 0, ErrSourceUnavailable
 	}
-	return readSource(ctx, owner, parts[3], seq, offset, limit)
+	return parts[3], seq, nil
+}
+
+var neighborSourceScript = redis.NewScript(`
+local gen = redis.call('GET', KEYS[2])
+if not gen or gen ~= ARGV[1] then return {} end
+if not redis.call('LINDEX', KEYS[1], ARGV[2]) then return {} end
+return redis.call('LRANGE', KEYS[1], ARGV[3], ARGV[4])
+`)
+
+// SourceNeighbors returns adjacent raw events (including the anchor), not
+// projected messages. At most 11 previews of 200 code points each. It does not
+// skip audit/tool events or expand spill pointers; callers can page each ID.
+func (RedisStore) SourceNeighbors(ctx context.Context, owner uint, id string, before, after int) ([]SourcePage, error) {
+	gen, seq, err := parseSource(owner, id)
+	if err != nil {
+		return nil, err
+	}
+	if before < 0 || after < 0 || before > 5 || after > 5 {
+		return nil, errors.New("neighbor bounds must be 0..5")
+	}
+	if rdb == nil {
+		return nil, errors.New("redis client is nil")
+	}
+	start := max(int64(0), seq-int64(before))
+	// Saturate instead of overflowing an untrusted seq near MaxInt64.
+	end := seq
+	if seq <= int64(^uint64(0)>>1)-int64(after) {
+		end += int64(after)
+	}
+	values, err := neighborSourceScript.Run(ctx, rdb, sourceKeys(owner), gen, seq, start, end).StringSlice()
+	if err != nil {
+		return nil, err
+	}
+	if len(values) == 0 {
+		return nil, ErrSourceUnavailable
+	}
+	pages := make([]SourcePage, 0, len(values))
+	for i, raw := range values {
+		p, err := sourcePage(owner, gen, start+int64(i), raw, 0, 200)
+		if err != nil {
+			return nil, err
+		}
+		pages = append(pages, p)
+	}
+	return pages, nil
 }
 
 func readSource(ctx context.Context, owner uint, expected string, seq int64, offset, limit int) (SourcePage, error) {
@@ -115,8 +169,12 @@ func readSource(ctx context.Context, owner uint, expected string, seq int64, off
 	if len(values) != 2 {
 		return SourcePage{}, ErrSourceUnavailable
 	}
+	return sourcePage(owner, values[0], seq, values[1], offset, limit)
+}
+
+func sourcePage(owner uint, gen string, seq int64, raw string, offset, limit int) (SourcePage, error) {
 	var dto MemoryDTO
-	if err := json.Unmarshal([]byte(values[1]), &dto); err != nil {
+	if err := json.Unmarshal([]byte(raw), &dto); err != nil {
 		return SourcePage{}, fmt.Errorf("corrupt source: %w", err)
 	}
 	if dto.V > LogFormatVersion {
@@ -127,7 +185,8 @@ func readSource(ctx context.Context, owner uint, expected string, seq int64, off
 		return SourcePage{}, errors.New("source offset beyond content")
 	}
 	end := offset + min(limit, len(text)-offset)
-	return SourcePage{ID: fmt.Sprintf("history:v1:%d:%s:%d", owner, values[0], seq), Seq: seq,
-		Type: dto.Type, Role: dto.Role, Interrupted: dto.Interrupted, Text: string(text[offset:end]),
+	return SourcePage{ID: fmt.Sprintf("history:v1:%d:%s:%d", owner, gen, seq), Seq: seq,
+		SpillLocator: dto.SpillLocator,
+		Type:         dto.Type, Role: dto.Role, Interrupted: dto.Interrupted, Text: string(text[offset:end]),
 		Offset: offset, Next: end, Total: len(text), HasMore: end < len(text)}, nil
 }

@@ -126,7 +126,7 @@ func migrateChunks(conn *gorm.DB) error {
 		return err
 	}
 	if count > 0 {
-		return nil
+		return migrateEmbeddings(conn)
 	}
 	for _, ddl := range []string{
 		`CREATE TABLE IF NOT EXISTS knowledge_chunk_indexes (
@@ -145,5 +145,39 @@ func migrateChunks(conn *gorm.DB) error {
 			return err
 		}
 	}
-	return conn.Exec("INSERT INTO knowledge_schema_versions(version, applied_at) VALUES (4, CURRENT_TIMESTAMP(3))").Error
+	if err := conn.Exec("INSERT INTO knowledge_schema_versions(version, applied_at) VALUES (4, CURRENT_TIMESTAMP(3))").Error; err != nil {
+		return err
+	}
+	return migrateEmbeddings(conn)
+}
+
+// migrateEmbeddings v5：分段向量表 + 向量索引记录表。
+// 为什么与分块分表：向量是可重建的派生数据，换模型/换维度只需重建它，不动原文与分段。
+func migrateEmbeddings(conn *gorm.DB) error {
+	var count int64
+	if err := conn.Table("knowledge_schema_versions").Where("version = 5").Count(&count).Error; err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS knowledge_chunk_embeddings (
+ id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, chunk_id BIGINT UNSIGNED NOT NULL,
+ version_id BIGINT UNSIGNED NOT NULL, embedding_rule VARCHAR(100) NOT NULL, dim INT NOT NULL, vector BLOB NOT NULL,
+ UNIQUE KEY uq_knowledge_chunk_embedding (chunk_id, embedding_rule), KEY idx_knowledge_embedding_version (version_id),
+ CONSTRAINT fk_knowledge_embedding_chunk FOREIGN KEY (chunk_id) REFERENCES knowledge_chunks(id),
+ CONSTRAINT fk_knowledge_embedding_version FOREIGN KEY (version_id) REFERENCES knowledge_source_versions(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+		`CREATE TABLE IF NOT EXISTS knowledge_embedding_indexes (
+ version_id BIGINT UNSIGNED PRIMARY KEY, embedding_rule VARCHAR(100) NOT NULL, model VARCHAR(100) NOT NULL,
+ dim INT NOT NULL, chunk_count INT NOT NULL, updated_at DATETIME(3) NOT NULL,
+ CONSTRAINT fk_knowledge_embedding_index_version FOREIGN KEY (version_id) REFERENCES knowledge_source_versions(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+	} {
+		if err := conn.Exec(ddl).Error; err != nil {
+			return err
+		}
+	}
+	return conn.Exec("INSERT INTO knowledge_schema_versions(version, applied_at) VALUES (5, CURRENT_TIMESTAMP(3))").Error
 }

@@ -2,6 +2,7 @@ package knowledge
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"unicode/utf8"
 )
@@ -84,4 +85,29 @@ func (s *Store) SearchSources(ctx context.Context, owner uint, library uint64, q
 		result.Items = append(result.Items, KeywordHit{SourceID: row.SourceID, VersionID: row.VersionID, Version: row.Version, Title: row.Title, Offset: row.MatchOffset, MatchEnd: row.MatchOffset + utf8.RuneCountInString(query), IndexRule: row.IndexRule})
 	}
 	return result, nil
+}
+
+// maxKeywordPages 单个查询词的翻页上限（每页 10 份）：防止语料变大后一次检索被放大成无界 DB 往返。
+const maxKeywordPages = 10
+
+// SearchAllSources 翻完一个查询词的全部候选页（SearchSources 游标按 source_id 稳定）。
+// 需要完整候选集的调用方（混合排名、评测）用它而不是单页 SearchSources；
+// 超过页数上限明确报错，不静默丢候选。
+func (s *Store) SearchAllSources(ctx context.Context, owner uint, library uint64, query string) ([]KeywordHit, error) {
+	all := []KeywordHit{}
+	var after uint64
+	for page := 0; ; page++ {
+		if page >= maxKeywordPages {
+			return nil, fmt.Errorf("关键词候选超过 %d 页上限（%d 份），需先扩展检索预算", maxKeywordPages, maxKeywordPages*10)
+		}
+		res, err := s.SearchSources(ctx, owner, library, query, after)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, res.Items...)
+		if res.NextAfter == 0 {
+			return all, nil
+		}
+		after = res.NextAfter
+	}
 }

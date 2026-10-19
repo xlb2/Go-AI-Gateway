@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/cloudwego/eino/schema"
+	"go_im_gateway/internal/harness/agent"
 	"go_im_gateway/internal/harness/approval"
 	"go_im_gateway/internal/harness/session"
 )
@@ -56,6 +57,7 @@ func (h *Harness) resolveToolApproval(ctx context.Context, userID uint, p approv
 		return fmt.Sprintf("执行结果已记录，但读取上下文失败：%v", err)
 	}
 	messages := append([]*schema.Message{schema.SystemMessage(h.buildSystemPrompt(ctx))}, history...)
+	ctx = agent.ObserveHistorySources(ctx, h.Sessions, userID, history)
 	reply, err := h.runLoop(ctx, userID, messages, nil)
 	if err != nil {
 		return fmt.Sprintf("执行结果已记录，但模型续答失败：%v\n%s", err, reply)

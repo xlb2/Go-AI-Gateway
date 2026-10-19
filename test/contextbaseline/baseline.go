@@ -65,17 +65,19 @@ func CorpusHash() string {
 }
 
 type TurnReport struct {
-	Input       string                   `json:"input"`
-	Reply       string                   `json:"reply"`
-	Expect      []string                 `json:"expect"`
-	Status      string                   `json:"status"`
-	ErrorCode   string                   `json:"error_code,omitempty"`
-	Recreated   bool                     `json:"harness_recreated"`
-	ElapsedMS   int64                    `json:"elapsed_ms"`
-	FirstTextMS *int64                   `json:"first_text_ms"`
-	Requests    []agent.InputObservation `json:"logical_main_inputs"`
-	Attempts    agent.AccountingSnapshot `json:"sdk_attempts"`
-	Tools       []ToolEvidence           `json:"tool_events"`
+	Input        string                   `json:"input"`
+	Reply        string                   `json:"reply"`
+	Expect       []string                 `json:"expect"`
+	Status       string                   `json:"status"`
+	ErrorCode    string                   `json:"error_code,omitempty"`
+	Recreated    bool                     `json:"harness_recreated"`
+	ElapsedMS    int64                    `json:"elapsed_ms"`
+	FirstTextMS  *int64                   `json:"first_text_ms"`
+	Requests     []agent.InputObservation `json:"logical_main_inputs"`
+	Attempts     agent.AccountingSnapshot `json:"sdk_attempts"`
+	Tools        []ToolEvidence           `json:"tool_events"`
+	Shadows      []agent.ContextShadow    `json:"context_shadows,omitempty"`
+	Applications []ShadowInputApplication `json:"shadow_input_applications,omitempty"`
 }
 
 // Terminal tool events only; nil observation means unavailable, not false/zero.
@@ -104,6 +106,17 @@ type Report struct {
 // passed to the model. All setup turns are included in usage, not amortized away.
 func Run(ctx context.Context, owner uint, c Case, restart func(context.Context) error,
 	run func(context.Context, string, func(string)) (string, error)) Report {
+	return RunWithOptions(ctx, owner, c, restart, run, RunOptions{})
+}
+
+type RunOptions struct {
+	ApplyShadow bool
+}
+
+// RunWithOptions executes the same fixed case as Run. ApplyShadow only enables
+// the evaluation model wrapper; production Harness construction is unchanged.
+func RunWithOptions(ctx context.Context, owner uint, c Case, restart func(context.Context) error,
+	run func(context.Context, string, func(string)) (string, error), options RunOptions) Report {
 	// Same adapter contract as cli.Run; Runtime/tools still consume this key.
 	ctx = context.WithValue(ctx, "user_id", owner)
 	r := Report{Version: "context-report-v1", CaseID: c.ID, Split: c.Split, Rhythm: c.Rhythm,
@@ -126,12 +139,23 @@ func Run(ctx context.Context, owner uint, c Case, restart func(context.Context) 
 		}
 		turnCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 		turnCtx, accounting := agent.WithModelAccounting(turnCtx)
+		var applicationState *shadowApplicationState
+		if options.ApplyShadow {
+			applicationState = &shadowApplicationState{}
+			turnCtx = context.WithValue(turnCtx, shadowApplicationKey{}, applicationState)
+		}
 		var mu sync.Mutex
 		turnCtx = agent.WithProgress(turnCtx, func(p agent.Progress) {
+			if applicationState != nil {
+				applicationState.observe(p)
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			if p.Input != nil {
 				row.Requests = append(row.Requests, *p.Input)
+			}
+			if p.Shadow != nil {
+				row.Shadows = append(row.Shadows, *p.Shadow)
 			}
 			if p.Kind == agent.ProgressToolReturned || p.Kind == agent.ProgressToolFailed {
 				evidence := ToolEvidence{Kind: p.Kind, Name: p.Tool}
@@ -156,6 +180,9 @@ func Run(ctx context.Context, owner uint, c Case, restart func(context.Context) 
 		cancel()
 		mu.Lock()
 		row.Reply, row.ElapsedMS, row.Attempts = reply, elapsed, accounting.Snapshot()
+		if applicationState != nil {
+			row.Applications = applicationState.snapshot()
+		}
 		row.Status = "returned"
 		if err != nil {
 			row.Status = "error"

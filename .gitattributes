@@ -6,3 +6,6 @@
 # Dockerfile / YAML 同理（镜像里的入口脚本如果带 CRLF 会起不来）
 *.yml  text eol=lf
 Dockerfile text eol=lf
+
+# Frozen RAG corpus hashes are calculated from LF bytes on every platform.
+test/rag/corpus/** text eol=lf

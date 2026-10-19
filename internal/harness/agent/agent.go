@@ -343,20 +343,23 @@ func memoryDTOFromToolResult(ctx context.Context, msg *schema.Message) session.M
 
 func toolResultWithStore(ctx context.Context, msg *schema.Message, store spill.Store) session.MemoryDTO {
 	content := msg.Content
+	locator := ""
 	if len([]rune(content)) > spillThreshold {
 		if userID, err := getUserID(ctx); err == nil {
 			if ref, err := store.SaveText(ctx, userID, "tool_result", content); err == nil {
+				locator = ref.Locator
 				content = fmt.Sprintf("（工具结果过大已外存）定位符: %s；需要时用 load_large_content 工具取回", ref.Locator)
 			}
 		}
 	}
 	return session.MemoryDTO{
-		Type:       session.EventToolResult,
-		Role:       string(msg.Role),
-		Content:    content,
-		ToolCallID: msg.ToolCallID,
-		ToolName:   msg.ToolName,
-		Time:       time.Now(),
+		SpillLocator: locator,
+		Type:         session.EventToolResult,
+		Role:         string(msg.Role),
+		Content:      content,
+		ToolCallID:   msg.ToolCallID,
+		ToolName:     msg.ToolName,
+		Time:         time.Now(),
 	}
 }
 

@@ -9,6 +9,8 @@ bin/
 
 # 环境变量与机密护照 (防止 API Key 泄露)
 .env
+.env.*
+!.env.example
 *.local
 
 # IDE 缓存

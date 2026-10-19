@@ -38,7 +38,24 @@ func TestRuntimeDefaultAssembly(t *testing.T) {
 		t.Fatalf("expected parent/child/parent requests, got %d", len(requests))
 	}
 	for _, req := range requests {
-		if len(req.ToolNames) != 6 {
+		wantTools := map[string]bool{
+			"search_memory_archive":  true,
+			"execute_system_defense": true,
+			"store_large_content":    true,
+			"load_large_content":     true,
+			"read_history_source":    true,
+			"browse_history_sources": true,
+			"search_history_sources": true,
+			"delegate_task":          true,
+			"delegate_tasks":         true,
+		}
+		for _, name := range req.ToolNames {
+			if !wantTools[name] {
+				t.Fatalf("unexpected or duplicate tool %q: %v", name, req.ToolNames)
+			}
+			delete(wantTools, name)
+		}
+		if len(wantTools) != 0 {
 			t.Fatalf("wrong tools: %v", req.ToolNames)
 		}
 	}

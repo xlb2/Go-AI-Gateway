@@ -15,10 +15,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cloudwego/eino/components/model"
 	"github.com/redis/go-redis/v9"
 	"go_im_gateway/internal/config"
 	"go_im_gateway/internal/harness"
@@ -28,6 +30,7 @@ import (
 	"go_im_gateway/internal/harness/sandbox"
 	"go_im_gateway/internal/harness/session"
 	"go_im_gateway/internal/harness/spill"
+	"go_im_gateway/internal/harness/subagent"
 	"go_im_gateway/internal/harness/tokenmeter"
 	"go_im_gateway/internal/workspace"
 	"go_im_gateway/test/contextbaseline"
@@ -38,6 +41,25 @@ func TestContextBaselineReal(t *testing.T) {
 	// are required before reading model configuration or touching Redis.
 	if os.Getenv("CONTEXT_BASELINE_REAL") != "1" {
 		t.Fatal("use scripts/context-baseline.sh")
+	}
+	shadowBudget := 0
+	if raw := os.Getenv("CONTEXT_BASELINE_SHADOW_BUDGET"); raw != "" {
+		var err error
+		shadowBudget, err = strconv.Atoi(raw)
+		if err != nil || shadowBudget <= 0 {
+			t.Fatal("CONTEXT_BASELINE_SHADOW_BUDGET must be a positive integer")
+		}
+	}
+	applyShadow := false
+	switch os.Getenv("CONTEXT_BASELINE_APPLY_SHADOW") {
+	case "", "0":
+	case "1":
+		applyShadow = true
+	default:
+		t.Fatal("CONTEXT_BASELINE_APPLY_SHADOW must be 0 or 1")
+	}
+	if applyShadow && shadowBudget <= 0 {
+		t.Fatal("CONTEXT_BASELINE_APPLY_SHADOW=1 requires a positive CONTEXT_BASELINE_SHADOW_BUDGET")
 	}
 	c, err := contextbaseline.Load(os.Getenv("CONTEXT_BASELINE_CASE"), os.Getenv("CONTEXT_BASELINE_HOLDOUT") == "1")
 	if err != nil {
@@ -58,6 +80,9 @@ func TestContextBaselineReal(t *testing.T) {
 	cfg := config.LoadConfig()
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
+	if shadowBudget > 0 {
+		ctx = agent.WithContextShadow(ctx, shadowBudget)
+	}
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.Redis.Addr})
 	defer rdb.Close()
 	probe, stop := context.WithTimeout(ctx, 5*time.Second)
@@ -110,6 +135,17 @@ func TestContextBaselineReal(t *testing.T) {
 		t.Fatal("model configuration unavailable; check CLI configuration")
 	}
 	rc.ExtraTools = tools
+	if applyShadow {
+		baseFactory := rc.NewModel
+		rc.SummaryModel = baseFactory
+		rc.NewModel = func(modelCtx context.Context) (model.ChatModel, error) {
+			base, err := baseFactory(modelCtx)
+			if err != nil || subagent.IsNested(modelCtx) {
+				return base, err
+			}
+			return contextbaseline.WrapShadowModelForEvaluation(modelCtx, base), nil
+		}
+	}
 	sourceHash := sourceDigest(t, repo)
 	var h *harness.Harness
 	restart := func(ctx context.Context) error {
@@ -120,15 +156,16 @@ func TestContextBaselineReal(t *testing.T) {
 	if err := restart(ctx); err != nil {
 		t.Fatal(err)
 	}
-	report := contextbaseline.Run(ctx, uid, c, restart, func(ctx context.Context, input string, emit func(string)) (string, error) {
+	report := contextbaseline.RunWithOptions(ctx, uid, c, restart, func(ctx context.Context, input string, emit func(string)) (string, error) {
 		return h.RunAgentTurn(ctx, uid, input, emit)
-	})
+	}, contextbaseline.RunOptions{ApplyShadow: applyShadow})
 	endpoint, _ := url.Parse(os.Getenv("VOLC_BASE_URL"))
 	host := "default"
 	if endpoint != nil && endpoint.Hostname() != "" {
 		host = endpoint.Hostname()
 	}
 	report.Metadata = map[string]any{"owner": uid, "model": os.Getenv("VOLC_ENDPOINT_ID"), "provider_host": host,
+		"context_shadow_budget": shadowBudget, "context_shadow_application": shadowApplicationMode(shadowBudget, applyShadow),
 		"go_version": runtime.Version(), "os": runtime.GOOS,
 		"budget": budget, "max_steps": rc.MaxSteps, "retry_policy": rc.Retry, "source_sha256": sourceHash,
 		"workspace": "synthetic project.md and reading.md only", "mcp": false, "turn_timeout_seconds": 180,
@@ -145,6 +182,16 @@ func TestContextBaselineReal(t *testing.T) {
 	if !report.ExecutionComplete {
 		t.Fatal("execution stopped; partial report saved")
 	}
+}
+
+func shadowApplicationMode(budget int, applied bool) string {
+	if applied {
+		return "apply_candidates"
+	}
+	if budget > 0 {
+		return "candidate_only"
+	}
+	return "disabled"
 }
 
 func sourceDigest(t *testing.T, repo string) string {

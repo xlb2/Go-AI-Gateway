@@ -19,6 +19,18 @@ go build -o bin/gwagent.exe ./cmd/agent
 .\bin\gwagent.exe -user 1
 ```
 
+WSL/Linux 终端可以安装成 `gwagent` 命令，之后直接在终端里启动：
+
+```bash
+bash scripts/install-agent.sh
+export PATH="$HOME/.local/bin:$PATH"
+gwagent -user 1
+```
+
+安装脚本会把可执行文件构建到 `$HOME/.local/bin`，并在需要时把该目录加入 `~/.bashrc`。当前终端尚未载入新 PATH 时执行上面的 `export`。从项目根目录启动会读取该目录下的 `.env`，并将它作为默认 `-workspace`；也可从另一个项目目录启动，让该目录成为工作区。程序运行期间，CLI 在当前终端等待并编辑输入，不会另开窗口；Linux/WSL 终端模拟器仍负责窗口、字体、剪贴板和滚动。
+
+Windows 用户可以自行创建桌面快捷方式，通过 Windows Terminal 启动 WSL，再进入本机仓库目录运行 `gwagent -user 1`。快捷方式不随仓库分发；换电脑后需按实际 WSL 发行版、安装位置、仓库路径和用户 ID 配置。Windows Terminal 的参数语法见 [Microsoft 官方文档](https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments)。
+
 不需要启动 HTTP、MySQL 或 RabbitMQ，也不需要 JWT_SECRET。MCP 未配置时不连接，配置后连接失败则明确退出。没有 MCP 不等于没有工具：历史检索、内容存取、委派和防御提案仍为内置能力。CLI另装配三个只读工作区工具，尚无通用命令执行工具。
 
 ## 只读项目工具
@@ -46,13 +58,16 @@ go build -o bin/gwagent.exe ./cmd/agent
 | 普通单行文本 | 提交一轮，流式显示回答 |
 | `/help`、`/exit` | 查看命令、退出 |
 | `/paste` | 收集多行正文；单独一行 `/send` 合并提交，`/cancel` 丢弃 |
+| Windows Terminal 右键粘贴多行文本 | Linux/WSL TTY 输入区上下横线之间插入同一条可编辑消息；不显示 `You` 标签，边框随窗口缩放重绘，按 Enter 后提交一次 |
+| Left/Right、Home/End、Backspace/Delete | Linux/WSL 交互提示中移动光标和编辑当前行或多行内容 |
+| Up/Down | 多行内容中移动光标；单行时浏览当前进程内最多100条输入历史，退出后不保留，`/paste` 正文不加入历史 |
 | `/reasoning on`、`/reasoning off` | 显示或隐藏服务商返回的推理字段，默认开启，仅本进程生效 |
 | `auth:approve` | 查看待审批动作及确认码 |
 | `auth:approve <确认码>`、`auth:reject` | 确认或拒绝动作 |
 | `auth:status <提案ID>` | 查询执行记录 |
 | Ctrl+C | 运行中请求取消并等待收尾；空闲时退出 |
 
-保留终端原生滚动、选中复制和粘贴，不接管鼠标或剪贴板快捷键。多行内容请先输入 `/paste` 并回车，再粘贴，最后单独一行输入 `/send` 并回车；空行保留，整段作为一条用户消息，不执行其中的CLI或审批命令。`/send`、`/cancel` 是此模式的保留结束行。EOF或空闲Ctrl+C退出时丢弃未发送正文；累计超过64KiB则报错退出且不提交部分正文，Harness原有输入长度检查仍保留。普通模式仍按行提交，尚无自动粘贴识别、全屏编辑、输入历史导航或 Markdown 渲染。
+交互编辑器仅在 Linux/WSL 的终端输入和输出均为TTY时启用；等待输入时临时进入 raw mode 并开启 bracketed paste，提交、取消或退出时关闭粘贴模式并恢复终端。Windows、重定向和管道输入继续使用逐行读取。终端发来的 `ESC[200~` 与 `ESC[201~` 包围内容会作为一次粘贴插入多行编辑区；保留换行与制表符，过滤其他控制字符。按 Enter 才提交，粘贴中的 `/exit`、`/help` 和审批命令都只作为消息正文。多行时 Up/Down 移动光标，单行时仍浏览本进程历史。编辑器不是全屏TUI；收到终端尺寸变化信号后会按输出终端宽度重绘上下边框和输入行，长内容仍可超出可视高度。若终端不支持 bracketed paste，可使用 `/paste` 后粘贴，单独一行 `/send` 提交或 `/cancel` 丢弃。交互输入累计超过64KiB则报错且不提交部分正文，Harness原有输入长度检查仍保留。用户已确认在其 Windows Terminal 环境下右键粘贴不会出现多行 shell 警告，长文本显示和光标编辑正常。
 
 ## 显示语义
 
@@ -87,6 +102,12 @@ Loop 的临时进度通过每轮 context 观察器传给 CLI。Harness 把推理
 
 ## 验证记录
 
+2026-09-29 输入边框缩放与终端交互验收：编辑器监听 `SIGWINCH`，按输出终端宽度重绘整框，并按缩窄后旧内容的换行数定位。PTY用例从80列缩至60列并检查上下横线更新。前两次WSL运行暴露的是测试计数问题：终端回车覆盖行不会在原始输出流中插入新行；改为清理CSI后按精确横线段长度计数。用户WSL最终运行编辑器定向1项、`CLI|CanceledTurn`定向13项和knowledgeintegration全量231项，均通过、0跳过。用户重装最新 `gwagent` 后确认实际终端缩放正常；旧安装二进制不含本次变更。用户另确认桌面快捷方式可启动独立Windows Terminal/WSL CLI、右键粘贴多行无shell警告、长文本显示和光标编辑正常。Linux/Windows目标 `go vet` 与 `git diff --check`通过，未本机运行Go测试或程序。
+
+2026-09-28 bracketed-paste 输入接管（WSL自动回归通过，Windows Terminal手测待验）：在Linux/WSL TTY编辑器上扩展多行插入、光标编辑和 bracketed paste 开关；PTY断言覆盖Enter前不提交、整段一次提交、命令样式文本按正文处理及模式/termios恢复。Windows主机 `go vet ./...` 与 `go vet -tags knowledgeintegration ./...` 均通过，未在本机运行Go测试或CLI。用户WSL报告编辑器定向1项、`CLI|CanceledTurn`定向13项及knowledgeintegration全量231项通过，均0跳过。仍需在实际Windows Terminal确认右键多行粘贴不弹警告、光标和多行显示正常；该终端手测尚未完成。
+
+2026-09-28 此前 CLI 验收：用户 WSL `-run CLI` 定向10项及原knowledgeintegration全量228项通过、0跳过；隔离 user `9280928` 的标记可跨 `/exit` 重启回忆，启动显示本机直跑/none。用户实测显式 `/paste` 中 PASTE-A/B/C 只提交一次；运行中 Ctrl+C 后回到提示符并继续对话，空闲 Ctrl+C 可退出到 shell。取消落盘回归首轮定向失败，后将夹具改成长SSE、Harness在处理缓冲分片前优先响应取消，并用5秒有界脱离取消上下文持久化收尾。用户重跑 `-run CanceledTurn` 为1项通过、knowledgeintegration全量229项通过，均0跳过。真实 CLI 长回复中 Ctrl+C 后未见记忆落盘失败提示，随后一轮仍可正常对话；本次未重启核对部分回答是否可恢复。窄窗口/调整尺寸仍待实测；剪贴板复制粘贴未做受控验收。该批时自动多行粘贴识别和输入编辑仍后置；输入编辑器随后在本轮实现并经WSL自动回归通过，真实终端手测仍待做。
+
 2026-09-23 新增 [上下文基线采集流程](../test/contextbaseline/README.md)，使用相同Harness和模型环境配置，以合成文件、独立owner运行固定题目；真实采集须在WSL显式调用脚本，不自动随普通回归执行。场景报告与CLI统计同口径，尚未采集真实基线。
 
 2026-09-22 累计回归最新验收：用户提供WSL `bash scripts/test-fast.sh -tags knowledgeintegration` 结果，189个顶层用例通过、0跳过，覆盖此前工作区读取/搜索上下文、工具诊断分类、模型输入证据、步数默认20及显式/paste改动的回归待验记录。真实模型对话可见8次调用及定点补读，但引用完整性和300字约束仍有不足，不将模型自述当执行证据。自动多行粘贴与输入编辑优化按用户要求后置，真实终端/paste及运行中取消仍待交互验收。本轮仅记录用户测试证据，未重跑测试、未提交或push。
@@ -101,4 +122,4 @@ Loop 的临时进度通过每轮 context 观察器传给 CLI。Harness 把推理
 bash scripts/test-fast.sh -tags knowledgeintegration
 ```
 
-窄终端、窗口缩放、实际复制粘贴、运行中取消和重启历史仍需实际交互验证。测试清单见 [CLI 验收](../test/cli/README.md)。
+用户已在实际 Windows Terminal 中验证桌面快捷方式启动、窗口缩放、右键多行粘贴和长文本光标编辑。测试清单见 [CLI 验收](../test/cli/README.md)。

@@ -22,7 +22,20 @@ type InputObservation struct {
 type ModelUsage struct{ Prompt, Completion int }
 
 func observeInput(ctx context.Context, messages []*schema.Message, tools int) {
-	reportProgress(ctx, Progress{Kind: ProgressModel, Input: estimateInput(messages, tools)})
+	p := Progress{Kind: ProgressModel, Input: estimateInput(messages, tools)}
+	if budget, ok := ctx.Value(shadowBudgetKey{}).(int); ok && budget > 0 {
+		required, unresolvedRequired := requiredShadowSelection(ctx, messages)
+		evidence, retrieved, unresolvedRetrievals := retrievedShadowSelection(ctx, messages)
+		shadow := EvaluateContextShadowWithEvidence(messages, tools, budget, required, evidence)
+		shadow.UnresolvedRequirements += unresolvedRequired
+		shadow.UnresolvedRetrievals += unresolvedRetrievals
+		if unresolvedRequired > 0 || unresolvedRetrievals > 0 {
+			shadow.NeedsConstraintReview = true
+		}
+		observeShadowSources(ctx, messages, &shadow, retrieved)
+		p.Shadow = &shadow
+	}
+	reportProgress(ctx, p)
 }
 
 func estimateInput(messages []*schema.Message, tools int) *InputObservation {

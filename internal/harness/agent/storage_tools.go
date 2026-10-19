@@ -37,6 +37,27 @@ func NewStorageTools(sessions session.Store, approvals approval.Store, content s
 		}
 		set.tools = append(set.tools, t)
 	}
+	if sources, ok := sessions.(historySources); ok {
+		t, err := newHistoryReadTool(sources, content)
+		if err != nil {
+			return nil, err
+		}
+		set.tools = append(set.tools, t)
+	}
+	if sources, ok := sessions.(historyBrowser); ok {
+		t, err := newHistoryBrowseTool(sources)
+		if err != nil {
+			return nil, err
+		}
+		set.tools = append(set.tools, t)
+	}
+	if sources, ok := sessions.(historySearcher); ok {
+		t, err := newHistorySearchTool(sources)
+		if err != nil {
+			return nil, err
+		}
+		set.tools = append(set.tools, t)
+	}
 	return set, nil
 }
 

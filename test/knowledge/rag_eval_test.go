@@ -29,7 +29,7 @@ func TestRAGDevelopmentEvaluation(t *testing.T) {
 		t.Fatal("cannot locate corpus")
 	}
 	repo := filepath.Clean(filepath.Join(filepath.Dir(file), "../.."))
-	workspace := filepath.Dir(repo)
+	workspace := filepath.Join(repo, "test/rag/corpus")
 	read := func(path string) []byte {
 		t.Helper()
 		data, err := os.ReadFile(path)
@@ -110,16 +110,14 @@ func TestRAGDevelopmentEvaluation(t *testing.T) {
 	started := time.Now().UTC()
 	scores, err := rag.Evaluate(ctx, cases.Cases, func(ctx context.Context, question string) ([]string, error) {
 		return rag.Rank(ctx, question, func(ctx context.Context, term string) ([]string, error) {
-			result, err := store.SearchSources(ctx, 11, lib.ID, term, 0)
+			// 翻页收齐该词全部候选（语料加干扰文档后单词命中可超过单页 10 份）。
+			items, err := store.SearchAllSources(ctx, 11, lib.ID, term)
 			if err != nil {
 				return nil, err
 			}
-			if result.NextAfter != 0 {
-				return nil, fmt.Errorf("evaluation corpus exceeds a single search page; pagination must be added before scoring")
-			}
-			observations[term] = result.Items
+			observations[term] = items
 			ids := []string{}
-			for _, hit := range result.Items {
+			for _, hit := range items {
 				id, ok := labels[hit.SourceID]
 				if !ok {
 					return nil, fmt.Errorf("unknown retrieved source")

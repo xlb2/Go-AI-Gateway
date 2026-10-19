@@ -839,18 +839,68 @@ func TestResumeTurnContinuesWithoutReplayingTool(t *testing.T) {
 		Type: session.EventToolCall, Role: "assistant",
 		ToolCalls: []session.ToolCallData{{ID: "call-r", Name: "search_memory_archive", Arguments: `{"query":"历史"}`}},
 	}))
+	sources, err := store.GetHistorySources(e.ctx(), e.uid, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requiredID string
+	for _, source := range sources {
+		if source.EventType == session.EventUserMessage && !source.Interrupted {
+			requiredID = source.ID
+			break
+		}
+	}
+	if requiredID == "" {
+		t.Fatalf("resumable user source missing: %+v", sources)
+	}
 
 	before := e.countTypes()[session.EventToolCall] // = 1
 
-	reply, resumed, err := e.h.ResumeTurn(e.ctx(), e.uid, nil)
+	var sourceShadow *agent.ContextShadow
+	ctx := agent.WithRequiredHistorySources(agent.WithContextShadow(e.ctx(), 100000), requiredID)
+	ctx = agent.WithProgress(ctx, func(p agent.Progress) {
+		if p.Shadow != nil {
+			sourceShadow = p.Shadow
+		}
+	})
+	reply, resumed, err := e.h.ResumeTurn(ctx, e.uid, nil)
 	if err != nil {
 		t.Fatalf("ResumeTurn 失败: %v", err)
 	}
 	if !resumed {
 		t.Fatal("应该识别出可续跑的开放轮次")
 	}
+	if sourceShadow == nil || sourceShadow.SourceStatus != "matched" || len(sourceShadow.Sources) == 0 {
+		t.Fatalf("resume source observation missing: %+v", sourceShadow)
+	}
+	if sourceShadow.RequiredSources != 1 || sourceShadow.UnresolvedRequirements != 0 {
+		t.Fatalf("resume constraint unresolved: %+v", sourceShadow)
+	}
+	foundRequired := false
+	for _, source := range sourceShadow.Sources {
+		if source.ID == requiredID {
+			foundRequired = source.Required && source.Kept
+		}
+	}
+	if !foundRequired {
+		t.Fatalf("resumed user source not required in candidate: id=%s shadow=%+v", requiredID, sourceShadow)
+	}
 	if reply == "" {
 		t.Fatal("续跑应产出回复")
+	}
+	requests := e.fake.Requests()
+	if len(requests) == 0 {
+		t.Fatal("续跑没有调用模型")
+	}
+	foundInInput := false
+	for _, message := range requests[0].Messages {
+		if message.Role == "user" && message.Content == "帮我查一下历史" {
+			foundInInput = true
+			break
+		}
+	}
+	if !foundInInput {
+		t.Fatal("shadow constraint changed the actual SDK input")
 	}
 
 	// 关键断言：续跑**没有重放工具**（tool/call 事件数不增加）。
