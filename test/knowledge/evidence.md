@@ -1,38 +1,31 @@
-# 已读取资料与原文核对
+# 已读取资料的证据片段
 
-本批将执行证据展示在回答旁，不将模型输出的引用文本转换成可信链接。
+证据链接来自已提交的工具调用和结果，不从模型生成的引用文字推断。
 
-## 契约
+## 投影与读取
 
-会话详情的每个turn新增evidence数组，含event_id、turn_id、source_id、version_id、version、title、offset、next_offset。详情不附带原文，避免每次刷新重复传输全部工具结果。服务端按事件顺序匹配read_source调用与结果，核对调用ID、工具名、source/version/offset、字符长度；失败、孤立和不匹配结果不产生来源。每个读取片段保留独立事件ID，不合并成“整份文档都已读”。
+会话详情的每个 turn 包含 evidence 元数据：event_id、turn_id、source_id、version_id、version、title、offset、next_offset。服务端按事件顺序匹配 read_source 调用与结果，校验调用ID、工具名、版本、偏移与字符长度；失败、孤立或不匹配事件不产生证据。
+
+详情不包含原文。点击证据时请求：
 
 ```text
-已提交 tool/call + tool/result
-  → 会话详情中的来源元数据
-  → 点击 GET /api/v1/libraries/:library_id/conversations/:conversation_id/turns/:turn_id/evidence/:event_id
-  → 校验用户→库→会话→轮次→事件
-  → 返回当时的片段快照
+GET /api/v1/libraries/:library_id/conversations/:conversation_id/turns/:turn_id/evidence/:event_id
 ```
 
-接口返回相同元数据及content，Cache-Control:no-store。不存在或不属于当前范围均404，不返回整个执行日志。无新表或迁移。原文来自已提交工具结果，资料后续更新不会替换历史片段；当前只提供当时读取的部分，不提供完整历史版本浏览。
+服务端逐层校验用户、库、会话、轮次、事件，返回当时工具读取的片段快照及元数据；不存在或不属于当前范围返回404，响应使用 `Cache-Control: no-store`。
 
-## 页面行为
+原文来自已提交工具结果，不随资料更新漂移。每次片段读取保持独立事件 ID，不合并成“整份已读”，也不开放整个执行日志或完整历史版本浏览。
 
-来源标为“已读取资料”，标题后显示版本和字符范围；内部偏移为零起点、右侧不含，页面显示从1开始的包含式范围。点击右侧原文面板显示保存的片段，纯textContent渲染，不执行HTML。原文与来源共用请求序号，较早请求不能覆盖后来选择；切库或切会话后忽略旧返回。查看片段时禁用“附加到对话”，避免无意附加最新整份版本。
+## 页面语义
 
-来源在流结束后的历史重载及刷新时出现，不随每次工具调用实时推送。失败/取消轮次也可能有已读取来源，轮次状态照常展示。“已读取”只证明有读取证据，不证明回答正确或每一句都得到原文支持。用户手动附件沿用原标注，不混成工具读取证据。
+来源显示为“已读取资料”，包含版本与范围。内部坐标零起点、右侧不含，页面显示为从1开始的包含式范围。正文使用 textContent，旧异步请求不能覆盖新选择；查看证据时不能将片段误作最新整份资料附件。
 
-## 验证与限制
+来源在轮次结束后的历史重载出现，不逐工具实时推送。失败/取消轮次也可能存在已读片段；用户附件与主动读取来源分开。“已读取”证明工具结果存在，不证明回答正确或每句话均有原文支持。
 
-3项集成测试在evidence_test.go，覆盖快照不漂移、模型伪引用不参与、元数据与正文分离、HTTP范围校验、孤立/失败/不匹配结果过滤。历史工具链回归仍包含在全量中。
+## 测试
 
 ```bash
-scripts/test-fast.sh -tags knowledgeintegration -run KnowledgeEvidence
-scripts/test-fast.sh -tags knowledgeintegration
+bash scripts/test-fast.sh -tags knowledgeintegration -run KnowledgeEvidence
 ```
 
-预计定向3、全量156，WSL待用户运行。本地go vet带tag与JS语法通过。
-
-独立Node fixture预置一条带来源对话。Playwright验证1440×900与390×844截图、320宽无横向溢出、打开/关闭并重开来源、焦点进入原文标题；含script标签的正文为纯文字且无script子节点，控制台零错误。此模拟服务不连接真实账号、MySQL或模型，不能替代真实页面端到端。
-
-本批不是检索/RAG或答案引用评估。查询暂从所选会话的轮次事件中投影来源，尚未建立独立来源索引；当前规模沿用每会话100轮和每轮工具输出预算，性能深化后置。
+覆盖快照稳定性、模型伪引用排除、元数据与正文分离、HTTP归属以及孤立/失败结果过滤。当前从会话事件投影，不提供独立来源索引或大规模性能保证。

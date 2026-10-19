@@ -1,6 +1,6 @@
-# RPC 运行控制验收
+# RPC 运行控制协议与测试
 
-`scripts/test-fast.sh -run RPC`：真实 WebSocket 与受控 Runner，不依赖真实模型。Harness 的运行互斥另由 `test/assembly/run_control_test.go` 验证。
+`bash scripts/test-fast.sh -run RPC`：真实 WebSocket 与受控 Runner，不依赖真实模型。Harness 的运行互斥另由 `test/assembly/run_control_test.go` 验证。
 
 同一个 `/api/v1/rpc?token=...` 连接可发送：
 
@@ -15,6 +15,6 @@
 - `agent/run` / `approval/command` 每连接最多一个正在执行的操作，多余请求返回错误码 `-32001`，不排队。运行期间状态和取消仍可接收；跨连接互斥由共享 Harness 负责。
 - `agent/chunk` 保留 `chunk`，新增 `request_id` 关联原请求。响应可能交错，应按请求 ID 分发。
 - 缺少取消 ID 返回 `-32602`；只实现旧 AgentRunner 的适配器仍可运行，但控制方法返回 `-32601`。
-- 断线或写失败取消该连接发起的操作。写操作串行且有 10 秒期限；不强行终止忽略 context 的第三方代码。旧聊天 `/ws` 本轮未迁移。
+- 断线或写失败取消该连接发起的操作。写操作串行且有 10 秒期限；不强行终止忽略 context 的第三方代码。旧聊天 `/ws` 保留原协议。
 
-本批静态检查通过，WSL 运行待验；不是生产 JWT 鉴权或慢客户端压力测试。
+该目录验证控制协议，不替代生产 JWT 鉴权、慢客户端压力或多进程互斥测试。

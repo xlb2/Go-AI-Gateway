@@ -1,127 +1,66 @@
-# 上下文成本基线 v1
+# 上下文基线与候选输入实验
 
-2026-09-24 CM-3k/reading-dev 4000重复配对：用户WSL候选/应用两份报告均完成3轮，配置哈希、模型和环境匹配。候选回答长度101/79/48，第1轮超限1字；应用组59/81/80，三轮语义与100字约束通过。只有第3轮一次模型调用实际裁剪4条消息，估算4019→3864（155 token，约整轮估算0.9%）；前两轮续接调用均因mandatory_over_budget回退。Provider Prompt 17055/17012、Completion 641/1004，usage均5/5；回复/历史不同，差额不能归因，费用/缓存未知。结合首对应用组133/189/90，应用输出长度一对失败、一对通过，现有小样本不支持稳定质量结论。见[人工评审](review-20260924-reading-shadow-ab.md)。保留失败记录；下一步转测resume-dev/4000，不切默认策略。未本机跑测试或真实模型，未提交/push。
+以固定多轮任务观察回答约束、工具证据、输入估算和 SDK 用量。采集器复用 Harness/Runtime，不另写 Agent Loop；测试资料为合成内容。
 
-历史记录（reading-dev首次4000诊断配对）：用户WSL两次真实采集均完成3轮，报告run-20260924T091518Z-15629（候选）与run-20260924T091530Z-15730（应用）的语料/源码哈希、模型和运行环境匹配。事实、来源和分页语义核对通过；但按人工判定规则计字符后，候选组回答为67/95/76字，应用组为133/189/90字，应用第1、2轮违反题面100字限制，故此应用组未通过完整质量门槛。应用报告在第2、3轮各一次调用中丢弃4条旧消息，估算4073→3900、4082→3909，共减少346估算token；第1轮因mandatory_over_budget回退全量。Provider Prompt为17060→16734、Completion为723→621，均5/5次usage覆盖，但回答/历史不同，差额不能归因于策略；费用和缓存未知。总估算降幅约2%，不足以支持默认切换。详情见[人工评审](review-20260924-reading-shadow-ab.md)。报告quality仍为unreviewed；当时计划重复此配对复核长度门槛。
+## 场景
 
-历史记录：2026-09-24 CM-3k与reading-dev首对A/B复核：定向5项、knowledgeintegration全量228项通过、0跳过。reading-dev两份8000预算报告的语料/源码哈希、模型和环境一致，三轮固定期望均通过人工核对；但应用报告5/5次 `applied=true` 且 `dropped_messages=0`，发送估算与原估算相等，因此这是质量检查，不是有效节省对照。Prompt 17044/16974、Completion 618/508，费用/缓存未知，差异不能归因于策略。人工评审见[review-20260924-reading-shadow-ab.md](review-20260924-reading-shadow-ab.md)，生成报告的 `quality` 保持 `unreviewed`。此前把e2e候选估算6790误称为必需输入下限，现已纠正；当时下一对计划以4000作诊断预算。未本机运行测试或真实模型，未提交/push。
+| 场景 | 检查内容 |
+|---|---|
+| `continuity-dev` | 用户偏好、最新决定与未完成事项 |
+| `resume-dev` | 重建 Harness 后接续目标、约束与未知日期 |
+| `evidence-dev` | 原文引用、事实与推断区分及换话题 |
+| `reading-dev` | 长正文、分页标志与中部/尾部补读 |
+| `continuity-holdout` / `resume-holdout` | 独立留出场景，须显式允许，不用于调参 |
 
-设置正整数 `CONTEXT_BASELINE_SHADOW_BUDGET` 时只计算候选；默认真实模型仍收到原输入，报告 `context_shadow_application=candidate_only`。只有显式 `--apply-shadow` 才让评测主循环的模型适配器收到通过校验的候选，其余候选回退全量；摘要与子 agent 保持原工厂。普通 Harness、CLI 和服务默认行为不变。预算及边界见[影子上下文](../context-shadow.md)。
+每场景3轮。`cases.json` 的 expect 仅供评审，不发给模型；只有 `fixtures/` 的两份合成资料复制到临时工具根目录。采集不连接 MCP，使用新的随机评测身份，Redis 日志和身份预留键不会自动清理。
 
-元数据的 `context_shadow_application=apply_candidates` 仅表示启用了评测应用模式；每个 SDK 调用是否真的裁剪，以 `shadow_input_applications[].applied` 为准。
-
-`needs_constraint_review` 是答案质量复核信号，不是评测应用开关：普通旧历史被裁剪时它也会为真，隔离 A/B 仍应把结构合法、来源匹配的候选实际送入模型以测量质量影响。未解决的显式约束或回读来源仍回退原输入；被省略的已读证据可以进入 A/B，须在答案评审时核对。
-
-## 隔离对照
-
-实现变更先在WSL跑本批定向与全量回归，并解析评测脚本语法；以下真实模型对照需等回归通过后再启动：
-
-```bash
-bash scripts/test-fast.sh -run 'ContextShadowVariant|ShadowApplyingModel|ShadowModelWrapper|ContextBaselineShadowApplication'
-bash scripts/test-fast.sh -tags knowledgeintegration
-bash -n scripts/context-baseline.sh
-```
-
-reading-dev 的4000重复配对里，应用组长度限制通过，但前一对未通过；当前小样本不能证明稳定质量。下一组测 `resume-dev` 的目标与约束续接，属于同进程 Harness 重建，不等同真实长时间间隔。下面两条命令会调用真实模型并产生费用：
-
-```bash
-CONTEXT_BASELINE_SHADOW_BUDGET=4000 bash scripts/context-baseline.sh --real resume-dev
-CONTEXT_BASELINE_SHADOW_BUDGET=4000 bash scripts/context-baseline.sh --real resume-dev --apply-shadow
-```
-
-`4000` 仍是诊断预算，不是生产默认或最终推荐值。reading-dev首个应用组发生过两轮超长，重复组没有复现；候选控制组重复时第1轮又超限1字。只有两个应用组都满足语义expect和可见回答Unicode字符数上限，且发生真实裁剪，才可称该场景重复验收通过；当前长度结果混合，尚未达到。对新场景同样要检查 `corpus_sha256`、`source_sha256`、模型、运行环境及 `WithUsage` 覆盖。Provider总Prompt差异受模型回复改变的后续历史影响，费用和缓存未知，报告的 `quality` 保持 `unreviewed`。
-
-8000和4000两组reading-dev配对的逐轮人工核对与usage口径见[评审记录](review-20260924-reading-shadow-ab.md)。其中e2e候选估算6790是保留了部分历史后的候选，不是必需输入下限。
-
-`shadow_input_applications` 每行对应一次传给模型适配器的调用（包括建流重试），记录候选状态、是否应用、回退原因、消息数及原/候选/实际适配器输入的估算。`logical_main_inputs` 与 `sdk_attempts.Main.EstimatedInput` 在包装器外测量，仍表示原始逻辑输入；比较实际请求优先看 provider 返回的 `sdk_attempts.Main.Prompt`，同时检查 `WithUsage` 覆盖。`sent_estimate_tokens` 是项目估算，不是供应商精确token或HTTP线级证据；`fees` 与 `cached_tokens` 仍为未知。
-
-2026-09-23 工具证据最新验收：用户WSL ContextBaseline定向4/knowledgeintegration全量199通过、0跳过。reading-dev补采run-20260923T084722Z-66816.json三轮PASS，工具证据确认1–27截断且有后续，45–55完整但有后续，90–100完整且无后续；回答82/77/68字符，助手复核本题通过。实报输入13894/输出349、5次主调用均有usage；未改模型策略，不把与旧报告差异当节省或质量修复。评审见test/contextbaseline/review-20260923-reading-evidence.md，原失败和quality=unreviewed保留。停止重复补采，下一工程切片CM-1稳定来源/分页回读；费用缓存及旧evidence问题仍未完成。仅更新文档，未本地测试/调用模型、未提交/push。
-
-2026-09-23 CM-0工具证据补齐（未提交）：采集器逐轮保存主循环工具返回/失败事件，复用ToolObservation名称/参数哈希/耗时/实际行范围及分页截断标志，复制快照，不保存原始参数或结果正文；缺观察值保留null。新增ContextBaselineToolEvidence真Harness/文件工具回归，覆盖中部has_more与末尾无后续、跨轮隔离及正文不泄漏。生产循环不变，无额外模型调用；go vet三标签通过，WSL ContextBaseline预计4/全量199待验。回归通过后仅重采reading-dev核对分页证据；不覆盖旧报告或宣称修正了模型质量，CM-1尚未开始。未本地跑测试/真实模型、未提交/push。
-
-2026-09-23 四开发场景基线交接：用户evidence-dev/reading-dev各三轮采集PASS，但助手复核并非质量全过。evidence末轮去Markdown后105字符超100，step定义未满足项目预期且题面缺专有定义；reading验收码/行号正确，但45–55无后续页说法混淆文件分页，实际调用范围因报告缺工具元数据无法核实。四题合计实报输入37954/输出1952、17次主调用均有usage；费用缓存未知。详情test/contextbaseline/review-20260923-evidence-reading.md。下一切片先复用工具进度补采集证据，再推进CM-1；不重跑已判定前两题或留出集。CM-0未整体完成，本轮仅评审和文档，未改生产代码/跑模型/测试/提交。
-
-2026-09-23 恢复场景基线：用户WSL resume-dev三轮PASS，报告run-20260923T083944Z-65615.json。助手按expect复核通过：重建Harness后保留目标/约束/下一步，第二轮79字符；项目编号正确且未编造上线日期。实报输入7579/输出458，4次主调用均有usage；第三轮含工具反馈的两个逻辑步骤，累计输入4021。报告未存工具名/正文，不凭模型自述认定检索范围。仅同进程重建，非真实时间间隔/进程重启/零缓存验证；费用缓存仍未知。评审见test/contextbaseline/review-20260923-resume.md。下一步evidence-dev/reading-dev；CM-0未整体完成，未改生产代码、未本地跑测试或模型、未提交/push。
-
-2026-09-23 最新验收与首份完整基线：用户WSL ApprovalClaim定向5/全量198通过、0跳过，覆盖过期测试前提修正。continuity-dev真实3轮采集PASS，报告run-20260923T083801Z-65467.json；助手逐项复核既定expect通过（末轮51字符），非独立人工复核，原quality=unreviewed保留。实报输入5463/输出388，主调用3次均有usage，无子/摘要调用；费用缓存未知。每轮系统+工具估算1533，短对话固定开销占主导，不证明已节省。详见test/contextbaseline/review-20260923-continuity.md；下一步resume-dev，再补来源及长工具场景。CM-0仍未整体完成。本轮仅读报告/更新文档，未本地运行测试或模型、未提交/push。
-
-2026-09-23 审批过期测试前提纠错（未提交）：用户ContextBaseline定向3通过、全量197通过/1失败/0跳过；唯一失败仍为ApprovalClaimChecksExpiryAtConsumption。新增诊断证明deadline=16:34:44.622，应用=44.553、Redis=44.553，断言时两端均未到期；此前两端时差假设不能解释本次失败。固定Sleep依赖单调时钟，不能证明JSON持久化期限对应的墙钟已越界（具体时钟调整原因未确认）。现原用例轮询应用和Redis墙钟，均超过期限10ms再断言，单调时间5秒上限，未满足前提单独报错；保留真实读取快照及无执行记录/未消费断言，不改生产代码、不新增顶层用例。go vet三标签及差异检查通过，WSL ApprovalClaim定向5/全量198待重验；基线身份修复的定向回归已验，真实采集未重跑。未本地运行测试、未提交/push。
-
-2026-09-23 真实基线入口纠错（未提交）：用户continuity-dev首次采集失败，部分报告run-20260923T082823Z-63557.json仅1轮，轮耗时6ms、SDK尝试0。采集入口遗漏CLI所需user_id上下文，Runtime在模型调用前失败；旧回归自带身份掩盖该遗漏。现采集Run显式接收owner并注入身份，Harness回归改从空白上下文启动，报告新增安全error_code且不存原始错误。go vet含knowledgeintegration/rageval/contexteval及差异检查通过；修复后WSL定向3/全量198和真实三轮采集待重验，此前198通过不覆盖本修复。失败报告保留，不计作质量/费用基线；未运行本地测试或真实模型、未提交/push。
-
-2026-09-23 最新验收：用户WSL ApprovalClaim定向5项、带knowledgeintegration全量198项通过，均0跳过，覆盖审批过期修复及CM-0c采集器的常规回归；此前ContextBaseline定向3项通过。真实模型采集尚无报告，不能据此声称质量/费用基线完成。仅记录用户证据，未重跑测试、未提交/push。下一步用户在WSL显式采集continuity-dev三轮，助手再读取报告分析。
-
-2026-09-23 用户WSL反馈：ContextBaseline定向3项通过、0跳过；带knowledgeintegration全量197通过/1失败/0跳过，失败为已有审批消费过期用例。该问题已另行修复并待重新回归；不把定向通过当全量通过，真实采集仍未执行。
-
-CM-0c：固定输入、保存用量和回答，供下一阶段上下文选择前后对照。工具与循环复用现有 Harness/Runtime，代码仅在 test/ 与 scripts/。没有另写 agent loop，也没有自动记忆抽取。go vet含knowledgeintegration/rageval/contexteval与Bash语法检查通过，运行回归待用户WSL。本批尚未采集真实报告，不代表节省效果已经验证。
-
-## 场景与范围
-
-| ID | 集合 | 轮数 | 检查目标 |
-|---|---|---|---|
-| continuity-dev | 开发 | 3 | 用户偏好、纠正决定、未完成事项；短历史固定开销 |
-| resume-dev | 开发 | 3 | 第2轮重建Harness，同一Redis历史；“继续”和未知上线日期 |
-| evidence-dev | 开发 | 3 | 原文引用、事实与推断区分、换话题 |
-| reading-dev | 开发 | 3 | 长工具正文、范围/分页标志、补读中部48行和尾部96行 |
-| continuity-holdout | 留出 | 3 | 不同项目和编号下的最新决定与优先级 |
-| resume-holdout | 留出 | 3 | 不同事实的续接和不捏造日期 |
-
-cases.json 中 expect 是人工评审标准，不送给模型。只有两份合成资料复制到临时只读工具根目录，预期答案和真实项目文件都不在该根目录。MCP不连接；内置工具与默认Runtime保持一致。使用新随机评测owner，既不读取user 1历史，也不复制/删除个人数据。owner保留在报告中；Redis中预留键和该owner的日志留存，不自动清理。预留只协调本采集器，不能防止其它程序刻意使用同一owner。
-
-重建的是Harness实例，仍在**同一进程**，没有时间等待和缓存清空。这不是实际隔几天、进程重启或零缓存实测。只能证明评测时是否从相同持久记录接上。长文件只模拟工具结果变大，并不是长达数月的历史。权限/取消/恢复/长消息回读等硬边界还要依赖专项回归，不能用这六个场景替代全部CM-5验收。
+resume 场景重建同一进程内的 Harness 实例，不模拟真实时间间隔、进程冷启动或缓存清空。长文件不等于长期历史。
 
 ## 执行
 
-先由用户在WSL运行不调用真实模型的回归：
+普通回归使用假模型：
 
 ```bash
 bash scripts/test-fast.sh -run ContextBaseline
-bash scripts/test-fast.sh -tags knowledgeintegration
 ```
 
-本批新增3个常规顶层用例，预计定向3项/全量198项。实际通过数与零跳过才是运行证据。真实采集用例由独立contexteval标签隔离，不属于这198项。
-
-确认后采集**一个**开发场景；以下命令会使用已有CLI模型配置并产生真实调用费用：
+真实采集在仓库根目录的 WSL/Linux 运行，使用现有模型与 Redis 配置，会产生真实调用用量：
 
 ```bash
 bash scripts/context-baseline.sh --real continuity-dev
 ```
 
-脚本默认只运行该场景的3轮，不自动跑全套。随后按需要分别选择resume-dev、evidence-dev、reading-dev。每轮最多3分钟，步数与重试使用现有环境配置；没有精确金额上限。每次创建不同owner，结果在test/contextbaseline/results/，以UTC时间和进程号命名，禁止覆盖已有报告。Redis/模型配置错误会失败，不静默跳过。报告内容包括合成输入和真实回答，不含API key、完整endpoint或原始错误正文；模型可能将自己推断的内容写入回答，应人工核对。
+一次只运行一个场景，报告写入已忽略的 `results/`。每轮有超时，但没有精确金额上限；失败时停止后续轮并保留部分报告。
 
-留出题在开发调参结束后才运行，例如：
+## 候选输入对照
+
+默认只记录候选，不改变实际输入。显式设置预算并加 `--apply-shadow` 才在评测路径应用候选：
 
 ```bash
-bash scripts/context-baseline.sh --real resume-holdout --holdout
+CONTEXT_BASELINE_SHADOW_BUDGET=4000 bash scripts/context-baseline.sh --real reading-dev
+CONTEXT_BASELINE_SHADOW_BUDGET=4000 bash scripts/context-baseline.sh --real reading-dev --apply-shadow
 ```
 
-留出集是流程约束，不是保密考题；源码中可以看到。不要看完留出结果再针对该题调参并宣称仍是独立验收。
+4000是诊断示例，不是生产默认或推荐预算。候选无法安全应用时回退全量，规则见 [上下文候选契约](../context-shadow.md)。
 
-## 报告怎么读
+## 报告口径
 
-- 新报告逐轮增加tool_events：仅主循环工具返回/失败事件，包含名称及已有ToolObservation的参数哈希、耗时（Elapsed为纳秒）、实际Path/FirstLine/LastLine和HasMore/ContentTruncated/ScanLimited。无事件为[]，旧报告缺字段不能当未调用；observation=null表示元数据不可用。失败/未知工具的零字段不能解释为完整读取，returned也不等于业务成功。无原始参数和结果正文，不能用哈希还原请求范围；没有next值或调用ID，也不覆盖子循环/审批直接执行。相同行范围不保证中间每行内容正确，必要时仍核对持久事件。
-- error_code仅保存允许的分类：missing_user_id、http_状态码、deadline_exceeded、canceled、restart_error或run_error；不记录原始错误正文。旧报告可能没有该字段。
-- source_sha256标识本地internal源码、采集器Go源码及go.mod/go.sum，包含未提交代码；corpus_sha256标识题目和两份资料。记录模型名、provider host、预算、步数、重试策略、Go版本与系统；不记录秘密配置。
-- 每轮logical_main_inputs是主循环逐次估算的组成；sdk_attempts的Main/Child/Summary是实际SDK尝试汇总。三桶互斥，累加所有轮次，**不要再加一次逻辑步骤的usage**，准备轮也不能省略。
-- Prompt/Completion仅累计已返回usage；WithUsage小于Attempts说明用量不全。即使相等，断流最终账单仍可能未知。EstimatedInput是估算，UnknownSchemas非零时还缺部分定义。Fees与cached_tokens保持null，不能当作零。
-- elapsed_ms包括该轮Harness调用全过程（包括其同步摘要/重试）；first_text_ms只看最终回答的首次非空分片，不把推理字段当首字，无文本分片则为null。重建Harness时间不在轮耗时内，不能当CLI冷启动耗时。
-- status=returned或execution_complete=true仅表示调用正常返回，不是答案正确或业务成功。quality固定unreviewed，禁止自动把文件生成/测试PASS当评测通过。错误或取消立即停止后续轮，部分报告仍保存；初始化失败可能只留下空文件，应视为无有效报告。
-
-## 人工判定与成本口径（运行前固定）
-
-逐轮按expect逐项填“通过/失败/无法判断”，记录证据。所有标注的事实、最新决定、约束和引用都必须通过；编号和行号必须精确，未知日期不得编造，长度按可见回答Unicode字符含标点计。执行失败、未评审或无法判断的场景不能算达标。引用要支持对应陈述，不只是出现文件名。
-
-对照必须保持同一语料、源码/策略标识、模型和工具配置。新策略实现后至少分别重复连续/续接两类，报告每次结果，不能只挑最便宜一次。usage和质量逐轮先列明，再汇总整个场景。一个场景是一个任务，不用成功轮数当“达标任务”分母。
-
-没有可验证费率、缓存字段或完整用量时，报告费用未知，先比较包含辅助调用的已知输入/输出token及覆盖范围。若后续做**按零缓存折算**，必须明确标记反事实假设，分别用全部输入与输出乘对应费率，不是服务商实付账单；不同模型分别计价。真实费用/达标任务只有分子完整且分母大于零才能报告。任何关键质量退化都不能因token下降而通过。
-
-### 本批回归
-
-| 用例 | 守住的边界 |
+| 字段 | 含义 |
 |---|---|
-| TestContextBaselineFixtures | 固定续接场景可用，未知ID/未显式允许的留出题被拒绝 |
-| TestContextBaselineToolEvidence | 假模型经真实文件工具读取中部/末尾，核对实际行范围、分页标志、哈希、跨轮隔离；报告不含工具正文和原始参数 |
-| TestContextBaselineStopsOnFailure | 第二轮失败后不继续；部分回答和首字证据保留；费用未知；不自动判优 |
-| TestContextBaselineHarnessReport | 从空白上下文验证采集器注入owner；假HTTP模型→真SDK→Harness→报告三轮计量；实例重建后仍保留历史；每轮独立统计；未知值序列化null |
+| `corpus_sha256` / `source_sha256` | 题目/资料与代码/依赖版本指纹 |
+| `logical_main_inputs` | 原始逻辑输入的组成估算 |
+| `sdk_attempts` | 主/子/摘要 SDK 尝试及已知 usage，不与逻辑步骤重复相加 |
+| `tool_events` | 主循环工具名称、参数哈希、范围、分页/裁剪及耗时元数据，不保存原始参数和结果正文 |
+| `shadow_input_applications` | 是否应用候选、回退原因、消息数量与原/候选/实际适配器输入估算 |
+| `first_text_ms` / `elapsed_ms` | 最终回答首个文本分片与本轮 Harness 调用耗时，不是冷启动性能 |
+| `quality` | 默认 `unreviewed`；采集成功不自动改为质量通过 |
 
-仅静态检查不代表上述用例已运行。真实采集报告须单独提供，不能由假模型结果推断质量或收益。
+未知 usage、缓存与费用保持未知，不填零。尝试统计中的逻辑输入估算仍可能是包装器外的原输入；分析实际应用时需同时核对应用记录及服务商 usage。报告含模型回答，分享前应检查内容。
+
+## 评审原则与已知结论
+
+按固定 expect 逐项核对事实、最新约束、引用和回答长度；无法判断不能算通过。比较前核对语料、源码、模型与配置，报告全部重复运行，不能只选择最有利结果。
+
+已有小样本试验中，8000预算曾出现候选全量保留；4000预算可发生裁剪，但回答长度遵守情况不稳定。不同回答会改变后续历史，单次 provider 总量差异不能直接归因于裁剪。当前不将该策略设为默认，也不宣称已经实现稳定节省。
+
+留出场景只能用于预定最终检查；查看结果后继续改策略的题目应降级为开发集。测试与评测方法见 [测试指南](../README.md)。

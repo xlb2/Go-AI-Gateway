@@ -1,23 +1,18 @@
-# 模型输入证据验收
+# 模型输入与持久历史的证据测试
 
-2026-09-22 最新运行证据：用户WSL定向4项、带knowledgeintegration全量186项通过，均0跳过，覆盖下方待验记录。之后默认步数从10调整为20，属于后续改动，不包含在这次186项运行证据内。
+这些回归通过假模型的实际 SDK 请求快照与 Redis 事件，检查工具正文、推理字段和历史表达是否符合契约，不依赖模型自述判断执行。
 
-2026-09-22：根据CLI试用反馈新增确定性回归。本地go vet（含knowledgeintegration/rageval）和CLI构建通过；运行待用户WSL，不将模型自述当作已确认缺陷。
-
-| 用例 | 核查证据 |
+| 测试 | 检查内容 |
 |---|---|
-| TestStorageSpillThresholdPerResult | 连续10条2000 rune结果不外存，2001 rune外存；日志转换不修改原消息 |
-| TestModelEvidenceLargeResultAcrossTurns | 真Redis保存大内容；模型调用load后，实际SDK请求含完整正文；下一轮历史为定位符，再次load的本轮请求仍有完整正文 |
-| TestModelEvidenceReasoningRoles | 推理分片进入独立回调，同轮工具续调保持assistant.reasoning_content；不混入content、user正文、事件内容或下一轮历史 |
-| TestWorkspaceEmptySearchFields | 无命中明确返回lines空数组与skipped=0；隐藏文件跳过返回skipped=1 |
-
-假模型请求快照增加role/content/reasoning_content，只供测试读取；请求摘要JSON接口不输出消息正文，不新增真实服务请求dump或生产日志。
+| `TestStorageSpillThresholdPerResult` | 单条2000 rune不外存，2001 rune外存；日志转换不修改原消息 |
+| `TestModelEvidenceLargeResultAcrossTurns` | 当前执行可见完整工具正文，历史保存外存引用，显式回读后本轮 SDK 输入获得正文 |
+| `TestModelEvidenceReasoningRoles` | reasoning 独立回调，同轮工具续调保留服务商字段，不混入用户正文或下一轮持久历史 |
+| `TestWorkspaceEmptySearchFields` | 无命中与 skipped 字段明确区分 |
 
 ```bash
 bash scripts/test-fast.sh -run 'ModelEvidence|StorageSpillThreshold|WorkspaceEmpty'
-bash scripts/test-fast.sh -tags knowledgeintegration
 ```
 
-本批定向预计4项，累计全量预计186项。覆盖假模型、实际SDK、Harness与真Redis的指定场景；不代表能证明某次历史真实模型回答中的每句话，也不验证模型对来源的理解正确。
+请求快照仅用于假模型测试；摘要接口不输出消息正文，不新增真实服务请求转储。外存改变的是持久历史表达，不代表当前工具返回也只能看见定位符。
 
-外存是历史表达与当前执行消息的区别：当前轮工具返回正文直接交回模型，持久化的超长结果记录定位符；再次取回不等于模型仍只能看到定位符。推理字段的当前轮回传同样不等于作为用户消息持久化。
+这些测试证明指定链路中的输入与事件行为，不证明模型理解来源或回答正确。

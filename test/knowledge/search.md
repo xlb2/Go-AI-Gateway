@@ -1,34 +1,31 @@
-# 精确关键词搜索基线
+# 精确关键词搜索
 
-用户问题 → Agent提取术语 → search_sources定位 → read_source读取 → 回答 → 查看已读取原文。
+`search_sources` 用于定位代码名或确切术语，再由 `read_source` 获取原文。它与自然语言 [混合搜索](hybrid.md) 是独立工具。
 
 ## 契约
 
-`search_sources`输入为`{"query":"RunAgentTurn","after":0}`。query去除首尾空白后为1到128个Unicode字符，不允许NUL；after是上一页next_after。owner/library不由模型提供，未知字段拒绝。
-
-查找当前资料库的当前版本正文，按字面匹配、区分大小写；中文、代码名和SQL符号均按原样处理，百分号和下划线不是通配符。标题不参与匹配。每页最多10份资料，按source_id升序，每份返回首个命中的source_id/version_id/version/title/offset/match_end；没有正文。next_after=0表示没有下一页。字符位置为Unicode零起点、右侧不含，不是UTF-8字节位置。
-
-SQL参数化且查询关联当前version与所属source。更新current_version_id后新搜索不会命中过期正文；已经返回的候选继续携带原version_id，后续读取不会悄悄改成新版本。资料删除功能尚未实现，本批不声称覆盖删除一致性。
-
-候选只说明关键词存在，不证明相关内容已被模型读到。Agent须用read_source，传入候选版本和合适偏移取得原文；成功结果才由现有来源投影生成可点开片段。搜索工具调用同样受轮次日志写入屏障、2分钟请求时限、8步循环和共享64KiB结果预算约束。空结果不意味着资料库一定没有语义相关内容。
-
-## 为什么先做这一步
-
-代码名和中文术语需要可解释的定位基线，便于后续比较召回。当前采用MySQL精确扫描，没有倒排索引、分词、相关度排序或向量检索，不适合作为大量资料的最终检索方案。SQL只返回最多11份候选的元数据和位置，不向Go传回正文；扫描量仍随资料库增长，不把返回数量上限当作数据库扫描上限。
-
-可重建分段索引已由用户4/163回归验证。当前进一步将其接入搜索：查询不超过100个Unicode字符且规则为当前版本时使用片段；缺失/过期规则及更长查询使用原文回退。100为片段重叠长度，避免较长关键词跨窗口后两个片段都不完整包含它。两路径在同一SQL语句内合并，按source_id统一分页；重叠或多次命中取每份资料最早原文位置。候选index_rule标记实际使用的分段规则，原文回退为空，不是答案置信度。
-
-位置转换先按二进制LOCATE精确匹配，再将命中前UTF-8字节前缀转换为字符数；片段路径加start_offset。两路径都绑定当前资料版本。重建事务保证只有旧完整或新完整索引可见；不为手工破坏数据库后的“有ready记录但丢片段”提供自动回退。
-
-下一阶段使用K-0开发集量化关键词召回，再比较向量及融合检索。当前不引入尚无评测依据的向量服务，也不把机制测试称为检索质量得分。产品无模型搜索页面/API仍待独立接入；本批入口是Agent工具及Store公开查询。
-
-## 验证
-
-新增三项MySQL集成测试在search_test.go，覆盖精确匹配、Unicode偏移、字面特殊字符、跨库/用户拒绝、无命中、分页、版本切换，以及假模型从真实搜索结果取版本ID继续读取并取得来源快照。
-
-```bash
-scripts/test-fast.sh -tags knowledgeintegration -run 'KnowledgeChunkSearch|KnowledgeSearch'
-scripts/test-fast.sh -tags knowledgeintegration
+```json
+{"query":"RunAgentTurn","after":0}
 ```
 
-原关键词3/159已由用户验证。本批另增2项片段检索测试，建议定向5、全量165，WSL待验；go vet带tag通过。不包含真实模型检索决策、性能压测或K-0题集评分。API重建后，可在已导入项目讲义的库内不选附件询问某个确切函数名，核对实际工具调用与页面来源，不能只凭模型回答判断搜索发生。
+query 去除首尾空白后为1–128个 Unicode 码点，不允许 NUL。after 使用上一页 next_after。owner/library 由服务端绑定，未知参数拒绝。
+
+只搜索所属资料库的当前版本正文，区分大小写，百分号与下划线不是通配符，标题不参与匹配。每页最多10份资料，按 source_id 升序，每份只返回最早命中的元数据与坐标，不返回正文；next_after 为0表示结束。
+
+offset/match_end 为 Unicode 零起点、右侧不含。候选携带固定 version_id，后续读取不会切换到新版本。候选不等于模型已经读过原文，成功读取才进入 [证据投影](evidence.md)。
+
+## 分段与原文回退
+
+查询长度不超过100码点且索引规则有效时使用片段；缺失/过期索引或更长查询回退原文。100对应片段重叠长度，避免完整关键词跨窗口丢失。两路径在同一 SQL 语句内合并，多次命中取最早原文位置，`index_rule` 标识使用的分段规则。
+
+查询采用参数化 SQL，先二进制 LOCATE，再将字节前缀换算为 Unicode 偏移。返回数量有限不代表数据库扫描量固定；当前没有全文倒排索引、同义词或语义相关度排名。
+
+`Store.SearchAllSources` 为融合与评测逐页收齐单词候选，每词最多10页，超出时明确失败，不静默只取第一页。模型的单次 search_sources 仍保留分页接口。
+
+## 测试
+
+```bash
+bash scripts/test-fast.sh -tags knowledgeintegration -run 'KnowledgeChunkSearch|KnowledgeSearch'
+```
+
+覆盖字面特殊字符、Unicode坐标、版本切换、归属、分页及搜索后读取的工具链。检索质量对照见 [RAG 评测](../rag/README.md)。

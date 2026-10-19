@@ -1,91 +1,53 @@
-# CM-1a 历史来源存储基础
+# 历史来源与分页回读
 
-## CM-2a：有来源的字面检索（待WSL）
+历史来源将持久事件绑定到可校验的 ID，供浏览、搜索与按需回读使用。它不替换默认历史投影或上下文压缩。
 
-CM-1d用户WSL合并定向8/全量206通过，0跳过。新增search_history_sources和SearchSources：query为1..100码点非空白字面字符串，区分大小写，不分词，因此中文短语、单字、代码标识符都可查；不做同义词召回或相关度排名。每页最多扫描50原始事件，最多5个匹配，按新到旧排列。匹配读取持久Content全文，返回首次命中前40码点起最多200码点预览、原seq和来源ID；用户/助手消息、工具结果、摘要可命中，审计与执行控制事件不作为匹配结果。未来版本/损坏事件明确失败。
+## 来源身份
 
-next_cursor沿用最后扫描事件的来源ID，同query继续更早页，追加不漂移；游标本身不绑定query，换query应从空cursor重新开始。Scanned含不参与匹配的事件，has_more说明还有更早事件，不保证那里有命中；sources=[]且has_more=true必须继续或明确范围有限。external_unsearched统计本页遇到的结构化外存引用，外存正文未展开；旧自然语言外存提示无法可靠识别，不计入该数，不能把0当已查完外存。
+来源 ID 包含用户、随机日志代次和原始事件 seq，对调用方应视为不透明字符串。owner 来自可信入口或工具 context，不能由模型参数覆盖。当前范围为用户主日志，不包含独立项目空间或子运行日志。
 
-扫描50条是事件数量预算，不是字节/内存预算，Redis仍整条读取JSON，大事件的传输和解码开销未优化。未建倒排/向量索引，不改变旧search_memory_archive或默认上下文选择；新增工具定义成本须在后续对照中计入。
+追加操作使用 Lua 同时维护日志代次与事件。只追加时已有 ID 保持稳定；日志重建或代次元数据丢失后旧 ID 失效。兼容旧日志只补元数据，不重写事件。读取会原子检查 owner、代次、锚点和事件格式。
 
-| 新回归 | 边界 |
+外部直接 `LSET`/`LTRIM`、绕过写入口重建、Redis 整体快照回滚不在该身份保证范围；当前也未提供 Redis Cluster 多键槽支持。
+
+## 存储接口
+
+| 接口 | 行为 |
 |---|---|
-| TestHistorySourceSearchPaging | 中文与代码标识符、命中超过预览开头、来源分页、追加不漂移、跨用户拒绝、查询上限与大小写 |
-| TestHistorySourceSearchToolAndCoverage | 真实工具装配、无命中仍可续扫、50事件上限、外存未覆盖计数、命中ID回读 |
+| `SourceAt` / `ReadSource` | 原始 seq 定位或按来源 ID 分页读取持久 Content |
+| `SourceNeighbors` | 同代次锚点前后各0–5条原始事件，单条最多200码点预览 |
+| `ListSources` | 按 seq 从新到旧浏览，每页最多5条，以来源 ID 续页 |
+| `SearchSources` | 字面检索原始事件正文，每页扫描最多50事件、返回最多5个匹配 |
+| `GetHistorySources` | 投影消息与来源的快照，并复用既有硬预算裁剪 |
 
-默认装配断言同步search_history_sources。三标签go vet通过，WSL合并定向预计10、全量208待验：
+正文偏移以 Unicode 码点计，零起点；页大小1–2000，offset等于末尾返回空页，超出末尾报错。返回事件类型、角色及中断标记，不把中断回复当完成回复。Content 不包含 ToolCalls 参数，空正文不代表事件无其他字段。
+
+来源快照仅在摘要覆盖证据有效时省略已覆盖前缀，否则回退完整日志；保留真实 base seq。活跃区坏事件或未来格式版本拒绝加载。快照的预算参数小于等于零表示不裁剪。
+
+## 模型工具
+
+| 工具 | 行为 |
+|---|---|
+| `browse_history_sources` | 无 anchor 时列最近来源，cursor 翻更早页；有 anchor 时浏览前后各2事件，不与 cursor 混用 |
+| `read_history_source` | 来源正文分页；`expand_spill` 显式读取结构化外存引用 |
+| `search_history_sources` | query 为1–100码点、区分大小写的字面文本；返回来源 ID、原 seq 和最多200码点命中预览 |
+
+浏览的是原始事件，不只是用户消息。向后游标不受后续追加影响；邻居模式的 `has_more=false` 不代表全日志没有更多内容。搜索游标不绑定 query，换词应从空游标开始。无命中但仍有下一页时，不能宣称搜索完毕。
+
+搜索不展开外存正文，`external_unsearched` 只统计本页可识别的结构化引用；旧自然语言外存提示不能可靠计数。搜索不提供同义词、向量排名或倒排索引。
+
+## 外存引用
+
+自动外存成功后，事件在 `spill_locator` 中保存结构化引用。展开要求存储支持归属分页，定位符必须匹配当前 owner；缺引用、内容丢失或非法位置均明确报错。不会从自然语言提示中猜定位符。来源提示页与外存正文页分别使用各自坐标。
+
+旧 `load_large_content` 路径保持原契约，不因新增来源工具自动获得相同归属校验。
+
+## 开销与测试
+
+分页和预览限制约束返回结果；存储当前仍读取完整事件 JSON 或外存正文再切页，不保证单事件传输量有界。快照也没有总字节上限。
 
 ```bash
-bash scripts/test-fast.sh -run 'HistorySource|SpillOwnedPages|RuntimeDefaultAssembly'
-bash scripts/test-fast.sh -tags knowledgeintegration
+bash scripts/test-fast.sh -run 'HistorySource|HistorySnapshot|SpillOwnedPages|RuntimeDefaultAssembly'
 ```
 
-## CM-1d：发现来源与邻居工具（待WSL）
-
-用户已提供默认装配定向1、全量204通过，0跳过，覆盖CM-1c及旧工具数断言修复。
-
-新增ListSources按seq倒序分页，最多5条原始事件、每条200码点预览；next_cursor为上一页最旧来源ID，严格读取其之前的事件，期间追加不改变翻页位置。Lua原子检查日志代次、锚点和读取范围，缺失/重建游标拒绝，空日志返回sources=[]。仍整条加载事件再截预览，不保证单事件内存开销有界。
-
-新增browse_history_sources：无anchor时列最近来源，cursor继续更早页；提供anchor时查看前后各2条事件（正序），不允许同时传cursor。来源ID再交给read_history_source完整分页。邻居模式不返回继续游标，has_more=false只表示没有列表续页，不代表整个日志无其它事件。工具根据可信context绑定owner，不接用户ID参数。
-
-这是原始事件浏览，包含工具/审计等事件，不是用户消息列表或关键词搜索；工具调用自身也会追加日志，向后游标用于避免不停读取新增的自身事件。项目隔离、多代次归档及旧外存读取路径仍不在本接口保证范围。不改变默认历史组装。
-
-| 新回归 | 边界 |
-|---|---|
-| TestHistorySourceBrowseCursor | 空日志、首尾分页、追加不漂移、跨用户游标拒绝、重建游标失效 |
-| TestHistorySourceBrowseTool | 实际工具发现ID→邻居浏览→按ID回读 |
-
-RuntimeDefaultAssembly同步新增工具名称集合。三标签go vet通过，用户WSL待验：
-
-```bash
-bash scripts/test-fast.sh -run 'HistorySource|SpillOwnedPages|RuntimeDefaultAssembly'
-bash scripts/test-fast.sh -tags knowledgeintegration
-```
-
-预计8项/206项；不把204通过当本批证据。新增工具schema也有成本，后续策略对照应重新核算。
-
-## CM-1c：结构化引用与已知来源工具（待WSL）
-
-CM-1b用户WSL定向4、全量203通过，0跳过。新增MemoryDTO.spill_locator，仅自动外存成功时写入；历史投影仍沿用旧Content。新read_history_source由支持ReadSource的session存储装配，owner从调用context取得，支持正文分页和expand_spill显式外存分页。展开时source部分是持久提示的1字符定位预览，expanded部分才是请求的外存正文页；各自offset/next/total不混用。缺结构化引用、旧提示文本、存储不支持归属分页、内容丢失均报错，不解析自然语言定位符。
-
-新增TestHistorySourceToolSpill覆盖自动外存→持久来源→实际工具分页、内容丢失拒绝、拒绝解析用户正文中的定位符。go vet三标签通过，WSL `bash scripts/test-fast.sh -run 'HistorySource|SpillOwnedPages'` 预计5，带knowledgeintegration全量204待验。工具仅支持已知ID；来源检索发现与邻居工具尚未接入，旧load_large_content路径不变。注册新增工具会增加工具定义token，不能复用旧基线固定开销数值宣称节省。
-
-## CM-1b：相邻事件与显式归属外存分页（待WSL）
-
-SourceNeighbors从同代次原始日志原子读取锚点前后各0..5个事件，包含锚点，每条预览最多200码点；返回ID可继续ReadSource翻页。这里是相邻事件，不跳过审计/工具事件，不等于相邻用户消息。缺锚点、代次不符或坏事件明确报错，不返回混代次的部分结果。存储读取仍取得完整事件JSON，预览上限不是Redis内存/传输上限。
-
-spill.RedisStore.ReadPage要求可信owner与标准Redis定位符归属一致，正文每页1..2000码点，丢失外存报错。仍整条加载后切页，不提供版本快照保证；既有LoadText及模型工具尚未切换，不声称旧读取路径已获得相同保护。历史事件里的自然语言外存提示未自动解析，结构化引用和工具接入待后续。
-
-| 新回归 | 边界 |
-|---|---|
-| TestHistorySourceNeighbors | 首尾范围裁剪、原seq与ID、预览续读、跨用户拒绝、邻居数量上限 |
-| TestSpillOwnedPages | 中文/emoji完整拼接、跨用户拒绝、页大小限制、内容删除后明确失败 |
-
-本地三标签go vet通过；用户WSL定向预计4、全量203，尚未运行：
-
-```bash
-bash scripts/test-fast.sh -run 'HistorySource|SpillOwnedPages'
-bash scripts/test-fast.sh -tags knowledgeintegration
-```
-
-下方CM-1a验收记录仅覆盖上一批。
-
-SourceAt(owner, seq, offset, limit)从原始主日志建立来源；ReadSource(owner, id, offset, limit)回读。owner来自可信入口，不从模型参数获得。ID格式history:v1:owner:随机代次:原始seq，对消费者视为不透明。当前日志按user划分，没有独立项目空间；不声称具备项目隔离。子日志不在本接口范围。
-
-每次单条/批量追加通过Lua同时管理generation键与RPUSH；日志为空时更换代次，非空时兼容补建元数据。读取以Lua原子核对代次并LINDEX。旧日志只创建旁路键、不重写事件；代次键丢失时旧ID失效，重新发现后获得新ID，不尝试猜测旧身份。正常重启保留Redis键则ID不变，但未执行真实进程重启验收。任意外部LSET/LTRIM、绕过新版写入口重建日志、回滚Redis整套快照均不在保证范围，历史索引仍依赖只追加契约。Redis Cluster多键槽支持未提供（与当前单Redis部署一致）。
-
-正文按Unicode码点从0分页，limit=1..2000；offset等于末尾返回空页，超过末尾报错。返回事件type/role/interrupted，不能把中断回复当完成回复。只读取持久Content，不展开spill定位符，不包含ToolCalls参数；空正文不代表事件没有其它字段。返回大小有界，但当前仍取完整单条JSON并解码，非存储端流式大对象分页。
-
-| 回归 | 边界 |
-|---|---|
-| TestHistorySourcePagesAndIdentity | 中文/emoji完整拼接、追加摘要后原seq仍可读、跨用户拒绝、页大小限制、单条及批量写入口、重建日志旧ID失效 |
-| TestHistorySourceLegacyAndUnavailable | 旧事件原文不变、中断标志保留、代次丢失拒绝旧ID、坏JSON/未来版本/缺失事件报错 |
-
-本地三标签go vet通过；2026-09-23用户WSL定向2、全量201通过，均0跳过。复验命令：
-
-```bash
-bash scripts/test-fast.sh -run HistorySource
-bash scripts/test-fast.sh -tags knowledgeintegration
-```
-
-上述运行结果为用户提供的WSL证据，本轮未重跑。尚待CM-1后续：相邻事件/消息回读、外存完整内容与归属检查、来源发现和模型工具接入；本批不改变模型上下文选择，不增加模型调用。不把CM-1a当CM-1全部完成。
+回归覆盖 Unicode、跨用户拒绝、代次失效、追加后分页、旧日志兼容、外存缺失、投影与实际工具装配。
